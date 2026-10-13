@@ -1,0 +1,98 @@
+# TODO
+
+## Example consumer: Family Album
+
+A small Flask application that consumes Atlas the way a real site would: it owns
+its own content database (descriptions, alt text, tags, folders) and delegates
+every media byte and every image transformation to Atlas. It exists to prove the
+integration contract from the consumer side, so it is a *reference
+implementation* - readable source, `requirements.txt`, and a README, with no
+Nix integration and no production ambitions.
+
+Placed at `examples/family-album/`.
+
+### Prerequisites in Atlas
+
+- [ ] **Adopt sqlx migrations.** Enable the `migrate` feature and move the
+      `CREATE TABLE IF NOT EXISTS` blocks in `Store::connect` into a
+      `migrations/` directory applied with `sqlx::migrate!().run(...)` at
+      startup. No new dependencies; `_sqlx_migrations` tracks checksums, so an
+      edited migration is caught instead of silently ignored. Note that the
+      macro does not rebuild when only `.sql` files change - add
+      `sqlx migrate build-script` or use `RUSTFLAGS='--cfg sqlx_macros_unstable'`.
+- [ ] **Know the `ALTER TABLE` limits.** SQLite supports only rename table,
+      rename column, add column, and drop column directly. Changing a column
+      type or a constraint requires the 12-step rebuild. Document this before
+      anyone reaches for `ALTER TABLE ... ALTER COLUMN`.
+- [ ] **Guard table rebuilds against CASCADE.** `DROP TABLE` fires
+      `ON DELETE CASCADE`, so rebuilding `assets` would silently delete every
+      `renditions` row - and the database would look self-consistent afterward.
+      Any rebuild must set `PRAGMA foreign_keys = OFF` *outside* the transaction
+      (it is a no-op inside one), run the rebuild, then `PRAGMA foreign_key_check`
+      and roll back on violations.
+- [ ] **Prefer additive migrations.** Add nullable columns, backfill, deploy the
+      code, then drop the old ones in a later release. Never rename-and-rebuild
+      in a single step.
+- [ ] **Trash instead of hard delete.** Add `deleted_at` and `pinned` columns.
+      `DELETE /api/v1/assets/{id}` moves `assets/<id>` to `trash/<id>` and stamps
+      `deleted_at`. Add `POST /api/v1/assets/{id}/restore` and `GET /api/v1/trash`
+      (authenticated). Public delivery stops serving the real bytes immediately,
+      so a blog never shows a half-deleted asset.
+- [ ] **Tombstones.** On purge, keep the metadata row with `purged_at` so Atlas
+      can tell "deleted" from "never existed". Unknown IDs stay `404`; known but
+      deleted IDs serve the placeholder.
+- [ ] **Purge.** Remove `trash/<id>` and mark the row purged once past
+      `trash_retention_days` (default 30, configurable). Run at startup and
+      opportunistically on upload, throttled. No scheduler, no job queue.
+      Startup recovery must leave `trash/` alone.
+- [ ] **Placeholder delivery.** Embed a small placeholder image in the binary;
+      serve it for trashed/purged IDs with `Cache-Control: public, max-age=60`.
+      Deliberately *not* immutable - an immutable placeholder could outlive a
+      restore by a year.
+- [ ] **Usage registration.** Let a consumer mark an asset in use so purge skips
+      it. Pins are Atlas's only hint about consumer content, so keep this minimal
+      and unopinionated.
+- [ ] **Report state.** `GET /api/v1/assets/{id}` should expose deleted/pinned
+      state so consumers can distinguish a missing asset from a deleted one.
+
+### Database safety
+
+- [ ] **Startup integrity checks.** Run `PRAGMA integrity_check` and
+      `PRAGMA foreign_key_check` after migrations, and log loudly on violations.
+- [ ] **Backup/restore runbook.** Document `VACUUM INTO` for a consistent
+      snapshot of the live database (it also compacts, unlike `.backup`), never
+      `cp` a live SQLite file, and note that SQLite does not `fsync` the
+      `VACUUM INTO` output - so a restore drill must verify the copy rather than
+      assume it worked.
+
+### The example app
+
+- [ ] **Scaffold.** `examples/family-album/` with Flask, `requirements.txt`, a
+      README, and its own `.gitignore`.
+- [ ] **Its own schema.** SQLite tables for photos (Atlas asset id, description,
+      alt text, tags, folder) and folders. This database is the point: Atlas owns
+      bytes, the app owns meaning.
+- [ ] **Atlas client.** Server-side HTTP client for `ATLAS_API_TOKEN`. The token
+      never reaches the browser; browsers only ever talk to Flask.
+- [ ] **Upload, single and bulk.** One file at a time, sequentially - Atlas
+      allows two concurrent uploads and one conversion, so a burst risks `503`.
+      Bulk upload reports partial success per file.
+- [ ] **Metadata editing.** Description, alt text, tags, and folder assignment;
+      changing these touches only the app's own database.
+- [ ] **Delete with a referential guard.** Before deleting, the app checks its
+      own database for published posts referencing the asset and blocks or warns.
+      This is the safety net Atlas cannot provide on the app's behalf.
+- [ ] **Use the renditions properly.** `w320` for folder thumbnails, `w640` and
+      `w960` for grid images via `srcset`/`sizes`, `w1280` or the original for the
+      full-size view. Store the rendition list returned by the upload response.
+- [ ] **Degrade gracefully.** If an asset `404`s or returns the placeholder, show
+      a sensible empty state rather than a broken image.
+- [ ] **README.** Two-process setup (Atlas plus Flask), where the token lives, and
+      which URLs are public.
+
+### Explicitly out of scope
+
+- Atlas-side listing, search, or tags - the consumer's own database covers that,
+  and the separation is the point.
+- Authentication or multi-user support in the example app.
+- Anything that would push Atlas toward knowing about consumer content.

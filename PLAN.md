@@ -1,158 +1,137 @@
-# Atlas project plan
+# Atlas plan and prototype status
 
 ## Goal
 
-Build a small, robust, API-first media service for blog-like sites with little
-user-generated content. Administrators upload media occasionally; the service
-stores originals, creates a few useful image variants, and mostly serves files
-to visitors. Each consuming site runs its own Atlas instance on the same host.
+Atlas is a small API-first media service for blog-like sites with little
+user-generated content. Administrators upload media occasionally; Atlas stores
+the original, generates a few fixed image renditions, and mostly delivers files
+to visitors. Each site runs one Atlas instance on the same host as its
+consuming application.
 
-Consuming applications continue to own their structured content and their own
-SQLite databases. Atlas owns media binaries and metadata about those binaries.
+Consuming applications own their structured content and databases. Atlas owns
+media files and media metadata only.
 
-## Decisions and constraints
+## Architecture and product decisions
 
-- **Language/API:** Rust with Axum. Keep the API strongly typed and the service
-  a single deployable process.
-- **Development tools:** Nix flakes provide the pinned Rust toolchain,
-  ImageMagick, SQLite utilities, and other project tools. Production hosts are
-  ordinary Linux systems; NixOS is not required.
-- **Metadata/storage:** SQLite and a persistent local filesystem directory,
-  both local to the host. One instance per consuming site; no multi-tenancy in
-  the initial release.
-- **Access:** Authenticated server-to-server/admin writes and public media
-  reads. No browser-facing admin UI in the initial release.
-- **Processing:** ImageMagick runs only during upload, as a bounded child
-  process. Preserve originals and generate a small configured set of
-  size-and-format variants: WebP, AVIF, and JPEG XL, with a conventional JPEG or
-  PNG fallback. Store documents and other non-image files as originals; do not
-  render or extract them initially.
-- **Uploads:** Stream into a staging file while enforcing a configured byte
-  limit. Initially accept web-ready JPEG, PNG, and WebP images for processing;
-  do not accept camera RAW or other unconfigured formats even if ImageMagick can
-  decode them. Enforce decoded width, height, and pixel limits before generating
-  variants. Reject over-limit uploads clearly rather than attempting expensive
-  conversions.
-- **Starting image limits:** Evaluate defaults around 20 MiB per image and 40
-  megapixels decoded, configurable per deployment. Select a separate byte cap
-  for documents. These are initial values to validate, not immutable API
-  guarantees.
-- **Delivery:** Stable opaque asset identifiers and immutable variant URLs;
-  public read responses should provide appropriate MIME types, cache headers,
-  validators, and byte-range support where practical. Keep URLs
-  format-specific, and have API responses expose available variant URLs so
-  consuming templates can use `<picture>` with modern-format sources and a
-  fallback. Do not vary bytes behind one URL based on `Accept` in the initial
-  release.
-- **Operations:** Keep service state in an explicitly configured persistent
-  directory and document backup/restore for both the SQLite database and media
-  files.
+- Rust with Axum; one service process per site.
+- SQLite metadata and local persistent file storage on the same host.
+- Nix flakes pin the development environment. Production hosts are ordinary
+  Linux systems; NixOS is not required.
+- Writes and metadata lookup require a Bearer API token used by a backend or
+  CLI. Public original and rendition reads are unauthenticated.
+- No browser-facing Atlas UI or direct browser uploads in the prototype. A
+  future UI must keep the permanent token server-side and can use its backend
+  to relay uploads or request short-lived upload grants.
+- Preserve originals. Accept only JPEG, PNG, and WebP for image processing;
+  reject camera RAW and other unconfigured formats even if ImageMagick can read
+  them. Accept PDF, legacy Word, and DOCX as unconverted originals.
+- Generate fixed maximum-width renditions, defaulting to 320, 640, 960, and
+  1280 pixels. Preserve aspect ratio, never upscale, and report actual output
+  dimensions. The consuming site decides the image's role and supplies its own
+  `srcset`/`sizes` layout hints. Server-side crop/art-direction renditions are
+  deferred.
+- At each width, generate JXL, AVIF, WebP, and one conventional fallback
+  (JPEG for JPEG or opaque WebP sources; PNG for PNG or transparent WebP
+  sources). Width profiles larger than the source do not upscale; duplicate
+  actual widths are generated only once. Public rendition URLs negotiate among
+  pre-generated representations from `Accept`; they do not perform image work
+  on reads and send `Vary: Accept`.
+- Asset URLs are immutable. Replacing bytes means uploading a new asset ID.
+- Asset IDs are random lowercase base36 strings, 18 characters by default, from
+  the OS random source. The ID is the only identifier: SQLite primary key,
+  on-disk directory name, and public URL component. There is no separate
+  internal or external identity, and no lookup column. ~93 bits of entropy puts
+  50% collision odds around 10^14 assets; a lost race surfaces as a primary
+  key violation and is retried with a fresh ID, bounded at five attempts.
+  `ATLAS_ID_LENGTH` may change the length (12–24) without a migration, since
+  existing rows keep the IDs they were issued.
+- Files live in a private persistent data directory outside any public web
+  root. The directory must be private to the Atlas service account.
 
-## Initial API shape
+## Configuration
 
-Exact route names and response schemas should be settled with the first API
-implementation. The initial surface is expected to include:
+Settings resolve in order: built-in defaults, then an optional TOML file named
+by `ATLAS_CONFIG`, then environment variables. The TOML file holds non-secret
+deployment shape and is safe to commit and share across sites; environment
+variables override it for per-host differences. `ATLAS_API_TOKEN` is
+deliberately excluded from the file schema so a committed config can never
+carry a secret — unknown keys are rejected outright, which also surfaces typos.
 
-- `GET /healthz` — process health for local monitoring.
-- `POST /api/v1/assets` — authenticated upload, validation, metadata creation,
-  and image variant generation.
-- `GET /api/v1/assets/{id}` — authenticated or application-facing metadata
-  lookup, finalized with the API contract.
-- `DELETE /api/v1/assets/{id}` — authenticated deletion of metadata, original,
-  and variants.
-- `GET /media/{id}/{variant}` — public original/variant delivery.
+## Implemented prototype API
 
-Publish an OpenAPI description alongside the API. Use normal HTTP semantics:
-for example, `413 Payload Too Large` for byte-limit violations and `415
-Unsupported Media Type` for unsupported uploads.
+- `GET /healthz` — process health.
+- `POST /api/v1/assets` — authenticated raw-body upload. `Content-Type` names
+  the input type; the request body is streamed to a staging file with limits.
+  Returns `201` only after persistence and image processing complete.
+- `GET /api/v1/assets/{id}` — authenticated asset metadata, including original
+  facts and available width renditions.
+- `GET /media/{id}/original` — public, unmodified original.
+- `GET /media/{id}/w{max_width}` — public rendition with format selected from
+  `Accept`; JXL, AVIF, WebP, then an acceptable JPEG/PNG fallback.
 
-## Implementation phases
+Public files support `ETag`, conditional requests, single byte ranges, a
+one-year immutable cache policy, and `X-Content-Type-Options: nosniff`. PDFs are
+served inline; Word files are served as attachments. Media paths use only
+opaque lowercase base36 IDs and a configured width profile, never filesystem
+paths or user-controlled names. Anything that fails ID validation resolves to
+`404`.
 
-### 1. Repository and development baseline
+This prototype does not yet provide asset listing, deletion, an OpenAPI
+document, multipart uploads, or arbitrary URL transformations.
 
-- Keep `flake.nix` and `flake.lock` as the reproducible development shell.
-- Create the Rust crate, configuration loading, structured logging, and
-  `/healthz` endpoint.
-- Add formatting, lint, and test commands to the documented workflow.
+## Upload validation and processing limits
 
-### 2. Metadata and local storage
+- Stream request bodies to disk; never buffer an entire upload in memory.
+- Defaults: 20 MiB per image, 50 MiB per document, 40 megapixels, and 12,000
+  pixels maximum on either image edge. Configure byte/pixel limits with
+  environment variables.
+- Verify file signatures against the declared type. Signature mismatches,
+  unsupported formats, empty files, byte overages, and decoded-dimension
+  overages return clear errors.
+- Invoke ImageMagick with argument lists, generated temporary paths, explicit
+  formats, and per-process memory/map/disk/thread/time limits. Startup verifies
+  read/write support for JPEG, PNG, WebP, AVIF, and JXL.
+- Bound uploads to two concurrent requests, image conversions to one at a time,
+  each ImageMagick invocation to 45 seconds, and all processing for one image
+  to 120 seconds. No persistent job queue is needed for occasional uploads.
+- Originals and generated renditions are staged together, then atomically
+  promoted before metadata is committed. Startup removes incomplete staging
+  data and unindexed asset directories after a crash.
 
-- Define the asset and variant metadata model and SQLite migrations.
-- Create a configured data directory with safe permissions and opaque,
-  server-generated storage keys.
-- Implement staging and atomic promotion of completed uploads; avoid exposing
-  partially written files.
-- Define deletion and error-recovery behavior across metadata and files.
+HTTP errors use a small JSON envelope. Relevant statuses include `401`
+unauthorized, `413` upload too large, `415` unsupported/mismatched media type,
+`422` invalid or unprocessable media, and `406` when no stored format matches
+the request's `Accept` header.
 
-### 3. Authenticated upload and validation
+## Operations
 
-- Add bearer-token authentication for write operations and an initial
-  provisioning/rotation procedure for credentials.
-- Stream request bodies to disk with enforced per-category byte limits; do not
-  buffer whole uploads in memory.
-- Validate actual file signatures and allowlisted input formats rather than
-  trusting filenames or request MIME headers. The initial image allowlist is
-  JPEG, PNG, and WebP; camera RAW formats are rejected and must be converted by
-  administrators before upload.
-- Add dimension/pixel checks and useful validation error responses.
-
-### 4. Bounded image processing
-
-- Invoke ImageMagick using safe argument passing and temporary files, never a
-  shell-interpolated command.
-- Configure ImageMagick's allowed coders and resource limits (memory, disk,
-  dimensions, time, and threads) in addition to API-level checks.
-- Bound conversion concurrency; no distributed or persistent job queue is
-  needed for the expected upload frequency.
-- Preserve the original and generate a small, fixed set of size variants in
-  WebP, AVIF, and JPEG XL, plus a JPEG/PNG fallback appropriate to the source
-  image. Confirm all four outputs work in the selected ImageMagick package and
-  Nix development shell.
-- Configure reasonable per-format quality and effort settings. In particular,
-  keep AVIF/JXL encoding effort bounded because uploads are infrequent but run
-  on small shared hosts.
-- Leave PDFs, Word files, and videos unmodified; provide original delivery.
-
-### 5. Public delivery and API contract
-
-- Serve public assets by opaque ID, without exposing filesystem paths.
-- Set correct content types, cache policy, validators, and appropriate
-  `Content-Disposition`; support conditional requests and byte ranges where
-  practical.
-- Return format-specific URLs suitable for `<picture>` markup; preserve a
-  broadly supported JPEG/PNG fallback and avoid requiring consumers to guess
-  browser codec support.
-- Publish OpenAPI and examples for upload, lookup, deletion, and public URLs.
-- Ensure overwrites cannot silently change bytes behind an immutable URL.
-
-### 6. Deployment and operations
-
-- Provide a Linux service example (systemd), environment/configuration
-  reference, persistent-directory layout, reverse-proxy guidance, and
-  ImageMagick installation/policy requirements.
-- Keep Atlas listening on loopback when deployed behind the site's public
-  reverse proxy; expose public media reads and authenticated write routes as
-  appropriate.
-- Document backup and restore for metadata and files, including a tested
-  recovery procedure.
+- Development: run commands inside `nix develop`; lock the Nixpkgs revision in
+  `flake.lock`.
+- Production: bind Atlas to loopback behind the site's HTTPS reverse proxy;
+  expose `/media/` publicly and keep token-authenticated API calls server-side.
+- Keep the SQLite database and media directory persistent and on local storage.
+- Back up both metadata and files. Test restoring them together.
 
 ## Verification focus
 
-- Upload streaming enforces byte limits even without a valid `Content-Length`.
-- Unsupported formats and oversized decoded dimensions are rejected before
-  conversion/storage promotion.
-- ImageMagick failures, timeouts, and resource-limit failures do not leave
-  visible partial assets or orphaned metadata.
-- Public delivery cannot escape the media root and returns the expected MIME
-  type/cache behavior.
-- Delete and backup/restore behavior keeps database metadata and stored files
-  consistent.
+- Streaming limits hold with or without `Content-Length`.
+- RAW/mismatched signatures and excessive decoded dimensions are rejected
+  before publication.
+- ImageMagick failures/timeouts and database failures do not publish partial
+  assets; startup cleanup handles unindexed directories left by a crash.
+- Auto-format negotiation honors `Accept` quality values, emits `Vary: Accept`,
+  and uses a conventional fallback when appropriate.
+- Public resolution rejects non-base36 or wrong-length IDs with `404` and cannot
+  traverse outside the media root; validators and byte ranges refer to the
+  selected stored representation.
+- Config precedence is defaults < TOML file < environment; a config file
+  containing a secret-like key is rejected; the API token is never read from a
+  file.
 
 ## Deferred scope
 
-- Admin UI and rich content-management features
+- Admin UI, browser upload grants, asset listing/search, and deletion workflows
+- PDF/office rendering, OCR, and document conversion
 - Video transcoding and thumbnail pipelines
-- PDF/office document previews, OCR, and text extraction
-- Direct browser uploads and signed upload URLs
-- Shared multi-tenant instances, multiple service replicas, remote object
-  storage, and distributed job queues
+- Remote object storage, multiple service instances, multi-tenancy, and
+  distributed job queues

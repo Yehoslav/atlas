@@ -1,0 +1,28 @@
+[package]
+name = "atlas"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "An API-first media service for small sites"
+license = "GPL-3.0-only"
+readme = "README.md"
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+futures-util = "0.3"
+getrandom = "0.3"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
+subtle = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
