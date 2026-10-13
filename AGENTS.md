@@ -16,6 +16,20 @@ changes; update them when the planned scope or operational behavior changes.
 - Keep dependencies focused. Prefer stable, maintained crates and explain new
   native/runtime dependencies in the README.
 
+## Commits
+
+- Prefix the subject with a type: `feat:`, `fix:`, `perf:`, `refactor:`,
+  `docs:`, `test:`, or `chore:`.
+- Write the subject in the imperative mood, about 60 characters including
+  the prefix, with no trailing period.
+- Follow the subject with a blank line and a body wrapped at 72 columns.
+  Explain why the change was made and what it replaces; the diff already
+  shows what changed.
+- Add a `BREAKING CHANGE:` footer when callers must adapt. The HTTP API is
+  Atlas's public contract.
+- Name the `PLAN.md` or `TODO.md` item a change advances when that is not
+  obvious from the subject.
+
 ## Product and architecture constraints
 
 - Keep Atlas API-first; consuming applications own their structured content
