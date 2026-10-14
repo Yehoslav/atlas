@@ -1,0 +1,159 @@
+# Family Album
+
+A small Flask application that consumes Atlas the way a real site would. It
+exists to prove the integration contract from the consumer's side, so it is a
+reference implementation: readable source, one dependency file, and no
+production ambitions.
+
+The split is the point. **Atlas owns the media bytes. This application owns the
+meaning** — descriptions, alt text, tags, folders, and the posts that reference
+photos. Neither service stores the other's data. If a photo row is lost, the
+asset is still in Atlas; if an asset is purged, the album's captions are still
+here.
+
+## What it demonstrates
+
+- **Its own database.** `schema.sql` holds folders, photos, renditions, posts,
+  and the post/photo join. Not one of those tables exists in Atlas.
+- **A server-side Atlas client.** `atlas_client.py` is the only thing that knows
+  the API token. It streams uploads rather than buffering them, and it is never
+  imported by anything the browser sees.
+- **Sequential uploads with per-file results.** Atlas takes two concurrent
+  uploads but converts one image at a time, so a burst of ten earns a `503` from
+  half of them. This uploads one at a time and reports every file's outcome,
+  including camera RAW that Atlas refuses.
+- **Metadata editing that never calls Atlas.** A caption is the album's business.
+- **A referential guard.** Before deleting, the album checks its own posts for
+  published references and returns `409` with a confirm button. Atlas cannot do
+  this: it has no idea which of its assets a published page shows.
+- **Usage registration.** Attaching a photo to a post pins the asset in Atlas
+  (`PUT /api/v1/assets/{id}/pin`), so the retention sweep will never discard
+  bytes a reader can currently see.
+- **Renditions used properly.** `w320` for thumbnails, `w640`/`w960` for the
+  grid's `srcset`, and the widest stored rendition for the full-size view. The
+  widths come from the upload response and are stored, so the album never asks
+  Atlas to transform anything on a read.
+- **Graceful degradation.** Images carry an `onerror` fallback, and a photo page
+  whose asset Atlas has forgotten says so in words instead of showing a broken
+  image.
+
+## Two processes, not one
+
+Atlas and the album are separate services. The browser only ever talks to the
+album, except for `/media/` image bytes, which the site's reverse proxy serves
+straight from Atlas.
+
+```
+browser ──► reverse proxy ──┬──► /            → album (Flask, :5000)
+                            └──► /media/...   → Atlas   (:3000)
+                                      ▲
+                        album ─────────┘  HTTP + Bearer token, server-side only
+```
+
+## Running it
+
+Two terminals. Atlas first:
+
+```sh
+export ATLAS_API_TOKEN='a-long-random-secret'
+export ATLAS_DATA_DIR="$PWD/atlas-data"
+cargo run --manifest-path ../..    # or run from the Atlas checkout
+```
+
+Then the album, from this directory:
+
+```sh
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+
+export ATLAS_API_TOKEN='the-same-long-random-secret'
+export ATLAS_API_URL='http://127.0.0.1:3000'   # where the album reaches Atlas
+export ATLAS_MEDIA_URL='http://127.0.0.1:3000' # where the browser reaches /media/
+python app.py
+```
+
+Open <http://127.0.0.1:5000>.
+
+### Where the token lives
+
+In the album process's environment, and nowhere else. `atlas_client.py` reads
+`ATLAS_API_TOKEN`; the templates never see it, no route ever accepts it from the
+browser, and the album's SQLite database does not contain it. `ATLAS_API_TOKEN`
+belongs to Atlas's environment, not to a file — Atlas deliberately refuses to
+read it from a config file so a committed config can never carry a secret.
+
+### Which URLs are public
+
+| URL | Served by | Authenticated |
+| --- | --- | --- |
+| `/`, `/photos/…`, `/upload`, `/posts`, `/trash` | album | no (there is no login here) |
+| `/media/{id}/original`, `/media/{id}/w{width}` | Atlas | no, deliberately public |
+| `/api/v1/assets…` | Atlas | yes, Bearer token |
+
+This example has no accounts: it is a single-family reference app, and adding
+login would only hide the integration. A real site puts its own authentication
+in front of these album routes and keeps the Atlas token behind them.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATLAS_API_TOKEN` | required | The Atlas token. Server-side only. |
+| `ATLAS_API_URL` | `http://127.0.0.1:3000` | Where the album sends API calls |
+| `ATLAS_MEDIA_URL` | same origin as `ATLAS_API_URL` | Prefix for `/media/` URLs in HTML. Leave empty when the reverse proxy serves Atlas on the same origin, which is the normal deployment. |
+| `ALBUM_DATABASE` | `./album.sqlite3` | The album's own database |
+| `ALBUM_MAX_UPLOAD_BYTES` | 50 MiB | Per-file ceiling checked before uploading |
+| `ALBUM_MAX_REQUEST_BYTES` | 200 MiB | Whole-request ceiling for a bulk upload |
+| `ALBUM_HOST` / `ALBUM_PORT` | `127.0.0.1` / `5000` | Where the album listens |
+
+## Routes
+
+| Route | What it does |
+| --- | --- |
+| `GET /` | The grid, filterable by folder and by one of the album's own tags |
+| `GET /upload`, `POST /upload` | Single or bulk upload with a per-file report |
+| `GET /photos/<id>` | Full-size view, metadata form, references, delete guard |
+| `POST /photos/<id>` | Save description, alt text, tags, folder — album database only |
+| `POST /photos/<id>/delete` | Move the asset to Atlas's trash, after the referential guard |
+| `POST /photos/<id>/pin` | Toggle Atlas's purge pin by hand |
+| `POST /photos/<id>/attach` | Add this photo to a post and pin the asset |
+| `GET /posts` | Posts, publishing, and the photos in a post |
+| `GET /trash` | Atlas's trashed and purged assets |
+| `POST /trash/<asset_id>/restore` | Restore one |
+
+## Deleting, end to end
+
+1. The album checks its own `posts` table. A published post referencing the
+   photo returns `409` and names the post; nothing is deleted without
+   `confirm=yes`.
+2. `DELETE /api/v1/assets/{id}` moves the bytes into Atlas's trash. Atlas stamps
+   the delete *before* the files move, so the public URLs start serving a
+   placeholder immediately.
+3. The album drops its own row. Published posts now show a placeholder rather
+   than a broken image.
+4. `POST /trash/{id}/restore` brings the original bytes back at the same URLs.
+5. If nobody restores it, Atlas purges it after `ATLAS_TRASH_RETENTION_DAYS` and
+   keeps a tombstone. The album's row says the asset was purged; that is the
+   point of `GET /api/v1/assets/{id}` reporting `state`.
+
+## Tests
+
+```sh
+pip install -r requirements.txt pytest
+python -m pytest tests -q
+```
+
+The tests replace Atlas with an in-memory fake, so they need no running service.
+They cover the upload report, the rendition widths the album renders, metadata
+edits that never reach Atlas, the referential guard, pin registration, and what
+the pages do when an asset has gone missing.
+
+The source is formatted with [`ruff`](https://docs.astral.sh/ruff/) if you have
+it: `ruff format . && ruff check .`
+
+## Deliberately out of scope
+
+- Atlas-side listing, search, or tags. The album's own database covers that,
+  and the separation is the point of the exercise.
+- Authentication or multiple users.
+- Anything that would push Atlas toward knowing about albums, posts, or people.

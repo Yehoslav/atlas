@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     io::SeekFrom,
+    sync::LazyLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -19,7 +20,7 @@ use axum::{
     response::Response,
 };
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::{
     fs::{self, File},
@@ -31,13 +32,24 @@ use crate::{
     AppState,
     error::ApiError,
     ident::AssetId,
-    media::{MediaError, sha256_file, validate_signature},
-    model::{AssetRecord, RenditionFormat, RenditionRecord, SourceFormat, StoredAsset},
+    media::{MediaError, sha256_bytes, sha256_file, validate_signature},
+    model::{AssetRecord, AssetState, RenditionFormat, RenditionRecord, SourceFormat, StoredAsset},
     store::InsertOutcome,
 };
 
 const CACHE_POLICY: &str = "public, max-age=31536000, immutable";
+/// Deliberately short: the placeholder stands in for an asset that may come back
+/// from the trash, and an immutable one could outlive that restore by a year.
+const PLACEHOLDER_CACHE_POLICY: &str = "public, max-age=60";
 const MAX_ID_ATTEMPTS: usize = 5;
+
+/// The fallback served in place of retired assets. It is a plain image rather
+/// than an error so that a page already referencing an asset URL keeps
+/// rendering while the asset sits in the trash.
+pub(crate) const PLACEHOLDER_PNG: &[u8] = include_bytes!("../assets/placeholder.png");
+
+static PLACEHOLDER_ETAG: LazyLock<String> =
+    LazyLock::new(|| format!("\"{}\"", sha256_bytes(PLACEHOLDER_PNG)));
 
 #[derive(Serialize)]
 pub(super) struct HealthResponse {
@@ -52,6 +64,10 @@ pub(crate) async fn health() -> Json<HealthResponse> {
 pub(super) struct AssetResponse {
     id: String,
     created_at: i64,
+    state: AssetState,
+    deleted_at: Option<i64>,
+    purged_at: Option<i64>,
+    pinned: bool,
     original: OriginalResponse,
     renditions: Vec<RenditionResponse>,
 }
@@ -73,6 +89,32 @@ pub(super) struct RenditionResponse {
     height: u32,
     url: String,
     formats: Vec<&'static str>,
+}
+
+/// A trash listing entry. Purged entries are tombstones: they describe bytes
+/// that no longer exist, which is why they carry no rendition list.
+#[derive(Serialize)]
+pub(super) struct TrashEntryResponse {
+    id: String,
+    state: AssetState,
+    created_at: i64,
+    deleted_at: Option<i64>,
+    purged_at: Option<i64>,
+    pinned: bool,
+    bytes: u64,
+    content_type: &'static str,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub(super) struct TrashResponse {
+    assets: Vec<TrashEntryResponse>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct PinRequest {
+    pinned: bool,
 }
 
 impl From<&StoredAsset> for AssetResponse {
@@ -103,6 +145,10 @@ impl From<&StoredAsset> for AssetResponse {
         Self {
             id: asset.id.to_string(),
             created_at: asset.created_at,
+            state: asset.state(),
+            deleted_at: asset.deleted_at,
+            purged_at: asset.purged_at,
+            pinned: asset.pinned,
             original: OriginalResponse {
                 url: format!("/media/{}/original", asset.id),
                 content_type: asset.source_format.mime_type(),
@@ -112,6 +158,24 @@ impl From<&StoredAsset> for AssetResponse {
                 height: asset.height,
             },
             renditions,
+        }
+    }
+}
+
+impl From<&StoredAsset> for TrashEntryResponse {
+    fn from(value: &StoredAsset) -> Self {
+        let asset = &value.asset;
+        Self {
+            id: asset.id.to_string(),
+            state: asset.state(),
+            created_at: asset.created_at,
+            deleted_at: asset.deleted_at,
+            purged_at: asset.purged_at,
+            pinned: asset.pinned,
+            bytes: asset.bytes,
+            content_type: asset.source_format.mime_type(),
+            width: asset.width,
+            height: asset.height,
         }
     }
 }
@@ -247,6 +311,9 @@ async fn create_asset(
         width: dimensions.map(|value| value.width),
         height: dimensions.map(|value| value.height),
         created_at,
+        deleted_at: None,
+        purged_at: None,
+        pinned: false,
     };
 
     let mut final_dir = state.asset_dir(&record.id);
@@ -289,7 +356,20 @@ async fn create_asset(
         }
     };
 
+    schedule_purge(state);
+
     Ok((StatusCode::CREATED, Json(AssetResponse::from(&stored))))
+}
+
+/// Sweep expired trash in the background. There is no scheduler, so an upload is
+/// the only other moment where the sweep can happen.
+fn schedule_purge(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = state.purge_expired_trash().await {
+            tracing::error!(%error, "opportunistic trash purge failed");
+        }
+    });
 }
 
 async fn stream_upload(
@@ -337,13 +417,124 @@ pub(super) async fn get_asset(
 ) -> Result<Json<AssetResponse>, ApiError> {
     authorize(&state, &headers)?;
     let id = parse_id(&id)?;
-    let asset = state
+    let asset = load_asset(&state, &id).await?;
+    Ok(Json(AssetResponse::from(&asset)))
+}
+
+/// Move an asset to the trash instead of destroying it.
+///
+/// The soft delete is recorded before the files move, so the window where Atlas
+/// refuses to publish is strictly wider than the window where the bytes are
+/// still in `assets/`. A crash in between leaves the bytes to be swept into the
+/// trash by startup recovery, never a live row with missing files.
+pub(super) async fn delete_asset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    authorize(&state, &headers)?;
+    let id = parse_id(&id)?;
+    let asset = load_asset(&state, &id).await?;
+
+    if asset.asset.state() == AssetState::Active {
+        state
+            .store
+            .mark_deleted(&id, crate::unix_now().map_err(ApiError::internal)?)
+            .await
+            .map_err(ApiError::internal)?;
+        let from = state.asset_dir(&id);
+        if tokio::fs::symlink_metadata(&from).await.is_ok() {
+            if let Err(error) = fs::rename(&from, state.trash_dir(&id)).await {
+                tracing::error!(
+                    asset = %id,
+                    %error,
+                    "the asset is in the trash but its files were not moved; startup recovery will finish the move"
+                );
+                return Err(ApiError::internal(error));
+            }
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn restore_asset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    authorize(&state, &headers)?;
+    let id = parse_id(&id)?;
+    let asset = load_asset(&state, &id).await?;
+
+    match asset.asset.state() {
+        AssetState::Active => return Ok(StatusCode::NO_CONTENT),
+        AssetState::Purged => {
+            return Err(ApiError::conflict(
+                "asset_purged",
+                "The asset was purged and its files no longer exist.",
+            ));
+        }
+        AssetState::Deleted => {}
+    }
+
+    // Files first: a crash here leaves a deleted row over files that are back in
+    // `assets/`, which recovery resolves back into the trash.
+    fs::rename(state.trash_dir(&id), state.asset_dir(&id))
+        .await
+        .map_err(ApiError::internal)?;
+    state
         .store
-        .get_asset(&id)
+        .mark_restored(&id)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Record that a consuming application still uses this asset, so purge skips it.
+pub(super) async fn set_pin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<PinRequest>,
+) -> Result<Json<AssetResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let id = parse_id(&id)?;
+    if !state
+        .store
+        .set_pinned(&id, body.pinned)
         .await
         .map_err(ApiError::internal)?
-        .ok_or_else(ApiError::not_found)?;
+    {
+        return Err(ApiError::not_found());
+    }
+    let asset = load_asset(&state, &id).await?;
     Ok(Json(AssetResponse::from(&asset)))
+}
+
+pub(super) async fn list_trash(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<TrashResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let assets = state
+        .store
+        .trashed_assets()
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(TrashResponse {
+        assets: assets.iter().map(TrashEntryResponse::from).collect(),
+    }))
+}
+
+async fn load_asset(state: &AppState, id: &AssetId) -> Result<StoredAsset, ApiError> {
+    state
+        .store
+        .get_asset(id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)
 }
 
 pub(super) async fn get_original(
@@ -352,12 +543,10 @@ pub(super) async fn get_original(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id)?;
-    let asset = state
-        .store
-        .get_asset(&id)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(ApiError::not_found)?;
+    let asset = load_asset(&state, &id).await?;
+    if let Some(response) = serve_placeholder_if_retired(&headers, &asset) {
+        return Ok(response);
+    }
     let path = state.asset_dir(&id).join(format!(
         "original.{}",
         asset.asset.source_format.extension()
@@ -392,12 +581,10 @@ pub(super) async fn get_rendition(
         .strip_prefix('w')
         .and_then(|value| value.parse::<u32>().ok())
         .ok_or_else(ApiError::not_found)?;
-    let asset = state
-        .store
-        .get_asset(&id)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(ApiError::not_found)?;
+    let asset = load_asset(&state, &id).await?;
+    if let Some(response) = serve_placeholder_if_retired(&headers, &asset) {
+        return Ok(response);
+    }
     let available: Vec<_> = asset
         .renditions
         .iter()
@@ -420,6 +607,44 @@ pub(super) async fn get_rendition(
         true,
     )
     .await
+}
+
+/// Public delivery for a trashed or purged asset.
+///
+/// The URL keeps working so that pages already referencing it never break, but
+/// the bytes are gone from Atlas's point of view. The placeholder is cached
+/// briefly rather than immutably, because a restore can bring the asset back.
+fn serve_placeholder_if_retired(headers: &HeaderMap, asset: &StoredAsset) -> Option<Response> {
+    let state = asset.asset.state();
+    if !state.is_retired() {
+        return None;
+    }
+    tracing::debug!(asset = %asset.asset.id, ?state, "serving the placeholder for a retired asset");
+    Some(serve_placeholder(headers))
+}
+
+fn serve_placeholder(request_headers: &HeaderMap) -> Response {
+    let etag = PLACEHOLDER_ETAG.clone();
+    if etag_matches(request_headers, &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(ETAG, etag)
+            .header(CACHE_CONTROL, PLACEHOLDER_CACHE_POLICY)
+            .body(Body::empty())
+            .expect("static placeholder response is well formed");
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "image/png")
+        .header(CONTENT_LENGTH, PLACEHOLDER_PNG.len().to_string())
+        .header(CONTENT_DISPOSITION, "inline; filename=\"placeholder.png\"")
+        .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(CACHE_CONTROL, PLACEHOLDER_CACHE_POLICY)
+        .header(ETAG, etag)
+        .header(ACCEPT_RANGES, "bytes")
+        .body(Body::from(PLACEHOLDER_PNG))
+        .expect("static placeholder response is well formed")
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -760,6 +985,7 @@ mod tests {
     use std::{path::PathBuf, process::Command, time::Duration};
 
     use axum::{
+        Router,
         body::{Body, to_bytes},
         http::{HeaderMap, HeaderValue, Request, StatusCode, header::ACCEPT},
     };
@@ -771,7 +997,7 @@ mod tests {
         model::{RenditionFormat, RenditionRecord},
     };
 
-    use super::{ByteRange, parse_range, select_format};
+    use super::{ByteRange, PLACEHOLDER_PNG, parse_range, select_format};
 
     fn rendition(format: RenditionFormat) -> RenditionRecord {
         RenditionRecord {
@@ -856,6 +1082,7 @@ mod tests {
             magick_bin: "magick".to_owned(),
             magick_timeout: Duration::from_secs(45),
             image_processing_timeout: Duration::from_secs(120),
+            trash_retention_days: 30,
         }
     }
 
@@ -867,6 +1094,381 @@ mod tests {
             .header("content-type", content_type)
             .body(Body::from(body))
             .unwrap()
+    }
+
+    fn pin_request(id: &str, pinned: bool) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/api/v1/assets/{id}/pin"))
+            .header("authorization", "Bearer prototype-test-token")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"pinned":{pinned}}}"#)))
+            .unwrap()
+    }
+
+    fn authorized(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer prototype-test-token")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn send(router: &Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        };
+        (status, value)
+    }
+
+    async fn upload_document(router: &Router, body: &[u8]) -> String {
+        let (status, value) = send(router, upload_request("application/pdf", body.to_vec())).await;
+        assert_eq!(status, StatusCode::CREATED);
+        value["id"].as_str().unwrap().to_owned()
+    }
+
+    async fn place_in_trash(router: &Router, id: &str) {
+        let (status, _) = send(
+            router,
+            authorized("DELETE", &format!("/api/v1/assets/{id}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn delete_stops_serving_bytes_and_restore_brings_them_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let state = AppState::new(test_config(data_dir.clone())).await.unwrap();
+        let router = app(state);
+
+        let id = upload_document(&router, b"%PDF-1.7\ntrash me").await;
+        let (status, body) =
+            send(&router, authorized("GET", &format!("/api/v1/assets/{id}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "active");
+        assert_eq!(body["pinned"], false);
+        assert!(body["deleted_at"].is_null());
+
+        place_in_trash(&router, &id).await;
+        assert!(
+            !data_dir.join("assets").join(&id).exists(),
+            "the live directory is emptied by the delete"
+        );
+        assert!(data_dir.join("trash").join(&id).exists());
+
+        let (status, body) =
+            send(&router, authorized("GET", &format!("/api/v1/assets/{id}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "deleted");
+        assert!(body["deleted_at"].is_i64());
+        assert!(body["purged_at"].is_null());
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/media/{id}/original"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/png");
+        assert_eq!(response.headers()["cache-control"], "public, max-age=60");
+        assert_eq!(
+            response.headers()["content-length"],
+            PLACEHOLDER_PNG.len().to_string()
+        );
+        let etag = response.headers()["etag"].clone();
+        assert_eq!(
+            to_bytes(response.into_body(), 1024 * 1024).await.unwrap()[..],
+            PLACEHOLDER_PNG[..]
+        );
+
+        let not_modified = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/media/{id}/original"))
+                    .header("if-none-match", etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            not_modified.headers()["cache-control"],
+            "public, max-age=60"
+        );
+
+        let (status, _) = send(
+            &router,
+            authorized("POST", &format!("/api/v1/assets/{id}/restore")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(data_dir.join("assets").join(&id).exists());
+        assert!(!data_dir.join("trash").join(&id).exists());
+
+        let restored = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/media/{id}/original"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
+        assert_eq!(restored.headers()["content-type"], "application/pdf");
+        assert_eq!(
+            restored.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+
+        let (status, body) =
+            send(&router, authorized("GET", &format!("/api/v1/assets/{id}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "active");
+        assert!(body["deleted_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn rendition_urls_also_fall_back_to_the_placeholder() {
+        let directory = tempfile::tempdir().unwrap();
+        let image_path = directory.path().join("source.png");
+        let generated = Command::new("magick")
+            .args(["-size", "640x480", "xc:red"])
+            .arg(format!("PNG:{}", image_path.display()))
+            .output()
+            .unwrap();
+        assert!(generated.status.success());
+        let image = tokio::fs::read(&image_path).await.unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let router = app(state);
+
+        let (status, value) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = value["id"].as_str().unwrap().to_owned();
+        place_in_trash(&router, &id).await;
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/media/{id}/w320"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/png");
+        assert_eq!(response.headers()["cache-control"], "public, max-age=60");
+    }
+
+    #[tokio::test]
+    async fn trash_listing_and_pinning_are_authenticated() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let router = app(state);
+        let id = upload_document(&router, b"%PDF-1.7\nlisted").await;
+
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/trash")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let (status, body) = send(&router, authorized("GET", "/api/v1/trash")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["assets"].as_array().unwrap().len(), 0);
+
+        place_in_trash(&router, &id).await;
+        let (status, body) = send(&router, authorized("GET", "/api/v1/trash")).await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = body["assets"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], id.as_str());
+        assert_eq!(entries[0]["state"], "deleted");
+        assert_eq!(entries[0]["content_type"], "application/pdf");
+
+        let (status, body) = send(&router, pin_request(&id, true)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["pinned"], true);
+
+        let unknown = "aaaaaaaaaaaaaaaaaaaa";
+        let (status, _) = send(&router, pin_request(unknown, true)).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unknown id has no row to pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_ids_stay_not_found_after_a_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let router = app(state);
+        let unknown = "aaaaaaaaaaaaaaaaaaaa";
+
+        for (method, uri) in [
+            ("DELETE", format!("/api/v1/assets/{unknown}")),
+            ("POST", format!("/api/v1/assets/{unknown}/restore")),
+            ("GET", format!("/api/v1/assets/{unknown}")),
+        ] {
+            let (status, _) = send(&router, authorized(method, &uri)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+
+        for uri in [
+            format!("/media/{unknown}/original"),
+            format!("/media/{unknown}/w320"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_keeps_a_tombstone_and_skips_pinned_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let mut config = test_config(data_dir.clone());
+        config.trash_retention_days = 30;
+
+        let state = AppState::new(config.clone()).await.unwrap();
+        let expired = upload_document(&app(state.clone()), b"%PDF-1.7\nexpired").await;
+        let kept = upload_document(&app(state.clone()), b"%PDF-1.7\tkept").await;
+        let router = app(state.clone());
+        place_in_trash(&router, &expired).await;
+        place_in_trash(&router, &kept).await;
+
+        let (status, body) = send(&router, authorized("GET", "/api/v1/trash")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["assets"].as_array().unwrap().len(), 2);
+
+        let (status, _) = send(&router, pin_request(&kept, true)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let long_ago = crate::unix_now().unwrap() - 40 * 24 * 60 * 60;
+        for id in [&expired, &kept] {
+            state
+                .store
+                .backdate_deletion(&AssetId::parse(id).unwrap(), long_ago)
+                .await;
+        }
+        drop(state);
+        drop(router);
+
+        // A restart is when the retention window is enforced.
+        let state = AppState::new(config).await.unwrap();
+        let router = app(state);
+        assert!(!data_dir.join("trash").join(&expired).exists());
+        assert!(data_dir.join("trash").join(&kept).exists());
+
+        let (status, body) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/assets/{expired}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "purged");
+        assert!(body["purged_at"].is_i64());
+        assert_eq!(
+            body["renditions"].as_array().unwrap().len(),
+            0,
+            "a tombstone does not advertise bytes that are gone"
+        );
+
+        let (status, body) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/assets/{kept}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "deleted");
+        assert_eq!(body["pinned"], true);
+
+        let (status, body) = send(&router, authorized("GET", "/api/v1/trash")).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut states: Vec<_> = body["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["state"].as_str().unwrap().to_owned())
+            .collect();
+        states.sort();
+        assert_eq!(states, vec!["deleted", "purged"]);
+
+        let (status, _) = send(
+            &router,
+            authorized("POST", &format!("/api/v1/assets/{expired}/restore")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "purged bytes cannot come back"
+        );
+
+        let (status, _) = send(
+            &router,
+            authorized("POST", &format!("/api/v1/assets/{kept}/restore")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn recovery_returns_an_interrupted_delete_to_the_trash() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let config = test_config(data_dir.clone());
+        let state = AppState::new(config.clone()).await.unwrap();
+        let id = upload_document(&app(state.clone()), b"%PDF-1.7\ninterrupted").await;
+        drop(state);
+
+        // Crash between recording the delete and moving the files.
+        let state = AppState::new(config.clone()).await.unwrap();
+        state
+            .store
+            .mark_deleted(&AssetId::parse(&id).unwrap(), crate::unix_now().unwrap())
+            .await
+            .unwrap();
+        drop(state);
+
+        let _state = AppState::new(config).await.unwrap();
+        assert!(!data_dir.join("assets").join(&id).exists());
+        assert!(data_dir.join("trash").join(&id).exists());
     }
 
     #[tokio::test]

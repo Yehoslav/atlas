@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# The album's own database. It is content, not code: back it up, do not commit it.
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

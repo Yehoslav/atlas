@@ -20,6 +20,7 @@ pub struct Config {
     pub magick_bin: String,
     pub magick_timeout: Duration,
     pub image_processing_timeout: Duration,
+    pub trash_retention_days: u32,
 }
 
 impl Config {
@@ -125,6 +126,16 @@ impl Config {
                 )?,
                 "ATLAS_IMAGE_PROCESSING_TIMEOUT_SECS",
             )?),
+            trash_retention_days: u32::try_from(positive(
+                setting(
+                    &file.trash_retention_days,
+                    "ATLAS_TRASH_RETENTION_DAYS",
+                    30,
+                    parse_u64,
+                )?,
+                "ATLAS_TRASH_RETENTION_DAYS",
+            )?)
+            .map_err(|_| "ATLAS_TRASH_RETENTION_DAYS must fit in 32 bits".to_owned())?,
         })
     }
 }
@@ -143,6 +154,7 @@ struct FileConfig {
     magick_bin: Option<String>,
     magick_timeout_secs: Option<u64>,
     image_processing_timeout_secs: Option<u64>,
+    trash_retention_days: Option<u64>,
 }
 
 impl FileConfig {
@@ -286,6 +298,7 @@ mod tests {
             "ATLAS_MAGICK_BIN",
             "ATLAS_MAGICK_TIMEOUT_SECS",
             "ATLAS_IMAGE_PROCESSING_TIMEOUT_SECS",
+            "ATLAS_TRASH_RETENTION_DAYS",
         ] {
             remove_var(name);
         }
@@ -430,5 +443,21 @@ mod tests {
         set_var("ATLAS_VARIANT_WIDTHS", "800,400,800");
         let config = Config::from_env().unwrap();
         assert_eq!(config.variant_widths, vec![400, 800]);
+    }
+
+    #[test]
+    fn trash_retention_defaults_to_thirty_days() {
+        let _guard = env_lock();
+        base_env();
+        assert_eq!(Config::from_env().unwrap().trash_retention_days, 30);
+
+        set_var("ATLAS_TRASH_RETENTION_DAYS", "7");
+        assert_eq!(Config::from_env().unwrap().trash_retention_days, 7);
+
+        set_var("ATLAS_TRASH_RETENTION_DAYS", "0");
+        assert!(
+            Config::from_env().is_err(),
+            "zero days would purge instantly"
+        );
     }
 }

@@ -47,6 +47,17 @@ media files and media metadata only.
   existing rows keep the IDs they were issued.
 - Files live in a private persistent data directory outside any public web
   root. The directory must be private to the Atlas service account.
+- Deletion is a lifecycle, not an erasure. `DELETE` moves the bytes to a trash
+  directory and stamps `deleted_at`; purge discards them after a retention
+  window and leaves a tombstone. Public URLs keep working throughout and serve
+  a short-cached placeholder while the asset is retired, so a page already
+  referencing an asset never breaks. A consuming application can pin an asset
+  it still uses, and that pin is the only hint Atlas ever gets about consumer
+  content.
+- Schema changes are additive SQL migrations applied at startup. Rebuilding a
+  table is a last resort guarded against `ON DELETE CASCADE`, and startup
+  refuses to serve from a database that fails `integrity_check` or
+  `foreign_key_check`.
 
 ## Configuration
 
@@ -64,7 +75,11 @@ carry a secret — unknown keys are rejected outright, which also surfaces typos
   the input type; the request body is streamed to a staging file with limits.
   Returns `201` only after persistence and image processing complete.
 - `GET /api/v1/assets/{id}` — authenticated asset metadata, including original
-  facts and available width renditions.
+  facts, available width renditions, and the asset's lifecycle state.
+- `DELETE /api/v1/assets/{id}` — authenticated move to the trash.
+- `POST /api/v1/assets/{id}/restore` — authenticated restore from the trash.
+- `PUT /api/v1/assets/{id}/pin` — authenticated usage registration.
+- `GET /api/v1/trash` — authenticated listing of trashed and purged assets.
 - `GET /media/{id}/original` — public, unmodified original.
 - `GET /media/{id}/w{max_width}` — public rendition with format selected from
   `Accept`; JXL, AVIF, WebP, then an acceptable JPEG/PNG fallback.
@@ -76,7 +91,12 @@ opaque lowercase base36 IDs and a configured width profile, never filesystem
 paths or user-controlled names. Anything that fails ID validation resolves to
 `404`.
 
-This prototype does not yet provide asset listing, deletion, an OpenAPI
+A retired asset — trashed or purged — is still a known ID, so its URLs resolve
+to an embedded placeholder with `Cache-Control: public, max-age=60` rather than
+`404`; an unknown ID stays `404`. The placeholder is deliberately not immutable,
+because a restore can bring the asset back.
+
+This prototype does not yet provide asset listing, search, an OpenAPI
 document, multipart uploads, or arbitrary URL transformations.
 
 ## Upload validation and processing limits
@@ -97,11 +117,27 @@ document, multipart uploads, or arbitrary URL transformations.
 - Originals and generated renditions are staged together, then atomically
   promoted before metadata is committed. Startup removes incomplete staging
   data and unindexed asset directories after a crash.
+- Trashed assets are purged at startup and, at most once an hour, after an
+  upload. Purge records the tombstone before deleting bytes, so a crash leaves
+  files that startup recovery sweeps rather than a row claiming bytes that are
+  gone. Startup recovery returns interrupted deletes and restores to the state
+  their rows record, and leaves the trash otherwise untouched.
 
 HTTP errors use a small JSON envelope. Relevant statuses include `401`
-unauthorized, `413` upload too large, `415` unsupported/mismatched media type,
-`422` invalid or unprocessable media, and `406` when no stored format matches
-the request's `Accept` header.
+unauthorized, `409` when a purged asset cannot be restored, `413` upload too
+large, `415` unsupported/mismatched media type, `422` invalid or
+unprocessable media, and `406` when no stored format matches the request's
+`Accept` header.
+
+## Example consumer
+
+`examples/family-album/` is a small Flask application that consumes Atlas the way
+a real site would. It owns a SQLite database of folders, descriptions, alt text,
+tags, posts, and references; it holds the API token server-side; it deletes only
+after checking its own posts for published references; and it uses the stored
+rendition widths in `srcset`. It exists to prove the integration contract from
+the consumer side and is not part of the service.
+
 
 ## Operations
 
@@ -110,7 +146,9 @@ the request's `Accept` header.
 - Production: bind Atlas to loopback behind the site's HTTPS reverse proxy;
   expose `/media/` publicly and keep token-authenticated API calls server-side.
 - Keep the SQLite database and media directory persistent and on local storage.
-- Back up both metadata and files. Test restoring them together.
+- Snapshot the database with `VACUUM INTO`, never `cp` — WAL mode means a copied
+  database file can be missing committed rows. Verify each snapshot, then copy
+  the media directories. Test restoring both together.
 
 ## Verification focus
 
@@ -127,10 +165,16 @@ the request's `Accept` header.
 - Config precedence is defaults < TOML file < environment; a config file
   containing a secret-like key is rejected; the API token is never read from a
   file.
+- Deleting stops public delivery before the files move; a trashed asset serves
+  the placeholder; restore returns the bytes to the same URLs; purge keeps a
+  tombstone and skips pinned assets.
+- A table rebuild guarded against `ON DELETE CASCADE` preserves child rows,
+  and the same rebuild without the guard is caught by a test that proves the
+  cascade would have deleted them silently.
 
 ## Deferred scope
 
-- Admin UI, browser upload grants, asset listing/search, and deletion workflows
+- Admin UI, browser upload grants, asset listing/search, and tagging
 - PDF/office rendering, OCR, and document conversion
 - Video transcoding and thumbnail pipelines
 - Remote object storage, multiple service instances, multi-tenancy, and

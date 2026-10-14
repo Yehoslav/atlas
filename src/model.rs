@@ -164,6 +164,41 @@ pub struct AssetRecord {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub created_at: i64,
+    /// When the asset moved to trash; `None` while it is live.
+    pub deleted_at: Option<i64>,
+    /// When the trashed bytes were discarded; the row outlives them as a tombstone.
+    pub purged_at: Option<i64>,
+    /// Set by a consuming application that still uses this asset, so purge skips it.
+    pub pinned: bool,
+}
+
+impl AssetRecord {
+    pub fn state(&self) -> AssetState {
+        if self.purged_at.is_some() {
+            AssetState::Purged
+        } else if self.deleted_at.is_some() {
+            AssetState::Deleted
+        } else {
+            AssetState::Active
+        }
+    }
+}
+
+/// How Atlas should treat an asset: live, in trash, or purged to a tombstone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssetState {
+    Active,
+    Deleted,
+    Purged,
+}
+
+impl AssetState {
+    /// A tombstone or a trashed asset no longer has bytes to publish, so public
+    /// delivery answers with the placeholder instead.
+    pub fn is_retired(self) -> bool {
+        !matches!(self, Self::Active)
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Trash &middot; Family Album{% endblock %}
+
+{% block content %}
+  <h1>Atlas trash</h1>
+  <p class="hint">
+    Deleting a photo in this album moves the asset into Atlas's trash rather than
+    destroying it. Atlas keeps it there for its retention window (30 days by
+    default) and then discards it, leaving a tombstone. Restoring puts the
+    original bytes back at the same URLs.
+  </p>
+
+  {% if atlas_error %}
+    <p class="notice notice-error">Atlas could not be reached: {{ atlas_error }}</p>
+  {% elif entries %}
+    <table class="trash">
+      <thead>
+        <tr>
+          <th>Asset</th><th>State</th><th>Type</th><th>Size</th><th>Deleted</th><th>Pinned</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for entry in entries %}
+          <tr>
+            <td><code>{{ entry.id }}</code></td>
+            <td>
+              {{ entry.state }}
+              {% if entry.pinned %}<span class="badge">pinned</span>{% endif %}
+            </td>
+            <td>{{ entry.content_type }}</td>
+            <td>{{ human_bytes(entry.bytes) }}</td>
+            <td>{{ timestamp(entry.deleted_at) }}</td>
+            <td>
+              {% if entry.is_restorable %}
+                <form method="post" action="{{ url_for('restore', asset_id=entry.id) }}" class="inline">
+                  <button type="submit">Restore</button>
+                </form>
+              {% else %}
+                <span class="hint">Purged; the bytes are gone.</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">The trash is empty.</p>
+  {% endif %}
+{% endblock %}

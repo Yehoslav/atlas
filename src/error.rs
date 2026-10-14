@@ -56,6 +56,10 @@ impl ApiError {
         )
     }
 
+    pub fn conflict(code: &'static str, detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, detail)
+    }
+
     pub fn too_large() -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,

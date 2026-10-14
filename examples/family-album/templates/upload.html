@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Upload &middot; Family Album{% endblock %}
+
+{% block content %}
+  <h1>Upload photos</h1>
+
+  <form method="post" enctype="multipart/form-data" class="stack upload-form" action="{{ url_for('upload') }}">
+    <label for="photos">JPEG, PNG, WebP, PDF, or Word files &mdash; up to {{ human_bytes(max_upload_bytes) }} each</label>
+    <input id="photos" type="file" name="photos" multiple required>
+
+    <p class="hint">
+      Files are uploaded to Atlas one at a time and in order. Atlas accepts two
+      concurrent uploads but converts one image at a time, so a burst would be
+      rejected; this stays politely in line instead.
+    </p>
+
+    <button type="submit">Upload</button>
+  </form>
+
+  {% if results %}
+    <h2>Results</h2>
+    <ul class="results">
+      {% for result in results %}
+        <li class="result {{ 'result-ok' if result.ok else 'result-failed' }}">
+          <strong>{{ result.filename }}</strong>
+          <span>{{ result.message }}</span>
+          {% if result.photo_id %}
+            <a href="{{ url_for('photo_detail', photo_id=result.photo_id) }}">Add a description</a>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+    <p class="hint">
+      {{ results | selectattr('ok') | list | length }} of {{ results | length }} uploaded.
+    </p>
+  {% endif %}
+{% endblock %}

@@ -329,6 +329,12 @@ pub async fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
 fn parse_dimensions(bytes: &[u8]) -> Result<ImageDimensions, MediaError> {
     let output = std::str::from_utf8(bytes)
         .map_err(|_| MediaError::Invalid("Image dimensions could not be read.".to_owned()))?;

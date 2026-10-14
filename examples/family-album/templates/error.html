@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Not found &middot; Family Album{% endblock %}
+
+{% block content %}
+  <h1>{{ message }}</h1>
+  <p><a href="{{ url_for('index') }}">Back to the album</a></p>
+{% endblock %}

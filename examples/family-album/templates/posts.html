@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Posts &middot; Family Album{% endblock %}
+
+{% block content %}
+  <h1>Posts</h1>
+
+  <form method="post" action="{{ url_for('create_post') }}" class="stack">
+    <label for="title">New post</label>
+    <input id="title" name="title" placeholder="Grandma's 70th" maxlength="200" required>
+    <label class="visually-hidden" for="body">Body</label>
+    <textarea id="body" name="body" rows="2" placeholder="Optional notes"></textarea>
+    <button type="submit">Create draft</button>
+  </form>
+
+  {% if posts %}
+    <ul class="post-list">
+      {% for post in posts %}
+        <li class="post {{ 'post-selected' if selected and selected['id'] == post['id'] }}">
+          <a href="{{ url_for('posts', post=post['id']) }}">
+            {{ post['title'] }}
+            {% if post['published_at'] %}
+              <span class="badge">published {{ timestamp(post['published_at'] | int) }}</span>
+            {% else %}
+              <span class="badge badge-draft">draft</span>
+            {% endif %}
+          </a>
+          <span class="hint">{{ post['photo_count'] }} photo{{ '' if post['photo_count'] == 1 else 's' }}</span>
+
+          <form method="post" action="{{ url_for('publish_post', post_id=post['id']) }}" class="inline">
+            {% if post['published_at'] %}
+              <input type="hidden" name="publish" value="no">
+              <button type="submit">Unpublish</button>
+            {% else %}
+              <input type="hidden" name="publish" value="yes">
+              <button type="submit">Publish</button>
+            {% endif %}
+          </form>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="empty">No posts yet.</p>
+  {% endif %}
+
+  {% if selected %}
+    <h2>{{ selected['title'] }}</h2>
+    {% if photos %}
+      <ul class="grid">
+        {% for photo in photos %}
+          <li class="tile">
+            <img
+              src="{{ images.thumbnail_url(photo) }}"
+              alt="{{ photo.alt_text or photo.description or 'Family photo' }}"
+              loading="lazy"
+              onerror="this.hidden = true; this.nextElementSibling.hidden = false;">
+            <div class="missing" hidden><span>Not available</span></div>
+            <form method="post" action="{{ url_for('toggle_post_photo', post_id=selected['id'], photo_id=photo.id) }}">
+              <button type="submit" class="danger">Remove from this post</button>
+            </form>
+          </li>
+        {% endfor %}
+      </ul>
+      <p class="hint">
+        A published post pins its photos in Atlas, so Atlas will never purge an
+        asset a reader can currently see.
+      </p>
+    {% else %}
+      <p class="empty">This post has no photos yet. Add one from a photo's page.</p>
+    {% endif %}
+  {% endif %}
+{% endblock %}

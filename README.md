@@ -17,7 +17,14 @@ without conversion.
 - `POST /api/v1/assets` — authenticated upload. The body is the file itself;
   `Content-Type` identifies the allowed format. It streams to disk and returns
   an asset ID, original metadata, and rendition URLs.
-- `GET /api/v1/assets/{id}` — authenticated metadata lookup.
+- `GET /api/v1/assets/{id}` — authenticated metadata lookup, including the
+  asset's `state` (`active`, `deleted`, or `purged`) and its `pinned` flag.
+- `DELETE /api/v1/assets/{id}` — authenticated move to the trash. Returns `204`.
+- `POST /api/v1/assets/{id}/restore` — authenticated restore from the trash.
+  Returns `204`, or `409` if the asset was already purged.
+- `PUT /api/v1/assets/{id}/pin` — authenticated usage registration. Body
+  `{"pinned": true|false}`; purge skips pinned assets.
+- `GET /api/v1/trash` — authenticated listing of trashed and purged assets.
 - `GET /media/{id}/original` — public original delivery.
 - `GET /media/{id}/w{width}` — public width rendition. Atlas selects a
   pre-generated JXL, AVIF, WebP, or JPEG/PNG fallback using `Accept` and returns
@@ -27,8 +34,8 @@ The default rendition widths are 320, 640, 960, and 1280 pixels. They preserve
 the original aspect ratio and are not upscaled. Configure a different fixed
 set with `ATLAS_VARIANT_WIDTHS=320,640,1280`; arbitrary sizes are not generated
 on public requests. Consuming sites can use the URLs in `srcset` and set their
-own `sizes` value. Atlas does not currently provide listing, deletion, or
-arbitrary transformation endpoints.
+own `sizes` value. Atlas does not currently provide listing, search, or
+arbitrary transformation endpoints, and never converts or re-encodes on a read.
 
 ## Asset IDs
 
@@ -63,6 +70,32 @@ uploaded format. For example:
 Uploads require `Authorization: Bearer $ATLAS_API_TOKEN`. Keep this token in the
 consuming server or CLI, never in browser code. Public media reads do not need a
 token.
+
+## Trash, restore, and purge
+
+Atlas never destroys an asset on request. `DELETE /api/v1/assets/{id}` moves
+`assets/<id>` to `trash/<id>` and stamps `deleted_at`. The soft delete is
+recorded *before* the files move, so from the first moment of the delete the
+public URLs stop serving the real bytes and answer with a small embedded
+placeholder image (`assets/placeholder.png`, compiled into the binary) sent with
+`Cache-Control: public, max-age=60`. That is deliberate: the placeholder is not
+immutable, because a restore can bring the asset back, and an immutable
+placeholder could outlive the restore by a year.
+
+Once an asset has been in the trash for `ATLAS_TRASH_RETENTION_DAYS` (30 by
+default) and no consumer has pinned it, purge discards the files and keeps the
+row as a tombstone with `purged_at`. Atlas can then still tell "deleted" from
+"never existed": an unknown ID is `404`, a tombstoned ID serves the placeholder,
+and `GET /api/v1/assets/{id}` reports `state: "purged"`. Rendition rows go with
+the bytes, so a tombstone does not advertise URLs that would resolve to
+nothing. Purge runs at startup and, at most once an hour, after an upload;
+there is no scheduler and no job queue.
+
+Pins are the one hint Atlas has about consumer content. Register an asset that
+a published post still uses and Atlas will never purge it.
+
+Nothing here is a replacement for a consuming site's own referential checks —
+Atlas cannot know which of its assets your posts mention.
 
 ## Development
 
@@ -111,6 +144,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
+## Example consumer
+
+[`examples/family-album/`](examples/family-album/) is a small Flask site that
+consumes Atlas the way a real one would: it owns its own database of folders,
+descriptions, alt text, tags, and posts, keeps the API token on the server,
+checks its own posts before deleting, and renders the stored rendition widths
+in `srcset`. Its own tests run against a fake Atlas:
+
+```sh
+cd examples/family-album
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt pytest
+python -m pytest tests -q
+```
+
 ## Configuration
 
 Atlas reads settings from, in increasing order of precedence: built-in
@@ -136,6 +184,8 @@ max_image_dimension = 12000
 magick_bin = "magick"
 magick_timeout_secs = 45
 image_processing_timeout_secs = 120
+
+trash_retention_days = 30
 ```
 
 Unknown keys are rejected so typos surface immediately. Secrets stay in the
@@ -159,11 +209,20 @@ Environment variables override the file, which is useful for per-host values:
 | `ATLAS_MAGICK_BIN` | `magick` | ImageMagick executable |
 | `ATLAS_MAGICK_TIMEOUT_SECS` | 45 | Per ImageMagick invocation limit |
 | `ATLAS_IMAGE_PROCESSING_TIMEOUT_SECS` | 120 | Total processing limit per image |
+| `ATLAS_TRASH_RETENTION_DAYS` | 30 | Days a trashed asset is kept before purge |
 
 Uploads are streamed to staging files; at most two uploads and one conversion
 run concurrently. ImageMagick receives explicit input/output formats and
 resource limits. Failed requests do not publish partial assets. On startup,
-Atlas removes incomplete staging data and unindexed asset directories.
+Atlas applies any pending schema migrations, runs `PRAGMA integrity_check` and
+`PRAGMA foreign_key_check` (refusing to start if either reports a problem),
+removes incomplete staging data, and returns any interrupted delete or restore
+to the state its row records.
+
+Schema changes live in `migrations/` and run through `sqlx::migrate!`. See
+[`migrations/README.md`](migrations/README.md) for the SQLite `ALTER TABLE`
+limits, the `ON DELETE CASCADE` hazard when rebuilding a table, and the
+additive-migration policy Atlas follows.
 
 ## Production notes
 
@@ -173,8 +232,65 @@ non-empty data directory that is accessible by group/other users. Install
 SQLite runtime libraries and ImageMagick with the required codecs. Check codec
 support with `magick -list format`. Run Atlas behind the site's HTTPS reverse
 proxy, routing `/media/` publicly and keeping the token-protected API on the
-server side. Proxy path matching must be case-preserving. Back up both the
-SQLite database and the media directory.
+server side. Proxy path matching must be case-preserving.
+
+## Backup and restore
+
+Metadata and files are useless separately: a restore that pairs a database with
+a different set of `assets/` directories makes every asset undeliverable. Back
+both up, and drill the restore.
+
+**Snapshot the database with `VACUUM INTO`, never `cp`.** Atlas runs SQLite in
+WAL mode, where committed transactions may still live in `atlas.sqlite3-wal`.
+Copying `atlas.sqlite3` on its own captures neither the WAL nor a consistent
+cut, and the result may be a database that opens fine and is missing rows.
+`VACUUM INTO` takes a read lock, writes a single consistent file, and compacts
+it as a side effect:
+
+```sh
+sqlite3 "$ATLAS_DATA_DIR/atlas.sqlite3" \
+  "VACUUM INTO '/backup/atlas-$(date -u +%Y%m%dT%H%M%SZ).sqlite3'"
+```
+
+**SQLite does not `fsync` the `VACUUM INTO` output.** A crash or a full disk
+during the write can leave a short file that still opens. A backup job that
+assumes success is a backup that does not exist, so verify each snapshot:
+
+```sh
+sqlite3 /backup/atlas-20260101T000000Z.sqlite3 'PRAGMA integrity_check;'
+sqlite3 /backup/atlas-20260101T000000Z.sqlite3 \
+  'SELECT COUNT(*) FROM assets; SELECT COUNT(*) FROM renditions;'
+```
+
+`PRAGMA quick_check` is enough to catch a truncated file; `integrity_check` is
+the stricter version. Keep the output, and compare the counts with the live
+database (`SELECT COUNT(*) FROM assets`) at a quiet moment.
+
+**Then copy the files.** A file copy only has to be internally consistent, so
+`snapshot`, `rsync -a`, or `tar` are all fine:
+
+```sh
+rsync -a --delete "$ATLAS_DATA_DIR/assets/" /backup/assets/
+rsync -a --delete "$ATLAS_DATA_DIR/trash/"  /backup/trash/
+```
+
+Snapshot the database *first*: the file copy taken afterwards may contain an
+asset the database does not know about (harmless — startup recovery removes
+unindexed directories) rather than missing one (broken delivery until the next
+upload). Note that files copied while Atlas is running can be mid-upload; the
+staging directory is never published, so ignore it and let startup recovery
+clear it.
+
+**Restore drill.** Stop Atlas, restore both halves, start it, and check:
+
+1. `GET /healthz` returns `ok` — this already proves the migrations applied and
+   both `PRAGMA` checks passed.
+2. `GET /api/v1/assets/{id}` for a known asset returns its metadata.
+3. `GET /media/{id}/original` returns `200` with the expected length, not a
+   placeholder.
+
+A restore drill that has not fetched an actual file has not tested the thing
+that matters.
 
 ## License
 

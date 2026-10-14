@@ -1,0 +1,6 @@
+# The Family Album example runs on Flask and talks to Atlas over HTTP.
+Flask>=3.0,<4
+requests>=2.31,<3
+
+# Only needed to run the example's own tests:
+#   pip install -r requirements.txt pytest
