@@ -50,6 +50,9 @@ DEFAULT_MAX_REQUEST_BYTES = 4 * DEFAULT_MAX_UPLOAD_BYTES
 THUMBNAIL_WIDTH = 320
 GRID_WIDTHS = (640, 960)
 
+#: How many ids go into one state lookup. Matches Atlas's own cap.
+STATE_CHUNK = 500
+
 
 @dataclass
 class UploadResult:
@@ -85,7 +88,7 @@ class AssetCheck:
     """What Atlas can tell this album about one asset right now."""
 
     status: str
-    asset: Any = None
+    pinned: bool = False
 
     @property
     def live(self) -> bool:
@@ -228,24 +231,38 @@ def create_app(
         if connection is not None:
             connection.close()
 
-    def check_asset(asset_id: str) -> AssetCheck:
-        """Ask Atlas once per request what it can serve for this asset.
+    def check_assets(asset_ids: Iterable[str]) -> dict[str, AssetCheck]:
+        """Ask Atlas what it can serve for every asset on this page, at once.
 
         The album cannot know on its own: Atlas has no listing endpoint, so the
         only way to learn that an asset was deleted, purged, or lost is to ask.
-        One request per photo on the page, cached so a photo rendered twice
-        costs one call.
+        One batched call per page - not one per photo - cached for the request so
+        a photo rendered twice costs nothing.
         """
-        cache = g.setdefault("asset_checks", {})
-        if asset_id not in cache:
-            cache[asset_id] = fetch_asset(atlas, asset_id)
-        return cache[asset_id]
+        cache: dict[str, AssetCheck] = g.setdefault("asset_checks", {})
+        wanted = [i for i in dict.fromkeys(asset_ids) if i not in cache]
+        for start in range(0, len(wanted), STATE_CHUNK):
+            chunk = wanted[start : start + STATE_CHUNK]
+            try:
+                found = atlas.states(chunk)
+            except AtlasError:
+                cache.update(
+                    {asset_id: AssetCheck("unreachable") for asset_id in chunk}
+                )
+                continue
+            cache.update(
+                {
+                    asset_id: AssetCheck(state.state, state.pinned)
+                    for asset_id, state in found.items()
+                }
+            )
+        return {asset_id: cache[asset_id] for asset_id in wanted} | cache
 
     images = AlbumImages(atlas)
     app.jinja_env.globals.update(
         atlas=atlas,
         images=images,
-        check_asset=check_asset,
+        check_assets=check_assets,
         fallback_reason=FALLBACK_REASON,
         human_bytes=human_bytes,
         timestamp=format_timestamp,
@@ -264,6 +281,7 @@ def create_app(
         return render_template(
             "index.html",
             photos=photos,
+            checks=check_assets(photo.asset_id for photo in photos),
             folders=album_db.list_folders(connection),
             folder=album_db.get_folder(connection, folder_id) if folder_id else None,
             tag=request.args.get("tag") or None,
@@ -294,6 +312,7 @@ def create_app(
         return render_template(
             "photo.html",
             photo=photo,
+            checks=check_assets([photo.asset_id]),
             references=album_db.references_for_photo(connection, photo_id),
             posts=album_db.list_posts(connection),
             folders=album_db.list_folders(connection),
@@ -330,6 +349,7 @@ def create_app(
                 render_template(
                     "photo.html",
                     photo=photo,
+                    checks=check_assets([photo.asset_id]),
                     blocking=references,
                     references=references,
                     posts=album_db.list_posts(connection),
@@ -358,8 +378,7 @@ def create_app(
     @app.post("/photos/<int:photo_id>/pin")
     def toggle_pin(photo_id: int) -> str:
         photo = album_db.get_photo(get_db(), photo_id) or abort(404)
-        asset = check_asset(photo.asset_id).asset
-        wanted = not (asset.pinned if asset else False)
+        wanted = not check_assets([photo.asset_id])[photo.asset_id].pinned
         try:
             atlas.set_pinned(photo.asset_id, wanted)
         except AtlasError as error:
@@ -375,11 +394,13 @@ def create_app(
     def posts() -> str:
         connection = get_db()
         post_id = request.args.get("post", type=int)
+        photos = album_db.post_photos(connection, post_id) if post_id else []
         return render_template(
             "posts.html",
             posts=album_db.list_posts(connection),
             selected=album_db.get_post(connection, post_id) if post_id else None,
-            photos=album_db.post_photos(connection, post_id) if post_id else [],
+            photos=photos,
+            checks=check_assets(photo.asset_id for photo in photos),
         )
 
     @app.post("/posts")
@@ -503,11 +524,26 @@ def _upload_one(
         )
 
     try:
-        asset = atlas.upload(storage.stream, content_type)
+        asset = atlas.upload(storage.stream, content_type, file_name=filename)
     except AtlasError as error:
         return UploadResult(filename, False, error.message)
 
-    photo_id = album_db.add_photo(connection, asset)
+    try:
+        photo_id = album_db.add_photo(connection, asset)
+    except sqlite3.IntegrityError:
+        # Atlas deduplicates identical bytes and hands back the existing asset.
+        # The album keeps one row per asset, so this file is already here.
+        existing = album_db.get_photo_by_asset(connection, asset.id)
+        title = existing.description if existing and existing.description else "a photo"
+        return UploadResult(
+            filename,
+            False,
+            f"Already in the album: this file is the same as an existing asset ({asset.id}),"
+            f" kept as {title}.",
+            asset_id=asset.id,
+            photo_id=existing.id if existing else None,
+        )
+
     widths = (
         ", ".join(str(rendition.max_width) for rendition in asset.renditions) or "none"
     )
@@ -518,17 +554,6 @@ def _upload_one(
         asset_id=asset.id,
         photo_id=photo_id,
     )
-
-
-def fetch_asset(atlas: AtlasClient, asset_id: str) -> AssetCheck:
-    """One Atlas metadata lookup, with every outcome named."""
-    try:
-        asset = atlas.get_asset(asset_id)
-    except AtlasError:
-        return AssetCheck("unreachable")
-    if asset is None:
-        return AssetCheck("missing")
-    return AssetCheck(asset.state, asset)
 
 
 def _sync_pin(

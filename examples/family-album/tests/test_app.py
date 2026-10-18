@@ -7,6 +7,7 @@ sends, and what it does when an asset is missing - without a running Atlas.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import sys
 from pathlib import Path
@@ -17,7 +18,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import album_db
 from app import create_app
-from atlas_client import Asset, AtlasError, Rendition, TrashEntry
+from atlas_client import (
+    Asset,
+    AssetState,
+    AtlasError,
+    Rendition,
+    TrashEntry,
+)
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n not really a png"
 
@@ -32,11 +39,20 @@ class FakeAtlas:
         self.pins: dict[str, bool] = {}
         self.next_id = 0
         self.fail_next_upload: str | None = None
+        self.state_calls: list[list[str]] = []
+        self.file_names: list[str | None] = []
+        self.by_digest: dict[str, Asset] = {}
+        self.file_names: list[str | None] = []
         # Source width of the next upload. Atlas caps renditions at the source,
         # so a small photo stores narrower images than its profiles ask for.
         self.source_width = 1600
 
-    def _make(self, state: str = "active", pinned: bool = False) -> Asset:
+    def _make(
+        self,
+        state: str = "active",
+        pinned: bool = False,
+        file_name: str | None = None,
+    ) -> Asset:
         self.next_id += 1
         asset_id = f"{self.next_id:018d}"
         source = self.source_width
@@ -68,14 +84,33 @@ class FakeAtlas:
 
     # --- the interface app.py uses -----------------------------------------
 
-    def upload(self, stream, content_type: str) -> Asset:
+    def upload(self, stream, content_type: str, file_name: str | None = None) -> Asset:
         if self.fail_next_upload:
             message, self.fail_next_upload = self.fail_next_upload, None
             raise AtlasError(message, status=415)
-        return self._make()
+        digest = hashlib.sha256(stream.read()).hexdigest()
+        stream.seek(0)
+        if digest in self.by_digest:
+            return self.by_digest[digest]
+        self.file_names.append(file_name)
+        asset = self._make(file_name=file_name)
+        self.by_digest[digest] = asset
+        return asset
 
     def get_asset(self, asset_id: str) -> Asset | None:
         return self.assets.get(asset_id)
+
+    def states(self, asset_ids: list[str]) -> dict[str, AssetState]:
+        self.state_calls.append(list(asset_ids))
+        found = {}
+        for asset_id in asset_ids:
+            asset = self.assets.get(asset_id)
+            found[asset_id] = AssetState(
+                id=asset_id,
+                state=asset.state if asset else "missing",
+                pinned=asset.pinned if asset else False,
+            )
+        return found
 
     def delete(self, asset_id: str) -> None:
         self.deleted.append(asset_id)
@@ -134,10 +169,30 @@ def client(atlas: FakeAtlas, tmp_path: Path):
     return app.test_client()
 
 
-def upload_png(client, name: str = "holiday.png") -> str:
+def png_bytes(seed: object = "") -> bytes:
+    """Unique bytes per upload: Atlas deduplicates identical ones by design."""
+    return PNG_BYTES + str(seed).encode()
+
+
+def upload_png(client, name: str = "holiday.png", seed: object = "") -> str:
     response = client.post(
         "/upload",
-        data={"photos": (io.BytesIO(PNG_BYTES), name)},
+        data={"photos": (io.BytesIO(png_bytes(seed or name)), name)},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 200, response.get_data(as_text=True)
+    return response.get_data(as_text=True)
+
+
+def upload_document(client, name: str = "menu.pdf", seed: object = "") -> str:
+    response = client.post(
+        "/upload",
+        data={
+            "photos": (
+                io.BytesIO(b"%PDF-1.7\n" + str(seed or name).encode()),
+                name,
+            )
+        },
         content_type="multipart/form-data",
     )
     assert response.status_code == 200, response.get_data(as_text=True)
@@ -164,9 +219,9 @@ def test_bulk_upload_reports_each_file_separately(client, atlas):
         "/upload",
         data={
             "photos": [
-                (io.BytesIO(PNG_BYTES), "one.png"),
+                (io.BytesIO(png_bytes("one")), "one.png"),
                 (io.BytesIO(b"II*\0raw"), "two.cr2"),
-                (io.BytesIO(PNG_BYTES), "three.png"),
+                (io.BytesIO(png_bytes("three")), "three.png"),
             ]
         },
         content_type="multipart/form-data",
@@ -184,8 +239,8 @@ def test_a_failed_upload_does_not_stop_the_rest(client, atlas):
         "/upload",
         data={
             "photos": [
-                (io.BytesIO(PNG_BYTES), "broken.png"),
-                (io.BytesIO(PNG_BYTES), "fine.png"),
+                (io.BytesIO(png_bytes("broken")), "broken.png"),
+                (io.BytesIO(png_bytes("fine")), "fine.png"),
             ]
         },
         content_type="multipart/form-data",
@@ -220,6 +275,54 @@ def test_a_small_photo_renders_its_real_width_in_the_srcset(client, atlas):
     detail = client.get(f"/photos/{photo_id}").get_data(as_text=True)
     assert f"/media/{asset_id}/w960 500w" in detail
     assert f"/media/{asset_id}/w1280 500w" in detail
+
+
+def test_the_uploaded_name_travels_to_atlas(client, atlas):
+    upload_png(client, "Unsere Familie.png", seed="family")
+    sent = [name for name in atlas.file_names if name]
+    assert sent == ["Unsere Familie.png"], sent
+
+    # The client percent-encodes, because Python's HTTP layer would raise on a
+    # non-Latin-1 header value.
+    from urllib.parse import quote
+
+    assert quote("Unsere Familie.png", safe="") == "Unsere%20Familie.png"
+
+
+def test_uploading_identical_bytes_points_at_the_existing_photo(client, atlas):
+    """Atlas deduplicates; the album keeps one row per asset and says so."""
+    upload_png(client, "beach.png", seed="beach")
+    photo_id = _only_photo_id(client, atlas)
+    asset_id = next(iter(atlas.assets))
+    client.post(
+        f"/photos/{photo_id}",
+        data={"description": "Sunset at the pier", "alt_text": "", "tags": "summer"},
+    )
+
+    again = upload_png(client, "beach-again.png", seed="beach")
+    assert "Already in the album" in again, again
+    assert asset_id in again
+    assert f"/photos/{photo_id}" in again, "the existing photo is linked"
+
+    connection = album_db.connect(client.application.config["DATABASE"])
+    try:
+        photos = album_db.list_photos(connection)
+    finally:
+        connection.close()
+    assert len(photos) == 1, "one album row, not two rows for one asset"
+
+
+def test_a_repeated_upload_of_a_document_reports_the_existing_photo(client, atlas):
+    upload_document(client, seed="menu")
+    connection = album_db.connect(client.application.config["DATABASE"])
+    try:
+        photo_id = album_db.list_photos(connection)[0].id
+    finally:
+        connection.close()
+
+    page = upload_document(client, seed="menu")
+    assert "Already in the album" in page
+    assert f"/photos/{photo_id}" in page
 
 
 def test_metadata_editing_never_touches_atlas(client, atlas):
@@ -335,10 +438,10 @@ def test_an_unreachable_atlas_is_reported_without_breaking_the_page(client, atla
     upload_png(client)
     photo_id = _only_photo_id(client, atlas)
 
-    def explode(asset_id: str) -> None:
+    def explode(asset_ids: list[str]):
         raise AtlasError("connection refused", status=503)
 
-    atlas.get_asset = explode  # type: ignore[method-assign]
+    atlas.states = explode  # type: ignore[method-assign]
 
     page = client.get(f"/photos/{photo_id}")
     assert page.status_code == 200
@@ -347,22 +450,45 @@ def test_an_unreachable_atlas_is_reported_without_breaking_the_page(client, atla
     assert "could not be reached" in body
 
 
-def test_each_asset_is_asked_about_once_per_page(client, atlas):
-    upload_png(client)
-    photo_id = _only_photo_id(client, atlas)
+def test_a_page_asks_about_every_asset_in_one_call(client, atlas):
+    upload_png(client, "one.png")
+    upload_png(client, "two.png")
+    upload_png(client, "three.png")
+    assert len(atlas.assets) == 3
 
-    calls: list[str] = []
-    original = atlas.get_asset
-
-    def counting(asset_id: str):
-        calls.append(asset_id)
-        return original(asset_id)
-
-    atlas.get_asset = counting  # type: ignore[method-assign]
-
-    page = client.get(f"/photos/{photo_id}")
+    page = client.get("/")
     assert page.status_code == 200
-    assert calls == [next(iter(atlas.assets))]
+
+    calls = atlas.state_calls
+    assert len(calls) == 1, "one batched call per page, not one per photo"
+    assert sorted(calls[0]) == sorted(atlas.assets)
+
+
+def test_a_repeated_asset_costs_nothing(client, atlas):
+    upload_png(client)
+    asset_id = next(iter(atlas.assets))
+
+    client.get("/")
+    client.get(f"/photos/{_only_photo_id(client, atlas)}")
+
+    assert atlas.state_calls.count([asset_id]) == 2
+    assert len(atlas.state_calls) == 2, "each request asks once"
+
+
+def test_state_lookups_are_chunked(client, atlas, monkeypatch):
+    """A page larger than one lookup is split rather than refused."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "STATE_CHUNK", 2)
+    upload_png(client, "one.png")
+    upload_png(client, "two.png")
+    upload_png(client, "three.png")
+
+    client.get("/")
+
+    assert len(atlas.state_calls) == 2
+    asked = [asset_id for call in atlas.state_calls for asset_id in call]
+    assert sorted(asked) == sorted(atlas.assets)
 
 
 def test_a_trashed_asset_offers_a_restore(client, atlas):

@@ -164,6 +164,8 @@ pub struct AssetRecord {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub created_at: i64,
+    /// The name the uploader gave the file, if it sent one. Never a path.
+    pub original_name: Option<String>,
     /// When the asset moved to trash; `None` while it is live.
     pub deleted_at: Option<i64>,
     /// When the trashed bytes were discarded; the row outlives them as a tombstone.
@@ -191,11 +193,14 @@ pub enum AssetState {
     Active,
     Deleted,
     Purged,
+    /// Atlas has no row with this id. Only a state lookup reports this;
+    /// `GET /api/v1/assets/{id}` answers `404` instead.
+    Missing,
 }
 
 impl AssetState {
-    /// A tombstone or a trashed asset no longer has bytes to publish, so public
-    /// delivery answers with the placeholder instead.
+    /// Anything but a live asset has no bytes to publish, so public delivery
+    /// answers with the placeholder instead.
     pub fn is_retired(self) -> bool {
         !matches!(self, Self::Active)
     }

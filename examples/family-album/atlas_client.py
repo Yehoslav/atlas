@@ -15,6 +15,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, BinaryIO
+from urllib.parse import quote
 
 import requests
 
@@ -22,6 +23,12 @@ import requests
 #: long a slow request may stall a worker. Image conversion is bounded by
 #: Atlas, which will not convert more than one image at a time.
 DEFAULT_TIMEOUT = 120
+
+#: Atlas caps one state lookup at this many ids.
+MAX_STATE_IDS = 500
+
+#: How Atlas learns the name an uploader gave a file.
+ORIGINAL_FILENAME_HEADER = "X-Original-Filename"
 
 #: Atlas serves images and documents; it does not accept camera RAW.
 CONTENT_TYPES = {
@@ -73,6 +80,19 @@ class Asset:
     @property
     def is_live(self) -> bool:
         """Atlas will serve real bytes only for an active asset."""
+        return self.state == "active"
+
+
+@dataclass(frozen=True)
+class AssetState:
+    """What Atlas will serve for one asset: `active`, `deleted`, `purged` or `missing`."""
+
+    id: str
+    state: str
+    pinned: bool
+
+    @property
+    def is_live(self) -> bool:
         return self.state == "active"
 
 
@@ -182,18 +202,26 @@ class AtlasClient:
         self,
         stream: BinaryIO,
         content_type: str,
+        file_name: str | None = None,
         retries: int = 1,
         retry_delay: float = 2.0,
     ) -> Asset:
-        """Stream one file to Atlas. Atlas validates it; the album only names a type.
+        """Stream one file to Atlas. Atlas validates it; the album only names things.
 
         The stream is passed to requests as-is, so a 50 MiB document never sits
-        in this process's memory.
+        in this process's memory. Returns the asset Atlas stored, which may be
+        one that already existed: `POST /api/v1/assets` answers `200` instead of
+        `201` for identical bytes, and the caller can tell by its own rows.
+
+        `file_name` goes out percent-encoded because Python's HTTP layer encodes
+        header values as Latin-1 and would raise on anything else.
         """
         headers = {
             "Authorization": f"Bearer {self._token}",
             "Content-Type": content_type,
         }
+        if file_name:
+            headers[ORIGINAL_FILENAME_HEADER] = quote(file_name, safe="")
         attempt = 0
         while True:
             try:
@@ -227,6 +255,33 @@ class AtlasClient:
             return None
         self._raise_for_status(response)
         return _parse_asset(response.json(), self.media_base_url)
+
+    def states(self, asset_ids: list[str]) -> dict[str, AssetState]:
+        """Lifecycle state for ids the caller already knows, in one call.
+
+        This is the call that makes a gallery page affordable: without it a
+        consumer has to ask about every asset one at a time. Ids Atlas has never
+        heard of come back as `missing` rather than being absent, because telling
+        "never existed" apart from "deleted" is the reason to ask.
+        """
+        if not asset_ids:
+            return {}
+        if len(asset_ids) > MAX_STATE_IDS:
+            raise ValueError(f"at most {MAX_STATE_IDS} ids per state lookup")
+
+        response = self._send(
+            "POST",
+            "/api/v1/assets/state",
+            json={"ids": asset_ids},
+            headers=self._headers(),
+        )
+        self._raise_for_status(response)
+        return {
+            entry["id"]: AssetState(
+                id=entry["id"], state=entry["state"], pinned=entry["pinned"]
+            )
+            for entry in response.json()["assets"]
+        }
 
     def delete(self, asset_id: str) -> None:
         """Move an asset to Atlas's trash. The bytes are still restorable there."""

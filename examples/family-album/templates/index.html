@@ -33,7 +33,7 @@
   {% if photos %}
     <ul class="grid">
       {% for photo in photos %}
-        {% set check = check_asset(photo.asset_id) if photo.is_image else None %}
+        {% set check = checks[photo.asset_id] if photo.is_image else None %}
         <li class="tile{% if check and not check.live %} tile-missing{% endif %}">
           <a href="{{ url_for('photo_detail', photo_id=photo.id) }}">
             {% if photo.is_image and check.live %}

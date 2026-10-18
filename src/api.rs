@@ -8,7 +8,7 @@ use std::{
 use axum::{
     Json,
     body::Body,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{
@@ -31,6 +31,7 @@ use tokio_util::io::ReaderStream;
 use crate::{
     AppState,
     error::ApiError,
+    filename,
     ident::AssetId,
     media::{MediaError, sha256_bytes, sha256_file, validate_signature},
     model::{AssetRecord, AssetState, RenditionFormat, RenditionRecord, SourceFormat, StoredAsset},
@@ -47,6 +48,9 @@ const MAX_ID_ATTEMPTS: usize = 5;
 /// than an error so that a page already referencing an asset URL keeps
 /// rendering while the asset sits in the trash.
 pub(crate) const PLACEHOLDER_PNG: &[u8] = include_bytes!("../assets/placeholder.png");
+
+/// Optional, untrusted, percent-encoded. See [`crate::filename`].
+const ORIGINAL_FILENAME_HEADER: &str = "x-original-filename";
 
 static PLACEHOLDER_ETAG: LazyLock<String> =
     LazyLock::new(|| format!("\"{}\"", sha256_bytes(PLACEHOLDER_PNG)));
@@ -75,6 +79,8 @@ pub(super) struct AssetResponse {
 #[derive(Serialize)]
 pub(super) struct OriginalResponse {
     url: String,
+    /// The name the uploader gave the file, when it sent one.
+    filename: Option<String>,
     content_type: &'static str,
     bytes: u64,
     sha256: String,
@@ -110,11 +116,46 @@ pub(super) struct TrashEntryResponse {
 #[derive(Serialize)]
 pub(super) struct TrashResponse {
     assets: Vec<TrashEntryResponse>,
+    total: i64,
+    limit: i64,
+    offset: i64,
 }
+
+/// A trash page is bounded so the listing cannot grow without limit. Callers
+/// page through `offset`; the default covers any realistic single screen.
+const DEFAULT_TRASH_LIMIT: i64 = 200;
+const MAX_TRASH_LIMIT: i64 = 500;
 
 #[derive(Deserialize)]
 pub(super) struct PinRequest {
     pinned: bool,
+}
+
+/// How many ids one state lookup may carry. A page of photos is the use case;
+/// anything larger is a caller bug or an attempt to make Atlas a database.
+const MAX_STATE_IDS: usize = 500;
+
+#[derive(Deserialize)]
+pub(super) struct TrashQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct StateRequest {
+    ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub(super) struct StateEntryResponse {
+    id: String,
+    state: AssetState,
+    pinned: bool,
+}
+
+#[derive(Serialize)]
+pub(super) struct StateResponse {
+    assets: Vec<StateEntryResponse>,
 }
 
 impl From<&StoredAsset> for AssetResponse {
@@ -151,6 +192,7 @@ impl From<&StoredAsset> for AssetResponse {
             pinned: asset.pinned,
             original: OriginalResponse {
                 url: format!("/media/{}/original", asset.id),
+                filename: asset.original_name.clone(),
                 content_type: asset.source_format.mime_type(),
                 bytes: asset.bytes,
                 sha256: asset.sha256.clone(),
@@ -208,6 +250,15 @@ pub(super) async fn upload_asset(
             ));
         }
     }
+    // Raw UTF-8 or percent-encoded; see `crate::filename`.
+    let original_name = match headers.get(ORIGINAL_FILENAME_HEADER) {
+        Some(value) => Some(
+            filename::from_header_bytes(value.as_bytes())
+                .map_err(|error| ApiError::bad_request("invalid_filename", error.to_string()))?,
+        ),
+        None => None,
+    };
+
     if let Some(content_length) = headers.get(CONTENT_LENGTH) {
         let declared = content_length
             .to_str()
@@ -231,7 +282,15 @@ pub(super) async fn upload_asset(
     fs::create_dir(&staging_dir)
         .await
         .map_err(ApiError::internal)?;
-    let result = create_asset(&state, id, source_format, request.into_body(), &staging_dir).await;
+    let result = create_asset(
+        &state,
+        id,
+        source_format,
+        original_name,
+        request.into_body(),
+        &staging_dir,
+    )
+    .await;
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging_dir).await;
     }
@@ -242,6 +301,7 @@ async fn create_asset(
     state: &AppState,
     id: AssetId,
     source_format: SourceFormat,
+    original_name: Option<String>,
     body: Body,
     staging_dir: &std::path::Path,
 ) -> Result<(StatusCode, Json<AssetResponse>), ApiError> {
@@ -265,6 +325,29 @@ async fn create_asset(
     let original_sha256 = sha256_file(&original_path)
         .await
         .map_err(ApiError::internal)?;
+
+    // Identical bytes are the same asset, because asset URLs are immutable and
+    // content is what identifies one. Checked before any conversion, so a
+    // repeated upload costs a hash instead of a full image pass.
+    if let Some(existing) = state
+        .store
+        .find_live_by_sha256(&original_sha256)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        let asset = state
+            .store
+            .get_asset(&existing)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::internal("the duplicate asset vanished mid-upload"))?;
+        // Nothing was published, so the staged copy goes away with the request.
+        fs::remove_dir_all(staging_dir)
+            .await
+            .map_err(ApiError::internal)?;
+        // 200 rather than 201: nothing was created, and saying so is the point.
+        return Ok((StatusCode::OK, Json(AssetResponse::from(&asset))));
+    }
 
     let (dimensions, renditions) = if source_format.is_image() {
         let _permit = state
@@ -311,6 +394,7 @@ async fn create_asset(
         width: dimensions.map(|value| value.width),
         height: dimensions.map(|value| value.height),
         created_at,
+        original_name,
         deleted_at: None,
         purged_at: None,
         pinned: false,
@@ -469,7 +553,7 @@ pub(super) async fn restore_asset(
 
     match asset.asset.state() {
         AssetState::Active => return Ok(StatusCode::NO_CONTENT),
-        AssetState::Purged => {
+        AssetState::Purged | AssetState::Missing => {
             return Err(ApiError::conflict(
                 "asset_purged",
                 "The asset was purged and its files no longer exist.",
@@ -513,18 +597,84 @@ pub(super) async fn set_pin(
     Ok(Json(AssetResponse::from(&asset)))
 }
 
+/// Answer "which of the ids I already know can you still serve?".
+///
+/// This is not a listing: the caller supplies the ids, so Atlas learns nothing
+/// about the consumer's content and the result cannot be paged through. Ids
+/// Atlas does not know come back as `missing`, because telling "never existed"
+/// apart from "deleted" is the whole reason a consumer asks.
+pub(super) async fn asset_states(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StateRequest>,
+) -> Result<Json<StateResponse>, ApiError> {
+    authorize(&state, &headers)?;
+
+    if body.ids.len() > MAX_STATE_IDS {
+        return Err(ApiError::bad_request(
+            "too_many_ids",
+            format!("Ask about at most {MAX_STATE_IDS} assets at a time."),
+        ));
+    }
+
+    let mut ids = Vec::with_capacity(body.ids.len());
+    for raw in &body.ids {
+        let id = AssetId::parse(raw).map_err(|_| {
+            ApiError::bad_request(
+                "invalid_asset_ids",
+                "Every id must be a lowercase base36 asset id of 12 to 24 characters.",
+            )
+        })?;
+        ids.push(id);
+    }
+
+    let known = state
+        .store
+        .asset_states_by_id(&ids)
+        .await
+        .map_err(ApiError::internal)?;
+    let assets = ids
+        .into_iter()
+        .map(|id| {
+            let (state, pinned) = known
+                .get(id.as_str())
+                .copied()
+                .unwrap_or((AssetState::Missing, false));
+            StateEntryResponse {
+                id: id.to_string(),
+                state,
+                pinned,
+            }
+        })
+        .collect();
+
+    Ok(Json(StateResponse { assets }))
+}
+
 pub(super) async fn list_trash(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<TrashQuery>,
 ) -> Result<Json<TrashResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let assets = state
-        .store
-        .trashed_assets()
-        .await
-        .map_err(ApiError::internal)?;
+
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_TRASH_LIMIT)
+        .clamp(1, MAX_TRASH_LIMIT);
+    let offset = query.offset.unwrap_or(0).max(0);
+
+    let (assets, total) = tokio::try_join!(
+        state.store.trashed_assets(limit, offset),
+        state.store.trashed_count(),
+    )
+    .map_err(ApiError::internal)?;
+
     Ok(Json(TrashResponse {
         assets: assets.iter().map(TrashEntryResponse::from).collect(),
+        total,
+        limit,
+        offset,
     }))
 }
 
@@ -564,6 +714,7 @@ pub(super) async fn get_original(
         &path,
         asset.asset.bytes,
         &asset.asset.sha256,
+        asset.asset.original_name.as_deref(),
         asset.asset.source_format.mime_type(),
         disposition,
         false,
@@ -592,6 +743,7 @@ pub(super) async fn get_rendition(
         &path,
         selected.bytes,
         &selected.sha256,
+        None,
         selected.format.mime_type(),
         "inline",
         true,
@@ -893,11 +1045,13 @@ fn parse_range(value: &str, size: u64) -> Result<Option<ByteRange>, ()> {
     Ok(Some(ByteRange { start, end }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_file(
     request_headers: &HeaderMap,
     path: &std::path::Path,
     expected_size: u64,
     sha256: &str,
+    original_name: Option<&str>,
     mime_type: &str,
     disposition: &str,
     vary_accept: bool,
@@ -970,17 +1124,20 @@ async fn serve_file(
         Body::from_stream(ReaderStream::new(file))
     };
 
+    // A stored name is already sanitized, but the value is only trusted once it
+    // has been through the header parser.
+    let content_disposition =
+        filename::disposition(disposition, original_name, extension_for_mime(mime_type));
+    let content_disposition = HeaderValue::from_str(&content_disposition).unwrap_or_else(|_| {
+        tracing::warn!("falling back to a generic download name");
+        HeaderValue::from_static("inline; filename=\"asset.bin\"")
+    });
+
     let mut builder = Response::builder()
         .status(status)
         .header(CONTENT_TYPE, mime_type)
         .header(CONTENT_LENGTH, content_length.to_string())
-        .header(
-            CONTENT_DISPOSITION,
-            format!(
-                "{disposition}; filename=\"asset.{extension}\"",
-                extension = extension_for_mime(mime_type)
-            ),
-        )
+        .header(CONTENT_DISPOSITION, content_disposition)
         .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(CACHE_CONTROL, CACHE_POLICY)
         .header(ETAG, etag)
@@ -1051,7 +1208,7 @@ mod tests {
         model::{RenditionFormat, RenditionRecord},
     };
 
-    use super::{ByteRange, PLACEHOLDER_PNG, parse_range, select_format};
+    use super::{ByteRange, ORIGINAL_FILENAME_HEADER, PLACEHOLDER_PNG, parse_range, select_format};
 
     fn rendition(format: RenditionFormat) -> RenditionRecord {
         RenditionRecord {
@@ -1186,6 +1343,15 @@ mod tests {
         let (status, value) = send(router, upload_request("application/pdf", body.to_vec())).await;
         assert_eq!(status, StatusCode::CREATED);
         value["id"].as_str().unwrap().to_owned()
+    }
+
+    fn upload_named(content_type: &str, body: &[u8], file_name: &str) -> Request<Body> {
+        let mut request = upload_request(content_type, body.to_vec());
+        request.headers_mut().insert(
+            ORIGINAL_FILENAME_HEADER,
+            HeaderValue::from_bytes(file_name.as_bytes()).unwrap(),
+        );
+        request
     }
 
     async fn place_in_trash(router: &Router, id: &str) {
@@ -1333,6 +1499,101 @@ mod tests {
         assert!(body["deleted_at"].is_null());
     }
 
+    fn state_request(ids: &[&str]) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/assets/state")
+            .header("authorization", "Bearer prototype-test-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "ids": ids }).to_string()))
+            .unwrap()
+    }
+
+    async fn states_of(router: &Router, ids: &[&str]) -> (StatusCode, serde_json::Value) {
+        send(router, state_request(ids)).await
+    }
+
+    #[tokio::test]
+    async fn one_call_reports_the_state_of_every_id_it_is_given() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let live = upload_document(&router, b"%PDF-1.7\nlive").await;
+        let deleted = upload_document(&router, b"%PDF-1.7\ndeleted").await;
+        let purged = upload_document(&router, b"%PDF-1.7\npurged").await;
+        place_in_trash(&router, &deleted).await;
+        place_in_trash(&router, &purged).await;
+        let (status, _) = send(&router, pin_request(&deleted, true)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) =
+            states_of(&router, &[&live, &deleted, &purged, "aaaaaaaaaaaaaaaaaaaa"]).await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = body["assets"].as_array().unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0]["id"], live.as_str());
+        assert_eq!(entries[0]["state"], "active");
+        assert_eq!(entries[0]["pinned"], false);
+        assert_eq!(entries[1]["state"], "deleted");
+        assert_eq!(entries[1]["pinned"], true);
+        assert_eq!(
+            entries[2]["state"], "deleted",
+            "purged is still deleted for now"
+        );
+        assert_eq!(
+            entries[3]["state"], "missing",
+            "an id Atlas never had is reported, not omitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_state_lookup_refuses_malformed_ids_and_enormous_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        for bad in ["../../etc/passwd", "UPPERCASEID", "short", "with space"] {
+            let (status, error) = states_of(&router, &[bad]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(error["error"]["code"], "invalid_asset_ids", "{bad}");
+        }
+
+        let many: Vec<String> = (0..501).map(|index| format!("{index:018}")).collect();
+        let borrowed: Vec<&str> = many.iter().map(String::as_str).collect();
+        let (status, error) = states_of(&router, &borrowed).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "too_many_ids");
+
+        let (status, body) = states_of(&router, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["assets"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_state_lookup_needs_the_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/assets/state")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ids":["aaaaaaaaaaaaaaaaaaaa"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn a_photo_smaller_than_every_profile_still_answers_each_one() {
         let directory = tempfile::tempdir().unwrap();
@@ -1443,6 +1704,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identical_bytes_come_back_as_the_asset_that_already_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
+
+        let body = b"%PDF-1.7\nthe very same document".to_vec();
+        let (status, created) =
+            send(&router, upload_request("application/pdf", body.clone())).await;
+        assert_eq!(status, StatusCode::CREATED, "the first upload creates");
+        let id = created["id"].as_str().unwrap().to_owned();
+
+        let (status, repeated) = send(&router, upload_request("application/pdf", body)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a repeat is not a creation, and the status says so"
+        );
+        assert_eq!(repeated["id"], id.as_str(), "the same ID comes back");
+        assert_eq!(repeated["created_at"], created["created_at"]);
+
+        let mut directories = std::fs::read_dir(data_dir.join("assets")).unwrap();
+        assert!(directories.next().is_some());
+        assert!(
+            directories.next().is_none(),
+            "one directory: no second copy of the file and its renditions"
+        );
+        let staged = std::fs::read_dir(data_dir.join("staging"))
+            .unwrap()
+            .next()
+            .is_some();
+        assert!(!staged, "the staged copy of a duplicate is not left behind");
+    }
+
+    #[tokio::test]
+    async fn a_deduplicated_upload_costs_no_image_conversion() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("repeated.png");
+        let image = write_test_image(&source, "640x480");
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let (status, created) = send(&router, upload_request("image/png", image.clone())).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = created["id"].as_str().unwrap().to_owned();
+        let data_dir = directory.path().join("atlas");
+        let stored = std::fs::read_dir(data_dir.join("assets").join(&id))
+            .unwrap()
+            .count();
+        // The test configuration generates two widths: original plus 2x4 formats.
+        assert_eq!(stored, 9, "the original plus four formats at two widths");
+
+        let (status, body) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], id.as_str());
+        assert_eq!(
+            std::fs::read_dir(data_dir.join("assets").join(&id))
+                .unwrap()
+                .count(),
+            stored,
+            "nothing was written a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_asset_does_not_shadow_a_new_upload_of_the_same_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let body = b"%PDF-1.7\ndeleted then uploaded again".to_vec();
+        let (status, first) = send(&router, upload_request("application/pdf", body.clone())).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let first_id = first["id"].as_str().unwrap().to_owned();
+        place_in_trash(&router, &first_id).await;
+
+        let (status, second) = send(&router, upload_request("application/pdf", body)).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "re-uploading after a delete adds the file again"
+        );
+        assert_ne!(second["id"], first_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn a_pinned_or_trashed_twin_does_not_change_a_new_upload() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        // Different bytes, so nothing here is deduplicated: the point is that a
+        // normal upload is untouched by the lookup.
+        for index in 0..3 {
+            let (status, _) = send(
+                &router,
+                upload_request(
+                    "application/pdf",
+                    format!("%PDF-1.7\ndistinct {index}").into_bytes(),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "upload {index}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_recorded_rendition_whose_file_is_gone_is_an_internal_error() {
         let directory = tempfile::tempdir().unwrap();
         let image = write_test_image(&directory.path().join("gone.png"), "800x600");
@@ -1547,6 +1917,84 @@ mod tests {
             StatusCode::NOT_FOUND,
             "an unknown id has no row to pin"
         );
+    }
+
+    #[tokio::test]
+    async fn the_trash_listing_is_bounded_and_pageable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.trash_retention_days = 30;
+        let state = AppState::new(config.clone()).await.unwrap();
+        let router = app(state.clone());
+
+        for index in 0..5 {
+            let body = format!("%PDF-1.7\ntrash {index}").into_bytes();
+            let (status, value) = send(&router, upload_request("application/pdf", body)).await;
+            assert_eq!(status, StatusCode::CREATED);
+            let id = value["id"].as_str().unwrap().to_owned();
+            place_in_trash(&router, &id).await;
+        }
+        drop(router);
+
+        // Restore one so the trash is not uniform, then restart so that one is
+        // the newest deletion on every page.
+        drop(state);
+        let router = app(AppState::new(config.clone()).await.unwrap());
+        let (status, body) = send(&router, authorized("GET", "/api/v1/trash")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 5);
+        assert_eq!(body["limit"], 200);
+        assert_eq!(body["offset"], 0);
+        assert_eq!(body["assets"].as_array().unwrap().len(), 5);
+
+        let (_, first) = send(&router, authorized("GET", "/api/v1/trash?limit=2&offset=0")).await;
+        assert_eq!(first["assets"].as_array().unwrap().len(), 2);
+        assert_eq!(first["total"], 5, "the count is of the whole trash");
+
+        let (_, second) = send(&router, authorized("GET", "/api/v1/trash?limit=2&offset=2")).await;
+        let (_, third) = send(&router, authorized("GET", "/api/v1/trash?limit=2&offset=4")).await;
+        let ids = |page: &serde_json::Value| -> Vec<String> {
+            page["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let mut paged = ids(&first);
+        paged.extend(ids(&second));
+        paged.extend(ids(&third));
+        assert_eq!(paged.len(), 5);
+        assert_eq!(
+            paged.iter().collect::<std::collections::HashSet<_>>().len(),
+            5,
+            "pages do not overlap or skip"
+        );
+
+        // A page past the end is empty rather than an error.
+        let (status, beyond) = send(
+            &router,
+            authorized("GET", "/api/v1/trash?limit=2&offset=99"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(beyond["assets"].as_array().unwrap().is_empty());
+        assert_eq!(beyond["total"], 5);
+    }
+
+    #[tokio::test]
+    async fn a_trash_page_is_capped_so_a_caller_cannot_ask_for_everything() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        let (status, body) = send(&router, authorized("GET", "/api/v1/trash?limit=100000")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["limit"], 500);
+
+        let (status, body) = send(&router, authorized("GET", "/api/v1/trash?offset=-5")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["offset"], 0);
     }
 
     #[tokio::test]
@@ -1787,6 +2235,224 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn an_uploaded_name_is_reported_and_used_for_downloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
+
+        let (status, body) = send(
+            &router,
+            upload_named("application/pdf", b"%PDF-1.7\nnamed", "menu-2026.pdf"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = body["id"].as_str().unwrap().to_owned();
+        assert_eq!(body["original"]["filename"], "menu-2026.pdf");
+
+        // The name is metadata, never a path: the file on disk is still named
+        // after the asset ID and the detected format.
+        assert!(
+            data_dir
+                .join("assets")
+                .join(&id)
+                .join("original.pdf")
+                .exists()
+        );
+        assert!(
+            !data_dir
+                .join("assets")
+                .join(&id)
+                .join("menu-2026.pdf")
+                .exists()
+        );
+
+        let (status, headers, body) = fetch(&router, &format!("/media/{id}/original")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"%PDF-1.7\nnamed");
+        assert_eq!(
+            headers["content-disposition"],
+            "inline; filename=\"menu-2026.pdf\"; filename*=UTF-8''menu-2026.pdf",
+            "an ASCII name is sent twice: readable, and exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_percent_encoded_name_survives_the_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let encoded = "Jahresbericht%20%28%C3%9C%29.pdf";
+        let (status, body) = send(
+            &router,
+            upload_named("application/pdf", b"%PDF-1.7\nunicode", encoded),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            body["original"]["filename"], "Jahresbericht (Ü).pdf",
+            "the API reports the decoded name"
+        );
+        let id = body["id"].as_str().unwrap().to_owned();
+
+        let (_, headers, _) = fetch(&router, &format!("/media/{id}/original")).await;
+        assert_eq!(
+            headers["content-disposition"],
+            "inline; filename=\"Jahresbericht (_).pdf\"; \
+             filename*=UTF-8''Jahresbericht%20%28%C3%9C%29.pdf"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hostile_name_is_refused_and_never_reaches_a_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
+
+        for (index, (name, why)) in [
+            ("evil%0D%0AX-Injected:%20yes", "a CRLF injection attempt"),
+            ("line%0Abreak.pdf", "a newline"),
+            ("nul%00byte.pdf", "a NUL byte"),
+            ("%2F%2F", "nothing but a path"),
+            ("%FF%FE", "bytes that are not text"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (status, error) = send(
+                &router,
+                upload_named(
+                    "application/pdf",
+                    format!("%PDF-1.7\nhostile {index}").as_bytes(),
+                    name,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {why}");
+            assert_eq!(error["error"]["code"], "invalid_filename", "{name}");
+        }
+
+        // A path is stripped rather than refused: the name is a label, not a
+        // location, and what survives is the last segment.
+        for (index, (sent, expected)) in [
+            ("../../etc/passwd", "passwd"),
+            ("..%2F..%2Fsecret%2Fphoto.pdf", "photo.pdf"),
+            ("C%3A%5CUsers%5Cme%5Cphoto.pdf", "photo.pdf"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (status, body) = send(
+                &router,
+                upload_named(
+                    "application/pdf",
+                    format!("%PDF-1.7\ntraversal {index}").as_bytes(),
+                    sent,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{sent}");
+            assert_eq!(body["original"]["filename"], expected, "{sent}");
+            let id = body["id"].as_str().unwrap().to_owned();
+            assert!(
+                data_dir
+                    .join("assets")
+                    .join(&id)
+                    .join("original.pdf")
+                    .exists()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_cannot_change_the_stored_format() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
+
+        let (status, body) = send(
+            &router,
+            upload_named("application/pdf", b"%PDF-1.7\nmismatch", "payload.png"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["original"]["content_type"], "application/pdf");
+        let id = body["id"].as_str().unwrap().to_owned();
+
+        let stored = std::fs::read_dir(data_dir.join("assets").join(&id))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stored,
+            vec!["original.pdf".to_owned()],
+            "the name picks nothing"
+        );
+
+        let (_, headers, _) = fetch(&router, &format!("/media/{id}/original")).await;
+        assert_eq!(headers["content-type"], "application/pdf");
+    }
+
+    #[tokio::test]
+    async fn an_upload_without_a_name_keeps_the_generic_download_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let (status, body) = send(
+            &router,
+            upload_request("application/pdf", b"%PDF-1.7\nplain".to_vec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["original"]["filename"], serde_json::Value::Null);
+        let id = body["id"].as_str().unwrap().to_owned();
+
+        let (_, headers, _) = fetch(&router, &format!("/media/{id}/original")).await;
+        assert_eq!(
+            headers["content-disposition"], "inline; filename=\"asset.pdf\"",
+            "an upload without a name keeps Atlas's generic download name"
+        );
+    }
+
+    #[tokio::test]
+    async fn images_are_served_inline_with_their_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("named.png");
+        let image = write_test_image(&source, "640x480");
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        // A raw UTF-8 name needs no encoding, which is what a browser's
+        // `File.name` would send.
+        let (status, body) = send(
+            &router,
+            upload_named("image/png", &image, "family \u{1F600}.png"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["original"]["filename"], "family \u{1F600}.png");
+        let id = body["id"].as_str().unwrap().to_owned();
+
+        let (status, headers, _) = fetch(&router, &format!("/media/{id}/original")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers["content-disposition"],
+            "inline; filename=\"family _.png\"; filename*=UTF-8''family%20%F0%9F%98%80.png"
+        );
+
+        // Renditions are Atlas's own output, so they keep the generic name.
+        let (_, headers, _) = fetch(&router, &format!("/media/{id}/w320")).await;
+        assert_eq!(
+            headers["content-disposition"],
+            "inline; filename=\"asset.png\""
+        );
     }
 
     #[tokio::test]

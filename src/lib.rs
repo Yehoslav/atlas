@@ -1,6 +1,7 @@
 mod api;
 pub mod config;
 mod error;
+mod filename;
 mod ident;
 mod media;
 mod model;
@@ -270,6 +271,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/v1/assets/{id}",
             get(api::get_asset).delete(api::delete_asset),
+        )
+        .route(
+            "/api/v1/assets/state",
+            axum::routing::post(api::asset_states),
         )
         .route(
             "/api/v1/assets/{id}/restore",

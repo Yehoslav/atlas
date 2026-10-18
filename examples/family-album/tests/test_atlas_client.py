@@ -54,9 +54,17 @@ class ScriptedSession:
         self.response = response
         self.error = error
         self.calls: list[tuple[str, str]] = []
+        self.methods: list[str] = []
+        self.paths: list[str] = []
+        self.headers_seen: dict = {}
+        self.bodies: list = []
 
     def request(self, method: str, url: str, **kwargs) -> requests.Response:
         self.calls.append((method, url))
+        self.methods.append(method)
+        self.paths.append("/" + url.split("://", 1)[-1].split("/", 1)[-1])
+        self.headers_seen = kwargs.get("headers") or {}
+        self.bodies.append(kwargs.get("json"))
         if self.error:
             raise self.error
         assert self.response is not None
@@ -141,6 +149,50 @@ def test_an_upload_response_becomes_an_asset():
     )
     method, url = session.calls[0]
     assert (method, url) == ("POST", "http://atlas.invalid:3000/api/v1/assets")
+
+
+def test_an_upload_sends_the_name_percent_encoded():
+    session = ScriptedSession(response=response(201, UPLOAD_RESPONSE))
+
+    client_with(session).upload(io.BytesIO(b"bytes"), "image/png", "Unsere Familie.png")
+
+    assert session.headers_seen["X-Original-Filename"] == "Unsere%20Familie.png"
+    assert session.headers_seen["Content-Type"] == "image/png"
+
+
+def test_an_upload_without_a_name_sends_no_name_header():
+    session = ScriptedSession(response=response(201, UPLOAD_RESPONSE))
+
+    client_with(session).upload(io.BytesIO(b"bytes"), "image/png")
+
+    assert "X-Original-Filename" not in session.headers_seen
+
+
+def test_a_state_lookup_posts_every_id():
+    session = ScriptedSession(
+        response=response(
+            200,
+            {
+                "assets": [
+                    {"id": "aaaaaaaaaaaaaaaaaaaa", "state": "active", "pinned": True},
+                    {"id": "bbbbbbbbbbbbbbbbbb", "state": "missing", "pinned": False},
+                ]
+            },
+        )
+    )
+
+    found = client_with(session).states(["aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbb"])
+
+    assert session.methods == ["POST"]
+    assert session.paths == ["/api/v1/assets/state"]
+    assert found["aaaaaaaaaaaaaaaaaaaa"].is_live
+    assert found["bbbbbbbbbbbbbbbbbb"].state == "missing"
+
+
+def test_a_state_lookup_refuses_more_ids_than_atlas_accepts():
+    client = client_with(ScriptedSession())
+    with pytest.raises(ValueError):
+        client.states(["a" * 18] * 501)
 
 
 def test_media_urls_are_absolute_only_when_a_media_base_is_configured():

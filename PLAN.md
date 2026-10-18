@@ -49,6 +49,15 @@ media files and media metadata only.
   pre-generated representations from `Accept`; they do not perform image work
   on reads and send `Vary: Accept`.
 - Asset URLs are immutable. Replacing bytes means uploading a new asset ID.
+- Identical bytes are the same asset. An upload whose original matches a live
+  asset returns that asset with `200` instead of `201`, costs a hash rather than
+  a conversion, and makes a retry after a timeout idempotent. Deduplication is
+  best effort: enforcing it with a unique index would require deleting rows a
+  live consumer may already reference.
+- An optional `X-Original-Filename` header keeps the name the uploader gave the
+  file, raw UTF-8 or percent-encoded. It is sanitized, truncated at 255
+  characters, and used only in `Content-Disposition` — never as a path, and
+  never to decide a stored format.
 - Asset IDs are random lowercase base36 strings, 18 characters by default, from
   the OS random source. The ID is the only identifier: SQLite primary key,
   on-disk directory name, and public URL component. There is no separate
@@ -84,14 +93,18 @@ carry a secret — unknown keys are rejected outright, which also surfaces typos
 
 - `GET /healthz` — process health.
 - `POST /api/v1/assets` — authenticated raw-body upload. `Content-Type` names
-  the input type; the request body is streamed to a staging file with limits.
-  Returns `201` only after persistence and image processing complete.
+  the input type and `X-Original-Filename` optionally names the file; the request
+  body is streamed to a staging file with limits. Returns `201` after creating
+  an asset, or `200` with the existing asset when the bytes are already present.
 - `GET /api/v1/assets/{id}` — authenticated asset metadata, including original
   facts, available width renditions, and the asset's lifecycle state.
+- `POST /api/v1/assets/state` — authenticated batch state for up to 500 ids the
+  caller supplies. Not a listing, and Atlas learns nothing from the ids.
 - `DELETE /api/v1/assets/{id}` — authenticated move to the trash.
 - `POST /api/v1/assets/{id}/restore` — authenticated restore from the trash.
 - `PUT /api/v1/assets/{id}/pin` — authenticated usage registration.
-- `GET /api/v1/trash` — authenticated listing of trashed and purged assets.
+- `GET /api/v1/trash` — authenticated listing of trashed and purged assets,
+  paged with `limit` (default 200, max 500) and `offset`, with a `total`.
 - `GET /media/{id}/original` — public, unmodified original.
 - `GET /media/{id}/w{max_width}` — public rendition with format selected from
   `Accept`; JXL, AVIF, WebP, then an acceptable JPEG/PNG fallback.
@@ -184,6 +197,14 @@ the consumer side and is not part of the service.
 - Deleting stops public delivery before the files move; a trashed asset serves
   the placeholder; restore returns the bytes to the same URLs; purge keeps a
   tombstone and skips pinned assets.
+- An uploaded name survives non-ASCII, percent-encoding and path-like input,
+  reaches only the `Content-Disposition` header, and cannot change the stored
+  format or reach the filesystem.
+- Identical bytes return the existing asset with `200`, write nothing, and
+  leave no staged files behind.
+- One state lookup covers a page, returns `missing` for unknown ids, refuses
+  malformed ones, and is capped.
+- The trash listing is capped and pages without overlapping or skipping.
 - A table rebuild guarded against `ON DELETE CASCADE` preserves child rows,
   and the same rebuild without the guard is caught by a test that proves the
   cascade would have deleted them silently.

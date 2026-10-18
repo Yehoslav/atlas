@@ -3,7 +3,7 @@
 
 {% block content %}
   {% set full_url, full_width, full_height = images.full_size(photo) %}
-  {% set check = check_asset(photo.asset_id) if photo.is_image else None %}
+  {% set check = checks[photo.asset_id] if photo.is_image else None %}
 
   <article class="detail">
     <div class="detail-media">
@@ -47,7 +47,7 @@
           Atlas did not answer, so this page cannot tell what Atlas would serve.
           The photo may well be fine.
         </p>
-      {% elif check and check.live and check.asset.pinned %}
+      {% elif check and check.live and check.pinned %}
         <p class="notice">
           Pinned: Atlas will not purge this asset while a post uses it.
         </p>
@@ -132,7 +132,7 @@
 
         <form method="post" action="{{ url_for('toggle_pin', photo_id=photo.id) }}">
           <button type="submit">
-            {% if check and check.live and check.asset.pinned %}Unpin from Atlas{% else %}Pin in Atlas{% endif %}
+            {% if check and check.live and check.pinned %}Unpin from Atlas{% else %}Pin in Atlas{% endif %}
           </button>
         </form>
       </section>

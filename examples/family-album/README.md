@@ -22,6 +22,12 @@ here.
   uploads but converts one image at a time, so a burst of ten earns a `503` from
   half of them. This uploads one at a time and reports every file's outcome,
   including camera RAW that Atlas refuses.
+- **Uploading a name.** The album percent-encodes the file name and sends it as
+  `X-Original-Filename`, so a download of a PDF is called what the person named
+  it instead of `asset.pdf`.
+- **Deduplication that reports itself.** Uploading identical bytes returns the
+  asset Atlas already has, and the album points at the photo row it already
+  wrote instead of failing on its own `UNIQUE` constraint.
 - **Metadata editing that never calls Atlas.** A caption is the album's business.
 - **A referential guard.** Before deleting, the album checks its own posts for
   published references and returns `409` with a confirm button. Atlas cannot do
@@ -115,11 +121,14 @@ in front of these album routes and keeps the Atlas token behind them.
 
 The album cannot know on its own whether Atlas will still serve an asset: Atlas
 has no listing endpoint, and its whole design is that it forgets files without
-telling anyone. So the album calls `GET /api/v1/assets/{id}` once per photo on
-the page and caches the answer for that request. A grid of 50 photos costs 50
-local HTTP calls, which is why this is an example and not a framework.
+telling anyone. So it asks, once per page, through
+`POST /api/v1/assets/state` with every asset ID on that page — one call, up to
+500 ids, answered from the request cache so a photo rendered twice costs
+nothing. Before that endpoint existed this was one call per photo, which is the
+kind of arithmetic that looks fine in a test with three photos and does not
+survive a real album.
 
-That cost buys the only thing worth having here: the album never renders a
+That call buys the only thing worth having here: the album never renders a
 broken image, and when it cannot show one it says which of five things happened.
 
 | State | What the page shows |
@@ -142,7 +151,7 @@ broken image, and when it cannot show one it says which of five things happened.
 | `POST /photos/<id>/pin` | Toggle Atlas's purge pin by hand |
 | `POST /photos/<id>/attach` | Add this photo to a post and pin the asset |
 | `GET /posts` | Posts, publishing, and the photos in a post |
-| `GET /trash` | Atlas's trashed and purged assets |
+| `GET /trash` | Atlas's trashed and purged assets (first page) |
 | `POST /trash/<asset_id>/restore` | Restore one |
 
 ## Deleting, end to end

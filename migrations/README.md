@@ -88,6 +88,25 @@ sequence, and `unguarded_table_rebuild_cascades_child_rows_away` runs the same
 rebuild without the guard to prove the cascade really does delete the child rows
 silently. Run both before trusting a rebuild.
 
+## Uniqueness Atlas does not enforce
+
+`renditions` rows are unique per `(asset_id, max_width, format)`, and `assets.id`
+is the primary key. Nothing else is unique, and that is deliberate.
+
+Uploads deduplicate identical bytes by looking for a live asset with the same
+`sha256` before converting. Making that a constraint would need
+
+```sql
+CREATE UNIQUE INDEX assets_live_sha256 ON assets (sha256) WHERE purged_at IS NULL;
+```
+
+which cannot be created on a database that already holds two live assets with
+the same bytes — and making room for it means deleting one of them, along with
+its files, at the moment someone runs a migration. A row a published post still
+references does not care that its bytes are a duplicate. So the lookup stays
+best effort: two *concurrent* uploads of identical bytes can both become assets,
+and the window is one conversion wide.
+
 ## Adding a migration
 
 1. Create `migrations/<next_version>_<description>.sql`. Never renumber or edit

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, error::Error, fmt, path::Path};
 
 use sqlx::{
-    Row, SqlitePool,
+    QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 
@@ -161,8 +161,9 @@ impl Store {
     ) -> Result<InsertOutcome, StoreError> {
         let mut transaction = self.pool.begin().await?;
         let insert = sqlx::query(
-            "INSERT INTO assets (id, source_format, bytes, sha256, width, height, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO assets (id, source_format, bytes, sha256, width, height, created_at,
+                                 original_name)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(asset.id.as_str())
         .bind(asset.source_format.key())
@@ -171,6 +172,7 @@ impl Store {
         .bind(asset.width.map(i64::from))
         .bind(asset.height.map(i64::from))
         .bind(asset.created_at)
+        .bind(&asset.original_name)
         .execute(&mut *transaction)
         .await;
 
@@ -229,10 +231,59 @@ impl Store {
             .collect())
     }
 
+    /// A live asset whose original bytes hash to `sha256`.
+    ///
+    /// Only live assets match: re-uploading after a delete is a decision to add
+    /// the file again, not to resurrect an old one. This is best effort by
+    /// design - see `migrations/README.md` for why a unique index is not an
+    /// option - so two *concurrent* uploads of identical bytes can both win.
+    pub async fn find_live_by_sha256(&self, sha256: &str) -> Result<Option<AssetId>, StoreError> {
+        let row =
+            sqlx::query("SELECT id FROM assets WHERE sha256 = ? AND deleted_at IS NULL LIMIT 1")
+                .bind(sha256)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row
+            .and_then(|row| row.try_get::<String, _>("id").ok())
+            .and_then(|id| AssetId::parse(&id).ok()))
+    }
+
+    /// Lifecycle state for a set of ids the caller already knows.
+    ///
+    /// Ids with no row are simply absent from the map: "Atlas has never heard of
+    /// this" is an answer, not an error.
+    pub async fn asset_states_by_id(
+        &self,
+        ids: &[AssetId],
+    ) -> Result<HashMap<String, (AssetState, bool)>, StoreError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT id, deleted_at, purged_at, pinned FROM assets WHERE id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id.as_str());
+        }
+        separated.push_unseparated(")");
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let id: String = row.try_get("id").ok()?;
+                let pinned = row.try_get::<bool, _>("pinned").ok()?;
+                Some((id, (state_from(&row), pinned)))
+            })
+            .collect())
+    }
+
     pub async fn get_asset(&self, id: &AssetId) -> Result<Option<StoredAsset>, StoreError> {
         let row = sqlx::query(
             "SELECT id, source_format, bytes, sha256, width, height, created_at,
-                    deleted_at, purged_at, pinned
+                    original_name, deleted_at, purged_at, pinned
              FROM assets WHERE id = ?",
         )
         .bind(id.as_str())
@@ -263,6 +314,7 @@ impl Store {
                 .try_get::<Option<i64>, _>("height")?
                 .and_then(|value| u32::try_from(value).ok()),
             created_at: row.try_get("created_at")?,
+            original_name: row.try_get("original_name")?,
             deleted_at: row.try_get("deleted_at")?,
             purged_at: row.try_get("purged_at")?,
             pinned: row.try_get::<bool, _>("pinned")?,
@@ -351,14 +403,35 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
+    /// How many assets are in the trash, for paging.
+    pub async fn trashed_count(&self) -> Result<i64, StoreError> {
+        Ok(
+            sqlx::query("SELECT COUNT(*) FROM assets WHERE deleted_at IS NOT NULL")
+                .fetch_one(&self.pool)
+                .await?
+                .try_get::<i64, _>(0)?
+                .max(0),
+        )
+    }
+
     /// Soft-deleted and purged assets, newest deletion first.
-    pub async fn trashed_assets(&self) -> Result<Vec<StoredAsset>, StoreError> {
+    ///
+    /// A window rather than the whole trash: an admin who has deleted a few
+    /// thousand assets over the years should still get a page that loads.
+    pub async fn trashed_assets(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StoredAsset>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, source_format, bytes, sha256, width, height, created_at,
-                    deleted_at, purged_at, pinned
+                    original_name, deleted_at, purged_at, pinned
              FROM assets WHERE deleted_at IS NOT NULL
-             ORDER BY deleted_at DESC, id ASC",
+             ORDER BY deleted_at DESC, id ASC
+             LIMIT ? OFFSET ?",
         )
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
@@ -391,6 +464,7 @@ impl Store {
                         .try_get::<Option<i64>, _>("height")?
                         .and_then(|value| u32::try_from(value).ok()),
                     created_at: row.try_get("created_at")?,
+                    original_name: row.try_get("original_name")?,
                     deleted_at: row.try_get("deleted_at")?,
                     purged_at: row.try_get("purged_at")?,
                     pinned: row.try_get::<bool, _>("pinned")?,
@@ -484,6 +558,7 @@ mod tests {
             width: Some(640),
             height: Some(480),
             created_at: 1_700_000_000,
+            original_name: None,
             deleted_at: None,
             purged_at: None,
             pinned: false,
@@ -598,6 +673,7 @@ mod tests {
                 width INTEGER,
                 height INTEGER,
                 created_at INTEGER NOT NULL,
+                original_name TEXT,
                 deleted_at INTEGER,
                 purged_at INTEGER,
                 pinned INTEGER NOT NULL DEFAULT 0,
@@ -609,9 +685,9 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO assets_new (id, source_format, bytes, sha256, width, height,
-                                     created_at, deleted_at, purged_at, pinned)
+                                     created_at, original_name, deleted_at, purged_at, pinned)
              SELECT id, source_format, bytes, sha256, width, height,
-                    created_at, deleted_at, purged_at, pinned
+                    created_at, original_name, deleted_at, purged_at, pinned
              FROM assets",
         )
         .execute(&mut *transaction)
@@ -784,7 +860,8 @@ mod tests {
         store.mark_deleted(&purged, 1_700_000_200).await.unwrap();
         store.mark_purged(&purged, 1_700_000_300).await.unwrap();
 
-        let trashed = store.trashed_assets().await.unwrap();
+        let trashed = store.trashed_assets(200, 0).await.unwrap();
+        assert_eq!(store.trashed_count().await.unwrap(), 2);
         assert_eq!(trashed.len(), 2);
         assert_eq!(trashed[0].asset.id, purged, "newest deletion first");
         assert_eq!(trashed[0].asset.state(), AssetState::Purged);

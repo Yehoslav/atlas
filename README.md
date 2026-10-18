@@ -15,16 +15,20 @@ without conversion.
 
 - `GET /healthz` — local process health.
 - `POST /api/v1/assets` — authenticated upload. The body is the file itself;
-  `Content-Type` identifies the allowed format. It streams to disk and returns
-  an asset ID, original metadata, and rendition URLs.
+  `Content-Type` identifies the allowed format, and the optional
+  `X-Original-Filename` header names it. It streams to disk and returns an asset
+  ID, original metadata, and rendition URLs.
 - `GET /api/v1/assets/{id}` — authenticated metadata lookup, including the
   asset's `state` (`active`, `deleted`, or `purged`) and its `pinned` flag.
+- `POST /api/v1/assets/state` — authenticated batch state lookup for ids the
+  caller already has. Not a listing.
 - `DELETE /api/v1/assets/{id}` — authenticated move to the trash. Returns `204`.
 - `POST /api/v1/assets/{id}/restore` — authenticated restore from the trash.
   Returns `204`, or `409` if the asset was already purged.
 - `PUT /api/v1/assets/{id}/pin` — authenticated usage registration. Body
   `{"pinned": true|false}`; purge skips pinned assets.
-- `GET /api/v1/trash` — authenticated listing of trashed and purged assets.
+- `GET /api/v1/trash` — authenticated listing of trashed and purged assets,
+  paged with `limit` (default 200, max 500) and `offset`.
 - `GET /media/{id}/original` — public original delivery.
 - `GET /media/{id}/w{width}` — public width rendition. Atlas selects a
   pre-generated JXL, AVIF, WebP, or JPEG/PNG fallback using `Accept` and returns
@@ -99,6 +103,62 @@ Uploads require `Authorization: Bearer $ATLAS_API_TOKEN`. Keep this token in the
 consuming server or CLI, never in browser code. Public media reads do not need a
 token.
 
+## Uploading a file
+
+The body is the file. `Content-Type` names the allowed format, and the optional
+`X-Original-Filename` header names the file for downloads:
+
+```sh
+curl -X POST \
+  -H "Authorization: Bearer $ATLAS_API_TOKEN" \
+  -H 'Content-Type: application/pdf' \
+  -H 'X-Original-Filename: menu-2026.pdf' \
+  --data-binary @menu-2026.pdf \
+  http://127.0.0.1:3000/api/v1/assets
+```
+
+`201` means a new asset was created. `200` means an asset with the same bytes
+already existed and this is that asset — identical content is the same asset,
+because URLs are immutable and content is what identifies one. A duplicate costs
+a hash rather than an image conversion, and a retry after a timeout gets the
+same asset instead of a second copy.
+
+The name is optional metadata and is never used as a path: the file on disk is
+named after the asset ID and the detected format. It arrives as raw UTF-8 or
+percent-encoded, so `Отчет за 2026.pdf`, `Jahresbericht (Ü).pdf` and
+`100% pure.pdf` all survive. Names are truncated at 255 characters, any path is
+stripped, and a name containing control characters is refused with
+`400 invalid_filename`. Delivery sends it as `Content-Disposition: inline;
+filename="…"; filename*=UTF-8''…`, falling back to `asset.pdf` when the upload
+had no name. Consumers that want a different display name should keep it in
+their own database.
+
+## Asking what Atlas can still serve
+
+A consumer that owns its own database still has to ask Atlas whether the assets
+it points at are still there, because Atlas forgets files without telling
+anyone. Asking once per asset is what makes a gallery page expensive, so:
+
+```sh
+curl -X POST http://127.0.0.1:3000/api/v1/assets/state \
+  -H "Authorization: Bearer $ATLAS_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"ids":["8odfjrxxjxzypa99j6","aaaaaaaaaaaaaaaaaaaa"]}'
+```
+
+```json
+{"assets":[
+  {"id":"8odfjrxxjxzypa99j6","state":"active","pinned":true},
+  {"id":"aaaaaaaaaaaaaaaaaaaa","state":"missing","pinned":false}
+]}
+```
+
+One call covers up to 500 ids. Ids Atlas has never heard of come back as
+`missing` rather than being absent, because telling "never existed" apart from
+"deleted" is the whole reason to ask. A malformed id is a `400`, not a silent
+omission. This is not a listing: the caller supplies the ids, so Atlas learns
+nothing about what they are used for and the result cannot be paged through.
+
 ## Trash, restore, and purge
 
 Atlas never destroys an asset on request. `DELETE /api/v1/assets/{id}` moves
@@ -124,6 +184,22 @@ a published post still uses and Atlas will never purge it.
 
 Nothing here is a replacement for a consuming site's own referential checks —
 Atlas cannot know which of its assets your posts mention.
+
+### If a consumer and Atlas have drifted
+
+Atlas cannot repair itself: it has no listing, and it is not told when the
+media directory and the database come back from different backups. The repair
+is on the consuming side, and it is bounded:
+
+1. Collect the asset IDs your database references.
+2. Ask `POST /api/v1/assets/state` for them in batches.
+3. Every `missing` ID is an asset that no longer exists and cannot be
+   recovered; re-upload the file and repoint your references to the new ID.
+4. Every `deleted` or `purged` ID is recoverable only while the bytes are in the
+   trash; `POST /api/v1/assets/{id}/restore` brings them back.
+
+A media directory restored on its own will report every asset as `missing`,
+which is the signal to stop serving those URLs rather than a silent failure.
 
 ## Development
 
