@@ -13,33 +13,77 @@ without conversion.
 
 ## Implemented prototype API
 
+Every route below that reads, changes, or renders an asset is *typed*: the
+collection is part of the path, `images` or `documents`. A mistake is a `404`
+rather than a silent no-op, and a reader can see which collection a call acts
+on. Only the two mixed-set endpoints (`state` and `trash`) are untyped, because
+they exist precisely to span collections.
+
+An asset's **kind** is what it is used for — `images` get renditions,
+`documents` do not — while its **format** is its media type: a JPEG, a PNG, a
+PDF. The two are independent. `POST /api/v1/documents` accepts any allowlisted
+format, images included, so a diagram or a scan can be stored whole and served
+as an attachment instead of being re-encoded into a picture.
+
 - `GET /healthz` — local process health.
-- `POST /api/v1/assets` — authenticated upload. The body is the file itself;
-  `Content-Type` identifies the allowed format, and the optional
-  `X-Original-Filename` header names it. It streams to disk and returns an asset
-  ID, original metadata, and rendition URLs.
-- `GET /api/v1/assets/{id}` — authenticated metadata lookup, including the
-  asset's `state` (`active`, `deleted`, or `purged`) and its `pinned` flag.
+- `POST /api/v1/images` — authenticated image upload. The body is the file
+  itself; `Content-Type` must be `image/jpeg`, `image/png`, or `image/webp`, and
+  the optional `X-Original-Filename` header names it. Streams to disk, generates
+  the configured renditions, and returns an asset ID, original metadata, and
+  rendition URLs.
+- `POST /api/v1/documents` — the same upload for `documents`. `Content-Type` may
+  be any allowlisted format, images included. The file is stored and served
+  untouched, with no renditions.
+- `GET /api/v1/{kind}` — authenticated listing of that collection, paged with
+  `limit` (default 50, max 200) and `offset`, and returning `total`. Also
+  accepts `state=active|deleted|purged|all` (default `active`), a `q` substring
+  of the original filename, the ranges `created_after`, `created_before`,
+  `bytes_min`, `bytes_max`, `width_min`, `height_min`, `sort` of `created_at`,
+  `bytes`, `width` or `filename`, and `order=asc|desc`. `deleted` and `purged`
+  are different answers: a deleted asset can still be restored, a purged one
+  cannot. An unknown value is a `400 invalid_sort`/`invalid_state` rather than a
+  quietly ignored filter. This is a listing of assets the site uploaded; it says
+  nothing about how the site uses them.
+- `GET /api/v1/{kind}/{id}` — authenticated metadata lookup, including the
+  asset's `kind`, `state` (`active`, `deleted`, or `purged`), and `pinned` flag.
+- `POST /api/v1/{kind}/actions` — authenticated bulk action for ids the caller
+  already has, such as `pin`, `unpin`, `delete`, or `restore`. Body
+  `{"action": "pin", "ids": ["…"]}`, max 500 ids. Validation is all-or-nothing:
+  one unknown id, a duplicate, or an action the current state does not allow
+  rejects the whole batch with `400` and changes nothing.
+- `GET /api/v1/summary` — authenticated counts and stored bytes for the whole
+  instance, including the trash. A cheap dashboard number, not a listing.
 - `POST /api/v1/assets/state` — authenticated batch state lookup for ids the
-  caller already has. Not a listing.
-- `DELETE /api/v1/assets/{id}` — authenticated move to the trash. Returns `204`.
-- `POST /api/v1/assets/{id}/restore` — authenticated restore from the trash.
+  caller already has, across both collections. Not a listing.
+- `DELETE /api/v1/{kind}/{id}` — authenticated move to the trash. Returns `204`.
+- `POST /api/v1/{kind}/{id}/restore` — authenticated restore from the trash.
   Returns `204`, or `409` if the asset was already purged.
-- `PUT /api/v1/assets/{id}/pin` — authenticated usage registration. Body
+- `PUT /api/v1/{kind}/{id}/pin` — authenticated usage registration. Body
   `{"pinned": true|false}`; purge skips pinned assets.
-- `GET /api/v1/trash` — authenticated listing of trashed and purged assets,
-  paged with `limit` (default 200, max 500) and `offset`.
+- `GET /api/v1/trash` — authenticated listing of trashed and purged assets from
+  both collections, paged with `limit` (default 200, max 500) and `offset`.
 - `GET /media/{id}/original` — public original delivery.
 - `GET /media/{id}/w{width}` — public width rendition. Atlas selects a
   pre-generated JXL, AVIF, WebP, or JPEG/PNG fallback using `Accept` and returns
   `Vary: Accept`.
+- `GET /api/v1/images/{id}/srcset` — authenticated ready-made `srcset` for one
+  image, one candidate per stored width. Each URL is the profile path and each
+  descriptor is the width that was really produced, so a photo narrower than
+  its largest profile is described honestly. Errors on an unknown asset
+  (`404`), a non-image, or a width Atlas does not have.
+
+Uploads are content-addressed within their collection. If the exact bytes are
+already live there, nothing is written or converted and the response is `200`
+with the existing asset and `"deduplicated": true`. A duplicate is not an
+error, and the alternative is paying for a conversion and storing the result
+twice.
 
 The default rendition widths are 320, 640, 960, and 1280 pixels. They preserve
 the original aspect ratio and are not upscaled. Configure a different fixed
 set with `ATLAS_VARIANT_WIDTHS=320,640,1280`; arbitrary sizes are not generated
-on public requests. Consuming sites can use the URLs in `srcset` and set their
-own `sizes` value. Atlas does not currently provide listing, search, or
-arbitrary transformation endpoints, and never converts or re-encodes on a read.
+on public requests. Consuming sites can fetch `/api/v1/images/{id}/srcset` and
+set their own `sizes` value. Atlas does not provide search, and never converts
+or re-encodes on a read.
 
 ## How a rendition URL resolves
 
@@ -105,7 +149,8 @@ token.
 
 ## Uploading a file
 
-The body is the file. `Content-Type` names the allowed format, and the optional
+The body is the file. The collection in the path decides what happens to it,
+`Content-Type` names the allowed format, and the optional
 `X-Original-Filename` header names the file for downloads:
 
 ```sh
@@ -114,14 +159,30 @@ curl -X POST \
   -H 'Content-Type: application/pdf' \
   -H 'X-Original-Filename: menu-2026.pdf' \
   --data-binary @menu-2026.pdf \
-  http://127.0.0.1:3000/api/v1/assets
+  http://127.0.0.1:3000/api/v1/documents
 ```
 
+A picture goes to `/api/v1/images`, which generates the configured renditions:
+
+```sh
+curl -X POST \
+  -H "Authorization: Bearer $ATLAS_API_TOKEN" \
+  -H 'Content-Type: image/png' \
+  -H 'X-Original-Filename: diagram.png' \
+  --data-binary @diagram.png \
+  http://127.0.0.1:3000/api/v1/images
+```
+
+That same diagram to `/api/v1/documents` instead is stored exactly as uploaded,
+generates no renditions, and is served as an attachment. Both are legitimate;
+choose the collection by whether the picture needs to be *displayed* or
+*preserved*.
+
 `201` means a new asset was created. `200` means an asset with the same bytes
-already existed and this is that asset — identical content is the same asset,
-because URLs are immutable and content is what identifies one. A duplicate costs
-a hash rather than an image conversion, and a retry after a timeout gets the
-same asset instead of a second copy.
+already existed in that collection and this is that asset — identical content is
+the same asset, because URLs are immutable and content is what identifies one. A
+duplicate costs a hash rather than an image conversion, and a retry after a
+timeout gets the same asset instead of a second copy.
 
 The name is optional metadata and is never used as a path: the file on disk is
 named after the asset ID and the detected format. It arrives as raw UTF-8 or
@@ -161,7 +222,7 @@ nothing about what they are used for and the result cannot be paged through.
 
 ## Trash, restore, and purge
 
-Atlas never destroys an asset on request. `DELETE /api/v1/assets/{id}` moves
+Atlas never destroys an asset on request. `DELETE /api/v1/images/{id}` moves
 `assets/<id>` to `trash/<id>` and stamps `deleted_at`. The soft delete is
 recorded *before* the files move, so from the first moment of the delete the
 public URLs stop serving the real bytes and answer with a small embedded
@@ -174,7 +235,7 @@ Once an asset has been in the trash for `ATLAS_TRASH_RETENTION_DAYS` (30 by
 default) and no consumer has pinned it, purge discards the files and keeps the
 row as a tombstone with `purged_at`. Atlas can then still tell "deleted" from
 "never existed": an unknown ID is `404`, a tombstoned ID serves the placeholder,
-and `GET /api/v1/assets/{id}` reports `state: "purged"`. Rendition rows go with
+and `GET /api/v1/images/{id}` reports `state: "purged"`. Rendition rows go with
 the bytes, so a tombstone does not advertise URLs that would resolve to
 nothing. Purge runs at startup and, at most once an hour, after an upload;
 there is no scheduler and no job queue.
@@ -196,7 +257,7 @@ is on the consuming side, and it is bounded:
 3. Every `missing` ID is an asset that no longer exists and cannot be
    recovered; re-upload the file and repoint your references to the new ID.
 4. Every `deleted` or `purged` ID is recoverable only while the bytes are in the
-   trash; `POST /api/v1/assets/{id}/restore` brings them back.
+   trash; `POST /api/v1/images/{id}/restore` brings them back.
 
 A media directory restored on its own will report every asset as `missing`,
 which is the signal to stop serving those URLs rather than a silent failure.
@@ -237,7 +298,7 @@ curl -X POST \
   -H "Authorization: Bearer $ATLAS_API_TOKEN" \
   -H 'Content-Type: application/pdf' \
   --data-binary @report.pdf \
-  http://127.0.0.1:3000/api/v1/assets
+  http://127.0.0.1:3000/api/v1/documents
 ```
 
 Useful checks:

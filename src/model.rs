@@ -2,6 +2,72 @@ use serde::Serialize;
 
 use crate::ident::AssetId;
 
+/// Which collection an asset belongs to: the caller's choice, recorded.
+///
+/// Not the same thing as the stored format. A PNG can be an `image` (inspected,
+/// converted into renditions, served inline) or a `document` (stored untouched,
+/// served as an attachment), and both take the identical path through storage,
+/// hashing and delivery. Format decides what the bytes may be *done to*; kind
+/// decides which operations exist at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Image,
+    Document,
+}
+
+impl Kind {
+    /// The URL segment for this collection.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Image => "images",
+            Self::Document => "documents",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Document => "document",
+        }
+    }
+
+    pub fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "image" => Some(Self::Image),
+            "document" => Some(Self::Document),
+            _ => None,
+        }
+    }
+
+    /// Parse a URL segment. Anything else is not a collection.
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "images" => Some(Self::Image),
+            "documents" => Some(Self::Document),
+            _ => None,
+        }
+    }
+
+    /// What this collection accepts.
+    ///
+    /// Images are the convertible formats, so they are the ones that can have
+    /// renditions. Documents accept the document formats and, deliberately,
+    /// images too: storing a picture without converting it is the reason the
+    /// collection exists.
+    pub fn accepts(self, format: SourceFormat) -> bool {
+        match self {
+            Self::Image => format.is_image(),
+            Self::Document => true,
+        }
+    }
+
+    /// Whether uploads into this collection are inspected and converted.
+    pub fn generates_renditions(self) -> bool {
+        matches!(self, Self::Image)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceFormat {
     Jpeg,
@@ -166,6 +232,9 @@ pub struct AssetRecord {
     pub created_at: i64,
     /// The name the uploader gave the file, if it sent one. Never a path.
     pub original_name: Option<String>,
+    /// Which collection this was uploaded into. Absent only for a row written
+    /// before the column existed, which is backfilled from the format.
+    pub kind: Option<Kind>,
     /// When the asset moved to trash; `None` while it is live.
     pub deleted_at: Option<i64>,
     /// When the trashed bytes were discarded; the row outlives them as a tombstone.

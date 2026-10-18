@@ -80,6 +80,77 @@ media files and media metadata only.
   refuses to serve from a database that fails `integrity_check` or
   `foreign_key_check`.
 
+## What Atlas owns, and what it does not
+
+Consumers share the logic of any API: errors, retries, transport. That is
+expected. What Atlas absorbs is **common interaction logic for media
+manipulation** — the capability every consumer would otherwise write from
+scratch — while the burden of *interpreting meaning* stays with the consumer.
+The working test: would every consumer write this, or only one?
+
+Atlas owns: listing, filtering, sorting, paging and counts; bulk actions with
+the trash lifecycle attached; rendition construction; deduplication signalling;
+lifecycle state; the original filename; the pin. Consumers own: captions, alt
+text, tags, folders, collections, ratings, post relationships, cover choice and
+ordering — everything that gives media meaning within a site.
+
+A pin is a boolean safety layer, not a usage graph. Atlas cannot know whether
+media is in use without knowing the contents of the consumer, so a consumer
+registers what it needs and interprets what `pinned` means for itself.
+
+Folders and tags are Atlas's to store (above), deliberately *rudimentary*: flat,
+opaque strings with no hierarchy, no colours and no ordering, so that every
+project does not rebuild label CRUD, facet counts, filtering and rename/merge.
+A consumer that wants nesting stores `2026/summer` as one label and does its
+own splitting. The burden of interpreting every label stays with the consumer.
+Hierarchy inside Atlas is refused on the record: it is how a media service
+becomes a document management system.
+
+### Kind is where the caller chose; format is what the bytes are
+
+Two collections, `images` and `documents`, in the API. They differ in what they
+offer, not in how they are stored:
+
+- **Kind** is the caller's choice, expressed in the URL path. It decides which
+  *operations* exist, whether renditions are generated, and whether the file is
+  served as an attachment. It is a property of the call site, so a client that
+  asks for a rendition is asking for an image by construction, and the server
+  *enforces* the classification instead of trusting a header.
+- **Format** is the stored bytes. It decides byte limits, magic-byte
+  validation, whether ImageMagick may decode the file at all, and which
+  conventional fallback a rendition uses.
+
+The two are orthogonal: `documents` accepts `image/*` for the case where an
+image should be stored and served untouched — no conversion, no renditions, an
+attachment — which is the same reason a messenger offers to send a photo as a
+document. Consequences that follow from keeping them apart: the format layer
+still branches exactly where it does today; and deduplication must be keyed on
+`(sha256, kind)`, because otherwise the first upload of some bytes would decide
+every later one — a document first would answer a photo request with an asset
+that has no renditions.
+
+### Typed where mistakes cost something, uniform where mixing is natural
+
+Mutations and rendition requests are typed: `POST /api/v1/images`,
+`GET|DELETE /api/v1/{kind}/{id}`, `POST /api/v1/{kind}/{id}/restore`,
+`PUT /api/v1/{kind}/{id}/pin`, `POST /api/v1/{kind}/actions`, and
+`GET /api/v1/images/{id}/srcset`, which simply has no documents equivalent.
+Read-only queries a consumer makes over a mixed set stay uniform:
+`POST /api/v1/assets/state` for batch drift repair, `GET /api/v1/trash`,
+`GET /api/v1/summary`. Public media URLs are untyped and immutable:
+`/media/{id}/original` and `/media/{id}/w{width}`.
+
+Handlers are shared behind one `Kind` value, so the split costs an enum and a
+route rather than a second implementation of the lifecycle.
+
+### If a third type arrives
+
+A type that brings only different *storage* joins the existing collections as a
+kind or format value. A type that brings new *operations* — transcoding status,
+a poster frame, a re-encode — gets its own collection, because operations are
+exactly what must be routed rather than guarded by a runtime check. Video and
+audio are deferred, not refused.
+
 ## Configuration
 
 Settings resolve in order: built-in defaults, then an optional TOML file named
@@ -91,20 +162,41 @@ carry a secret — unknown keys are rejected outright, which also surfaces typos
 
 ## Implemented prototype API
 
+Asset routes are typed by collection, `images` or `documents`, so a wrong
+collection is a `404` rather than a silent no-op. Only the two mixed-set
+endpoints (`state` and `trash`) are untyped, because they exist to span
+collections.
+
 - `GET /healthz` — process health.
-- `POST /api/v1/assets` — authenticated raw-body upload. `Content-Type` names
-  the input type and `X-Original-Filename` optionally names the file; the request
-  body is streamed to a staging file with limits. Returns `201` after creating
-  an asset, or `200` with the existing asset when the bytes are already present.
-- `GET /api/v1/assets/{id}` — authenticated asset metadata, including original
-  facts, available width renditions, and the asset's lifecycle state.
+- `POST /api/v1/images` — authenticated raw-body image upload. `Content-Type`
+  must be an allowlisted image type and `X-Original-Filename` optionally names
+  the file; the request body is streamed to a staging file with limits. Returns
+  `201` after creating an asset, or `200` with the existing asset and
+  `deduplicated: true` when those bytes are already live in this collection.
+- `POST /api/v1/documents` — the same upload for documents. `Content-Type` may
+  be any allowlisted format, images included; the file is stored and served
+  untouched, with no renditions.
+- `GET /api/v1/{kind}` — authenticated listing of that collection with `limit`,
+  `offset`, `total`, `state` (`active`, `deleted`, `purged` or `all`), a `q`
+  filename substring, the `created_after`/`created_before`, `bytes_min`/
+  `bytes_max` and `width_min`/`height_min` ranges, `sort` by `created_at`,
+  `bytes`, `width` or `filename`, and `order`.
+- `GET /api/v1/{kind}/{id}` — authenticated asset metadata, including its `kind`,
+  original facts, available width renditions, and lifecycle state.
+- `POST /api/v1/{kind}/actions` — authenticated bulk `pin`, `unpin`, `delete`,
+  or `restore` for up to 500 caller-supplied ids, validated all-or-nothing.
+- `GET /api/v1/summary` — authenticated counts and stored bytes, trash included.
 - `POST /api/v1/assets/state` — authenticated batch state for up to 500 ids the
-  caller supplies. Not a listing, and Atlas learns nothing from the ids.
-- `DELETE /api/v1/assets/{id}` — authenticated move to the trash.
-- `POST /api/v1/assets/{id}/restore` — authenticated restore from the trash.
-- `PUT /api/v1/assets/{id}/pin` — authenticated usage registration.
-- `GET /api/v1/trash` — authenticated listing of trashed and purged assets,
-  paged with `limit` (default 200, max 500) and `offset`, with a `total`.
+  caller supplies, across collections. Not a listing, and Atlas learns nothing
+  from the ids.
+- `DELETE /api/v1/{kind}/{id}` — authenticated move to the trash.
+- `POST /api/v1/{kind}/{id}/restore` — authenticated restore from the trash.
+- `PUT /api/v1/{kind}/{id}/pin` — authenticated usage registration.
+- `GET /api/v1/trash` — authenticated listing of trashed and purged assets from
+  both collections, paged with `limit` (default 200, max 500) and `offset`, with
+  a `total`.
+- `GET /api/v1/images/{id}/srcset` — authenticated `srcset` for one image, one
+  candidate per stored width, described by the width actually produced.
 - `GET /media/{id}/original` — public, unmodified original.
 - `GET /media/{id}/w{max_width}` — public rendition with format selected from
   `Accept`; JXL, AVIF, WebP, then an acceptable JPEG/PNG fallback.
@@ -121,8 +213,8 @@ to an embedded placeholder with `Cache-Control: public, max-age=60` rather than
 `404`; an unknown ID stays `404`. The placeholder is deliberately not immutable,
 because a restore can bring the asset back.
 
-This prototype does not yet provide asset listing, search, an OpenAPI
-document, multipart uploads, or arbitrary URL transformations.
+This prototype does not yet provide search, an OpenAPI document, multipart
+uploads, or arbitrary URL transformations.
 
 ## Upload validation and processing limits
 
@@ -211,7 +303,8 @@ the consumer side and is not part of the service.
 
 ## Deferred scope
 
-- Admin UI, browser upload grants, asset listing/search, and tagging
+- Admin UI and browser upload grants
+- Rich tagging and folder hierarchy beyond the flat opaque labels above
 - PDF/office rendering, OCR, and document conversion
 - Video transcoding and thumbnail pipelines
 - Remote object storage, multiple service instances, multi-tenancy, and

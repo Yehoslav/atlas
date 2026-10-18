@@ -107,6 +107,11 @@ impl ApiError {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_media", detail)
     }
 
+    /// The message a client may safely be shown.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
     pub fn internal(error: impl std::fmt::Display) -> Self {
         tracing::error!(%error, "request failed");
         Self::new(

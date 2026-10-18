@@ -7,7 +7,9 @@ use sqlx::{
 
 use crate::{
     ident::AssetId,
-    model::{AssetRecord, AssetState, RenditionFormat, RenditionRecord, SourceFormat, StoredAsset},
+    model::{
+        AssetRecord, AssetState, Kind, RenditionFormat, RenditionRecord, SourceFormat, StoredAsset,
+    },
 };
 
 #[derive(Clone)]
@@ -75,6 +77,128 @@ impl From<sqlx::migrate::MigrateError> for StoreError {
     fn from(value: sqlx::migrate::MigrateError) -> Self {
         Self::Migration(value)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Sort {
+    CreatedAt,
+    Bytes,
+    Width,
+    Filename,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Order {
+    Asc,
+    Desc,
+}
+
+/// Which part of an asset's life a listing covers.
+///
+/// "Deleted" and "purged" are deliberately different questions. A deleted asset
+/// still has its bytes in the trash and can be restored; a purged one is a
+/// tombstone, and listing one under the other is how a caller ends up offering
+/// a reader a restore that can no longer work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StateFilter {
+    Live,
+    Deleted,
+    Purged,
+    All,
+}
+
+/// A browsable page of one collection.
+///
+/// Every field is optional except the collection and the window: an absent
+/// filter means "no opinion", which is what makes a query builder's job easy.
+#[derive(Clone, Debug)]
+pub struct ListQuery {
+    pub kind: Kind,
+    pub state: StateFilter,
+    pub name_contains: Option<String>,
+    pub created_after: Option<i64>,
+    pub created_before: Option<i64>,
+    pub bytes_min: Option<i64>,
+    pub bytes_max: Option<i64>,
+    pub width_min: Option<i64>,
+    pub height_min: Option<i64>,
+    pub sort: Sort,
+    pub order: Order,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+impl Default for ListQuery {
+    fn default() -> Self {
+        Self {
+            kind: Kind::Image,
+            state: StateFilter::Live,
+            name_contains: None,
+            created_after: None,
+            created_before: None,
+            bytes_min: None,
+            bytes_max: None,
+            width_min: None,
+            height_min: None,
+            sort: Sort::CreatedAt,
+            order: Order::Desc,
+            limit: DEFAULT_LIST_LIMIT,
+            offset: 0,
+        }
+    }
+}
+
+pub const DEFAULT_LIST_LIMIT: i64 = 50;
+pub const MAX_LIST_LIMIT: i64 = 200;
+
+/// Append the `WHERE` clause for a listing, including the leading `WHERE`.
+///
+/// Used by both the count and the page query so the two can never disagree
+/// about what "the filtered set" means.
+fn push_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &ListQuery) {
+    builder.push(" WHERE kind = ");
+    builder.push_bind(query.kind.key());
+
+    match query.state {
+        StateFilter::Live => {
+            builder.push(" AND deleted_at IS NULL");
+        }
+        StateFilter::Deleted => {
+            builder.push(" AND deleted_at IS NOT NULL AND purged_at IS NULL");
+        }
+        StateFilter::Purged => {
+            builder.push(" AND purged_at IS NOT NULL");
+        }
+        StateFilter::All => {}
+    }
+
+    if let Some(needle) = query.name_contains.as_deref() {
+        builder.push(" AND original_name LIKE ");
+        builder.push_bind(format!("%{}%", escape_like(needle)));
+        builder.push(" ESCAPE '\\'");
+    }
+    for (column, value) in [
+        ("created_at >=", query.created_after),
+        ("created_at <=", query.created_before),
+        ("bytes >=", query.bytes_min),
+        ("bytes <=", query.bytes_max),
+        ("width >=", query.width_min),
+        ("height >=", query.height_min),
+    ] {
+        if let Some(value) = value {
+            builder.push(format!(" AND {column} "));
+            builder.push_bind(value);
+        }
+    }
+}
+
+/// Escape the characters `LIKE` treats as wildcards, so a search for `50%` or
+/// `a_b` looks for those characters instead of matching everything.
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Outcome of an insert, distinguishing a lost ID race from a real failure so
@@ -162,8 +286,8 @@ impl Store {
         let mut transaction = self.pool.begin().await?;
         let insert = sqlx::query(
             "INSERT INTO assets (id, source_format, bytes, sha256, width, height, created_at,
-                                 original_name)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                 original_name, kind)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(asset.id.as_str())
         .bind(asset.source_format.key())
@@ -173,6 +297,7 @@ impl Store {
         .bind(asset.height.map(i64::from))
         .bind(asset.created_at)
         .bind(&asset.original_name)
+        .bind(asset.kind.map(Kind::key))
         .execute(&mut *transaction)
         .await;
 
@@ -231,21 +356,143 @@ impl Store {
             .collect())
     }
 
-    /// A live asset whose original bytes hash to `sha256`.
+    /// A live asset whose original bytes hash to `sha256` *in the same
+    /// collection*.
     ///
     /// Only live assets match: re-uploading after a delete is a decision to add
-    /// the file again, not to resurrect an old one. This is best effort by
-    /// design - see `migrations/README.md` for why a unique index is not an
-    /// option - so two *concurrent* uploads of identical bytes can both win.
-    pub async fn find_live_by_sha256(&self, sha256: &str) -> Result<Option<AssetId>, StoreError> {
-        let row =
-            sqlx::query("SELECT id FROM assets WHERE sha256 = ? AND deleted_at IS NULL LIMIT 1")
-                .bind(sha256)
-                .fetch_optional(&self.pool)
-                .await?;
+    /// the file again, not to resurrect an old one. The kind is part of the
+    /// lookup because identical bytes mean different things in different
+    /// collections - a document must never answer a request for an image that
+    /// needs renditions. This is best effort by design: see
+    /// `migrations/README.md` for why a unique index is not an option.
+    pub async fn find_live_by_sha256(
+        &self,
+        sha256: &str,
+        kind: Kind,
+    ) -> Result<Option<AssetId>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id FROM assets
+             WHERE sha256 = ? AND kind = ? AND deleted_at IS NULL
+             ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(sha256)
+        .bind(kind.key())
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row
             .and_then(|row| row.try_get::<String, _>("id").ok())
             .and_then(|id| AssetId::parse(&id).ok()))
+    }
+
+    /// A page of one collection, plus the size of the whole filtered set.
+    pub async fn list_assets(
+        &self,
+        query: ListQuery,
+    ) -> Result<(Vec<StoredAsset>, i64), StoreError> {
+        let total: i64 = {
+            let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM assets");
+            push_filters(&mut count, &query);
+            count.build().fetch_one(&self.pool).await?.try_get(0)?
+        };
+
+        let direction = match query.order {
+            Order::Asc => "ASC",
+            Order::Desc => "DESC",
+        };
+        // `id` is the tiebreaker on every sort, so equal keys cannot make a row
+        // appear on two pages or on none.
+        let ordering = match query.sort {
+            Sort::CreatedAt => format!("created_at {direction}, id {direction}"),
+            Sort::Bytes => format!("bytes {direction}, id {direction}"),
+            Sort::Width => format!("width {direction}, id {direction}"),
+            Sort::Filename => {
+                // Unnamed assets last, whichever way the list is ordered.
+                format!("(original_name IS NULL) ASC, original_name {direction}, id {direction}")
+            }
+        };
+
+        let mut page = QueryBuilder::<Sqlite>::new(
+            "SELECT id, source_format, bytes, sha256, width, height, created_at, \
+             original_name, kind, deleted_at, purged_at, pinned FROM assets",
+        );
+        push_filters(&mut page, &query);
+        page.push(format!(" ORDER BY {ordering} LIMIT "));
+        page.push_bind(query.limit);
+        page.push(" OFFSET ");
+        page.push_bind(query.offset);
+        let rows = page.build().fetch_all(&self.pool).await?;
+
+        let mut assets = Vec::with_capacity(rows.len());
+        for row in rows {
+            let raw_id = row.try_get::<String, _>("id")?;
+            let Ok(id) = AssetId::parse(&raw_id) else {
+                tracing::error!("stored asset id is not a valid identifier: {raw_id}");
+                continue;
+            };
+            let Some(asset) = asset_from_row(&row, id)? else {
+                continue;
+            };
+            assets.push(StoredAsset {
+                asset,
+                renditions: Vec::new(),
+            });
+        }
+
+        Ok((assets, total))
+    }
+
+    /// Counts and bytes for each collection, for a library header.
+    pub async fn summary(&self) -> Result<Vec<(Kind, i64, i64)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT kind, COUNT(*) AS count, COALESCE(SUM(bytes), 0) AS bytes
+             FROM assets GROUP BY kind",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let kind = row
+                    .try_get::<Option<String>, _>("kind")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| Kind::from_key(&value))?;
+                Some((
+                    kind,
+                    row.try_get::<i64, _>("count").ok()?,
+                    row.try_get::<i64, _>("bytes").ok()?.max(0),
+                ))
+            })
+            .collect())
+    }
+
+    /// Renditions for a set of assets, in one query, for a listing page.
+    pub async fn renditions_for(
+        &self,
+        ids: &[&AssetId],
+    ) -> Result<HashMap<String, Vec<RenditionRecord>>, StoreError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT asset_id, max_width, width, height, format, bytes, sha256, file_name
+             FROM renditions WHERE asset_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id.as_str());
+        }
+        separated.push_unseparated(") ORDER BY max_width ASC, format ASC");
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut by_asset: HashMap<String, Vec<RenditionRecord>> = HashMap::new();
+        for row in rows {
+            if let Some((asset_id, rendition)) = to_rendition(row) {
+                by_asset.entry(asset_id).or_default().push(rendition);
+            }
+        }
+        Ok(by_asset)
     }
 
     /// Lifecycle state for a set of ids the caller already knows.
@@ -255,13 +502,13 @@ impl Store {
     pub async fn asset_states_by_id(
         &self,
         ids: &[AssetId],
-    ) -> Result<HashMap<String, (AssetState, bool)>, StoreError> {
+    ) -> Result<HashMap<String, (AssetState, bool, Option<Kind>)>, StoreError> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
 
         let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT id, deleted_at, purged_at, pinned FROM assets WHERE id IN (",
+            "SELECT id, kind, deleted_at, purged_at, pinned FROM assets WHERE id IN (",
         );
         let mut separated = query.separated(", ");
         for id in ids {
@@ -275,7 +522,12 @@ impl Store {
             .filter_map(|row| {
                 let id: String = row.try_get("id").ok()?;
                 let pinned = row.try_get::<bool, _>("pinned").ok()?;
-                Some((id, (state_from(&row), pinned)))
+                let kind = row
+                    .try_get::<Option<String>, _>("kind")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| Kind::from_key(&value));
+                Some((id, (state_from(&row), pinned, kind)))
             })
             .collect())
     }
@@ -283,7 +535,7 @@ impl Store {
     pub async fn get_asset(&self, id: &AssetId) -> Result<Option<StoredAsset>, StoreError> {
         let row = sqlx::query(
             "SELECT id, source_format, bytes, sha256, width, height, created_at,
-                    original_name, deleted_at, purged_at, pinned
+                    original_name, kind, deleted_at, purged_at, pinned
              FROM assets WHERE id = ?",
         )
         .bind(id.as_str())
@@ -294,41 +546,23 @@ impl Store {
             return Ok(None);
         };
 
-        let source_format = row
-            .try_get::<String, _>("source_format")
-            .ok()
-            .and_then(|value| SourceFormat::from_database(&value));
-        let Some(source_format) = source_format else {
+        let Some(asset) = asset_from_row(&row, id.clone())? else {
             return Ok(None);
         };
 
-        let asset = AssetRecord {
-            id: id.clone(),
-            source_format,
-            bytes: row.try_get::<i64, _>("bytes")?.max(0) as u64,
-            sha256: row.try_get("sha256")?,
-            width: row
-                .try_get::<Option<i64>, _>("width")?
-                .and_then(|value| u32::try_from(value).ok()),
-            height: row
-                .try_get::<Option<i64>, _>("height")?
-                .and_then(|value| u32::try_from(value).ok()),
-            created_at: row.try_get("created_at")?,
-            original_name: row.try_get("original_name")?,
-            deleted_at: row.try_get("deleted_at")?,
-            purged_at: row.try_get("purged_at")?,
-            pinned: row.try_get::<bool, _>("pinned")?,
-        };
-
         let rows = sqlx::query(
-            "SELECT max_width, width, height, format, bytes, sha256, file_name
+            "SELECT asset_id, max_width, width, height, format, bytes, sha256, file_name
              FROM renditions WHERE asset_id = ? ORDER BY max_width ASC, format ASC",
         )
         .bind(id.as_str())
         .fetch_all(&self.pool)
         .await?;
 
-        let renditions = rows.into_iter().filter_map(to_rendition).collect();
+        let renditions = rows
+            .into_iter()
+            .filter_map(to_rendition)
+            .map(|(_, rendition)| rendition)
+            .collect();
 
         Ok(Some(StoredAsset { asset, renditions }))
     }
@@ -425,7 +659,7 @@ impl Store {
     ) -> Result<Vec<StoredAsset>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, source_format, bytes, sha256, width, height, created_at,
-                    original_name, deleted_at, purged_at, pinned
+                    original_name, kind, deleted_at, purged_at, pinned
              FROM assets WHERE deleted_at IS NOT NULL
              ORDER BY deleted_at DESC, id ASC
              LIMIT ? OFFSET ?",
@@ -437,38 +671,16 @@ impl Store {
 
         let mut assets = Vec::with_capacity(rows.len());
         for row in rows {
-            let id = row.try_get::<String, _>("id")?;
-            let Some(id) = AssetId::parse(&id).ok() else {
-                tracing::error!("stored asset id is not a valid identifier: {id}");
+            let raw_id = row.try_get::<String, _>("id")?;
+            let Ok(id) = AssetId::parse(&raw_id) else {
+                tracing::error!("stored asset id is not a valid identifier: {raw_id}");
                 continue;
             };
-            let Some(source_format) = row
-                .try_get::<String, _>("source_format")
-                .ok()
-                .and_then(|value| SourceFormat::from_database(&value))
-            else {
-                tracing::error!("asset {id} has an unknown source format and is skipped");
+            let Some(asset) = asset_from_row(&row, id)? else {
                 continue;
             };
-
             assets.push(StoredAsset {
-                asset: AssetRecord {
-                    id,
-                    source_format,
-                    bytes: row.try_get::<i64, _>("bytes")?.max(0) as u64,
-                    sha256: row.try_get("sha256")?,
-                    width: row
-                        .try_get::<Option<i64>, _>("width")?
-                        .and_then(|value| u32::try_from(value).ok()),
-                    height: row
-                        .try_get::<Option<i64>, _>("height")?
-                        .and_then(|value| u32::try_from(value).ok()),
-                    created_at: row.try_get("created_at")?,
-                    original_name: row.try_get("original_name")?,
-                    deleted_at: row.try_get("deleted_at")?,
-                    purged_at: row.try_get("purged_at")?,
-                    pinned: row.try_get::<bool, _>("pinned")?,
-                },
+                asset,
                 renditions: Vec::new(),
             });
         }
@@ -488,7 +700,65 @@ impl Store {
     }
 }
 
-fn to_rendition(row: sqlx::sqlite::SqliteRow) -> Option<RenditionRecord> {
+/// Build an `AssetRecord` from a row that selected the asset columns.
+///
+/// `None` means the row cannot be trusted: an unknown format or an identifier
+/// that is not an asset id. Kind is read from the column and, for a row written
+/// before that column existed, derived from the format the row already had.
+fn asset_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    id: AssetId,
+) -> Result<Option<AssetRecord>, StoreError> {
+    let Some(source_format) = row
+        .try_get::<String, _>("source_format")
+        .ok()
+        .and_then(|value| SourceFormat::from_database(&value))
+    else {
+        tracing::error!(asset = %id, "stored asset has an unknown source format");
+        return Ok(None);
+    };
+
+    let kind = match row.try_get::<Option<String>, _>("kind").ok().flatten() {
+        Some(value) => match Kind::from_key(&value) {
+            Some(kind) => Some(kind),
+            None => {
+                tracing::error!(asset = %id, kind = %value, "stored asset has an unknown kind");
+                None
+            }
+        },
+        None => {
+            tracing::warn!(asset = %id, "stored asset has no kind; deriving it from its format");
+            Some(match source_format {
+                SourceFormat::Jpeg | SourceFormat::Png | SourceFormat::Webp => Kind::Image,
+                SourceFormat::Pdf | SourceFormat::Doc | SourceFormat::Docx => Kind::Document,
+            })
+        }
+    };
+
+    Ok(Some(AssetRecord {
+        id,
+        source_format,
+        bytes: row.try_get::<i64, _>("bytes")?.max(0) as u64,
+        sha256: row.try_get("sha256")?,
+        width: row
+            .try_get::<Option<i64>, _>("width")?
+            .and_then(|value| u32::try_from(value).ok()),
+        height: row
+            .try_get::<Option<i64>, _>("height")?
+            .and_then(|value| u32::try_from(value).ok()),
+        created_at: row.try_get("created_at")?,
+        original_name: row.try_get("original_name")?,
+        kind,
+        deleted_at: row.try_get("deleted_at")?,
+        purged_at: row.try_get("purged_at")?,
+        pinned: row.try_get::<bool, _>("pinned")?,
+    }))
+}
+
+/// The asset ID and the rendition it describes, or `None` for a row Atlas cannot
+/// make sense of.
+fn to_rendition(row: sqlx::sqlite::SqliteRow) -> Option<(String, RenditionRecord)> {
+    let asset_id: String = row.try_get("asset_id").ok()?;
     let format = row
         .try_get::<String, _>("format")
         .ok()
@@ -507,15 +777,18 @@ fn to_rendition(row: sqlx::sqlite::SqliteRow) -> Option<RenditionRecord> {
         }
     };
 
-    Some(RenditionRecord {
-        max_width,
-        width,
-        height: u32::try_from(row.try_get::<i64, _>("height").ok()?).ok()?,
-        format,
-        bytes: row.try_get::<i64, _>("bytes").ok()?.max(0) as u64,
-        sha256: row.try_get("sha256").ok()?,
-        file_name,
-    })
+    Some((
+        asset_id,
+        RenditionRecord {
+            max_width,
+            width,
+            height: u32::try_from(row.try_get::<i64, _>("height").ok()?).ok()?,
+            format,
+            bytes: row.try_get::<i64, _>("bytes").ok()?.max(0) as u64,
+            sha256: row.try_get("sha256").ok()?,
+            file_name,
+        },
+    ))
 }
 
 fn state_from(row: &sqlx::sqlite::SqliteRow) -> AssetState {
@@ -546,6 +819,7 @@ mod tests {
     use crate::{
         MIGRATION_FILES,
         ident::{AssetId, DEFAULT_LENGTH},
+        model::Kind,
         model::{AssetRecord, AssetState, RenditionFormat, RenditionRecord, SourceFormat},
     };
 
@@ -559,6 +833,7 @@ mod tests {
             height: Some(480),
             created_at: 1_700_000_000,
             original_name: None,
+            kind: Some(Kind::Image),
             deleted_at: None,
             purged_at: None,
             pinned: false,
@@ -674,6 +949,7 @@ mod tests {
                 height INTEGER,
                 created_at INTEGER NOT NULL,
                 original_name TEXT,
+                kind TEXT,
                 deleted_at INTEGER,
                 purged_at INTEGER,
                 pinned INTEGER NOT NULL DEFAULT 0,
@@ -685,9 +961,9 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO assets_new (id, source_format, bytes, sha256, width, height,
-                                     created_at, original_name, deleted_at, purged_at, pinned)
+                                     created_at, original_name, kind, deleted_at, purged_at, pinned)
              SELECT id, source_format, bytes, sha256, width, height,
-                    created_at, original_name, deleted_at, purged_at, pinned
+                    created_at, original_name, kind, deleted_at, purged_at, pinned
              FROM assets",
         )
         .execute(&mut *transaction)

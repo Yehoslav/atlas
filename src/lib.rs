@@ -267,21 +267,40 @@ async fn recover_incomplete_storage(
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(api::health))
-        .route("/api/v1/assets", axum::routing::post(api::upload_asset))
+        // Two collections: the caller's choice is in the path, so asking for a
+        // rendition is asking for an image by construction.
         .route(
-            "/api/v1/assets/{id}",
+            "/api/v1/images",
+            axum::routing::post(api::upload_image).get(api::list_images),
+        )
+        .route(
+            "/api/v1/documents",
+            axum::routing::post(api::upload_document).get(api::list_documents),
+        )
+        .route(
+            "/api/v1/{kind}/{id}",
             get(api::get_asset).delete(api::delete_asset),
         )
+        .route(
+            "/api/v1/{kind}/{id}/restore",
+            axum::routing::post(api::restore_asset),
+        )
+        .route("/api/v1/{kind}/{id}/pin", axum::routing::put(api::set_pin))
+        .route(
+            "/api/v1/{kind}/actions",
+            axum::routing::post(api::bulk_actions),
+        )
+        // Images only: documents have no renditions, so there is no such route.
+        .route("/api/v1/images/{id}/srcset", get(api::get_srcset))
+        // Uniform reads: a caller naturally asks about a mixed set of ids, and
+        // reading is harmless when the caller's classification is wrong.
         .route(
             "/api/v1/assets/state",
             axum::routing::post(api::asset_states),
         )
-        .route(
-            "/api/v1/assets/{id}/restore",
-            axum::routing::post(api::restore_asset),
-        )
-        .route("/api/v1/assets/{id}/pin", axum::routing::put(api::set_pin))
+        .route("/api/v1/summary", get(api::summary))
         .route("/api/v1/trash", get(api::list_trash))
+        // Public delivery is addressed by id and stays untyped.
         .route("/media/{id}/original", get(api::get_original))
         .route("/media/{id}/{rendition}", get(api::get_rendition))
         .with_state(state)

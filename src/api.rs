@@ -34,8 +34,12 @@ use crate::{
     filename,
     ident::AssetId,
     media::{MediaError, sha256_bytes, sha256_file, validate_signature},
-    model::{AssetRecord, AssetState, RenditionFormat, RenditionRecord, SourceFormat, StoredAsset},
-    store::InsertOutcome,
+    model::{
+        AssetRecord, AssetState, Kind, RenditionFormat, RenditionRecord, SourceFormat, StoredAsset,
+    },
+    store::{
+        DEFAULT_LIST_LIMIT, InsertOutcome, ListQuery, MAX_LIST_LIMIT, Order, Sort, StateFilter,
+    },
 };
 
 const CACHE_POLICY: &str = "public, max-age=31536000, immutable";
@@ -67,7 +71,13 @@ pub(crate) async fn health() -> Json<HealthResponse> {
 #[derive(Serialize)]
 pub(super) struct AssetResponse {
     id: String,
+    /// Present only when an upload matched an asset that already existed. The
+    /// status says it too; this saves a client from reading a status code for
+    /// something a field states directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deduplicated: Option<bool>,
     created_at: i64,
+    kind: Kind,
     state: AssetState,
     deleted_at: Option<i64>,
     purged_at: Option<i64>,
@@ -150,12 +160,30 @@ pub(super) struct StateRequest {
 pub(super) struct StateEntryResponse {
     id: String,
     state: AssetState,
+    /// Which collection it belongs to, so a caller can address it with a typed
+    /// route afterwards. Null only when Atlas has no record of the id.
+    kind: Option<Kind>,
     pinned: bool,
 }
 
 #[derive(Serialize)]
 pub(super) struct StateResponse {
     assets: Vec<StateEntryResponse>,
+}
+
+/// The collection a row belongs to when its own column is missing.
+fn default_kind(format: SourceFormat) -> Kind {
+    match format {
+        SourceFormat::Jpeg | SourceFormat::Png | SourceFormat::Webp => Kind::Image,
+        SourceFormat::Pdf | SourceFormat::Doc | SourceFormat::Docx => Kind::Document,
+    }
+}
+
+impl AssetResponse {
+    fn deduplicated(mut self) -> Self {
+        self.deduplicated = Some(true);
+        self
+    }
 }
 
 impl From<&StoredAsset> for AssetResponse {
@@ -185,7 +213,11 @@ impl From<&StoredAsset> for AssetResponse {
 
         Self {
             id: asset.id.to_string(),
+            deduplicated: None,
             created_at: asset.created_at,
+            kind: asset
+                .kind
+                .unwrap_or_else(|| default_kind(asset.source_format)),
             state: asset.state(),
             deleted_at: asset.deleted_at,
             purged_at: asset.purged_at,
@@ -222,18 +254,53 @@ impl From<&StoredAsset> for TrashEntryResponse {
     }
 }
 
-pub(super) async fn upload_asset(
+/// Upload into the images collection.
+pub(super) async fn upload_image(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<(StatusCode, Json<AssetResponse>), ApiError> {
-    authorize(&state, request.headers())?;
+    upload_into(state, Kind::Image, request).await
+}
+
+/// Upload into the documents collection, which also accepts images that should
+/// be stored without being converted.
+pub(super) async fn upload_document(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<(StatusCode, Json<AssetResponse>), ApiError> {
+    upload_into(state, Kind::Document, request).await
+}
+
+/// The upload itself, shared by both collections.
+///
+/// The collection comes from the route, so the classification is a property of
+/// the call site rather than a header the caller asserts: posting a PDF to
+/// `/api/v1/images` is refused, not quietly stored.
+async fn upload_into(
+    state: AppState,
+    kind: Kind,
+    request: Request,
+) -> Result<(StatusCode, Json<AssetResponse>), ApiError> {
+    let state = &state;
+    authorize(state, request.headers())?;
     let headers = request.headers();
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| ApiError::unsupported("Set a supported Content-Type for the file."))?;
     let source_format = SourceFormat::parse_content_type(content_type)
-        .ok_or_else(|| ApiError::unsupported("This file type is not accepted."))?;
+        .filter(|format| kind.accepts(*format))
+        .ok_or_else(|| {
+            ApiError::unsupported(match kind {
+                Kind::Image => {
+                    "The images collection accepts image/jpeg, image/png and image/webp."
+                }
+                Kind::Document => "This file type is not accepted.",
+            })
+        })?;
+    // The byte limit follows the format, not the collection: an image stored as
+    // a document is never decoded, but keeping one rule is simpler to reason
+    // about than a limit that depends on the route.
     let limit = if source_format.is_image() {
         state.config.max_image_bytes
     } else {
@@ -283,8 +350,9 @@ pub(super) async fn upload_asset(
         .await
         .map_err(ApiError::internal)?;
     let result = create_asset(
-        &state,
+        state,
         id,
+        kind,
         source_format,
         original_name,
         request.into_body(),
@@ -297,9 +365,11 @@ pub(super) async fn upload_asset(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_asset(
     state: &AppState,
     id: AssetId,
+    kind: Kind,
     source_format: SourceFormat,
     original_name: Option<String>,
     body: Body,
@@ -331,7 +401,7 @@ async fn create_asset(
     // repeated upload costs a hash instead of a full image pass.
     if let Some(existing) = state
         .store
-        .find_live_by_sha256(&original_sha256)
+        .find_live_by_sha256(&original_sha256, kind)
         .await
         .map_err(ApiError::internal)?
     {
@@ -346,10 +416,13 @@ async fn create_asset(
             .await
             .map_err(ApiError::internal)?;
         // 200 rather than 201: nothing was created, and saying so is the point.
-        return Ok((StatusCode::OK, Json(AssetResponse::from(&asset))));
+        return Ok((
+            StatusCode::OK,
+            Json(AssetResponse::from(&asset).deduplicated()),
+        ));
     }
 
-    let (dimensions, renditions) = if source_format.is_image() {
+    let (dimensions, renditions) = if kind.generates_renditions() {
         let _permit = state
             .conversion_slots
             .clone()
@@ -395,6 +468,7 @@ async fn create_asset(
         height: dimensions.map(|value| value.height),
         created_at,
         original_name,
+        kind: Some(kind),
         deleted_at: None,
         purged_at: None,
         pinned: false,
@@ -497,11 +571,11 @@ async fn stream_upload(
 pub(super) async fn get_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    Path((kind, id)): Path<(String, String)>,
 ) -> Result<Json<AssetResponse>, ApiError> {
     authorize(&state, &headers)?;
-    let id = parse_id(&id)?;
-    let asset = load_asset(&state, &id).await?;
+    let kind = parse_kind(&kind)?;
+    let asset = load_asset(&state, &parse_id(&id)?, Some(kind)).await?;
     Ok(Json(AssetResponse::from(&asset)))
 }
 
@@ -514,45 +588,67 @@ pub(super) async fn get_asset(
 pub(super) async fn delete_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    Path((kind, id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     authorize(&state, &headers)?;
+    let kind = parse_kind(&kind)?;
     let id = parse_id(&id)?;
-    let asset = load_asset(&state, &id).await?;
+    load_asset(&state, &id, Some(kind)).await?;
 
-    if asset.asset.state() == AssetState::Active {
-        state
-            .store
-            .mark_deleted(&id, crate::unix_now().map_err(ApiError::internal)?)
-            .await
-            .map_err(ApiError::internal)?;
-        let from = state.asset_dir(&id);
-        if tokio::fs::symlink_metadata(&from).await.is_ok() {
-            if let Err(error) = fs::rename(&from, state.trash_dir(&id)).await {
-                tracing::error!(
-                    asset = %id,
-                    %error,
-                    "the asset is in the trash but its files were not moved; startup recovery will finish the move"
-                );
-                return Err(ApiError::internal(error));
-            }
-        }
-    }
+    delete_inner(&state, &id).await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Move an asset to the trash. Shared with the bulk endpoint so both take the
+/// same order of operations, not just the same outcome.
+async fn delete_inner(state: &AppState, id: &AssetId) -> Result<(), ApiError> {
+    let asset = load_asset(state, id, None).await?;
+    if asset.asset.state() != AssetState::Active {
+        return Ok(());
+    }
+
+    state
+        .store
+        .mark_deleted(id, crate::unix_now().map_err(ApiError::internal)?)
+        .await
+        .map_err(ApiError::internal)?;
+    let from = state.asset_dir(id);
+    if tokio::fs::symlink_metadata(&from).await.is_ok()
+        && let Err(error) = fs::rename(&from, state.trash_dir(id)).await
+    {
+        tracing::error!(
+            asset = %id,
+            %error,
+            "the asset is in the trash but its files were not moved; startup recovery will finish the move"
+        );
+        return Err(ApiError::internal(error));
+    }
+    Ok(())
 }
 
 pub(super) async fn restore_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    Path((kind, id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     authorize(&state, &headers)?;
+    let kind = parse_kind(&kind)?;
     let id = parse_id(&id)?;
-    let asset = load_asset(&state, &id).await?;
+    load_asset(&state, &id, Some(kind)).await?;
 
+    restore_inner(&state, &id).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Bring a trashed asset back. Files first: a crash between the rename and the
+/// row update leaves a deleted row over files that are back in `assets/`, which
+/// recovery resolves back into the trash.
+async fn restore_inner(state: &AppState, id: &AssetId) -> Result<(), ApiError> {
+    let asset = load_asset(state, id, None).await?;
     match asset.asset.state() {
-        AssetState::Active => return Ok(StatusCode::NO_CONTENT),
+        AssetState::Active => return Ok(()),
         AssetState::Purged | AssetState::Missing => {
             return Err(ApiError::conflict(
                 "asset_purged",
@@ -562,39 +658,45 @@ pub(super) async fn restore_asset(
         AssetState::Deleted => {}
     }
 
-    // Files first: a crash here leaves a deleted row over files that are back in
-    // `assets/`, which recovery resolves back into the trash.
-    fs::rename(state.trash_dir(&id), state.asset_dir(&id))
+    fs::rename(state.trash_dir(id), state.asset_dir(id))
         .await
         .map_err(ApiError::internal)?;
     state
         .store
-        .mark_restored(&id)
+        .mark_restored(id)
         .await
         .map_err(ApiError::internal)?;
-
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 /// Record that a consuming application still uses this asset, so purge skips it.
 pub(super) async fn set_pin(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    Path((kind, id)): Path<(String, String)>,
     Json(body): Json<PinRequest>,
 ) -> Result<Json<AssetResponse>, ApiError> {
     authorize(&state, &headers)?;
+    let kind = parse_kind(&kind)?;
     let id = parse_id(&id)?;
+    // Checked before the write, so a wrong collection cannot pin an asset that
+    // is not in it.
+    load_asset(&state, &id, Some(kind)).await?;
+    set_pinned_inner(&state, &id, body.pinned).await?;
+    let asset = load_asset(&state, &id, Some(kind)).await?;
+    Ok(Json(AssetResponse::from(&asset)))
+}
+
+async fn set_pinned_inner(state: &AppState, id: &AssetId, pinned: bool) -> Result<(), ApiError> {
     if !state
         .store
-        .set_pinned(&id, body.pinned)
+        .set_pinned(id, pinned)
         .await
         .map_err(ApiError::internal)?
     {
         return Err(ApiError::not_found());
     }
-    let asset = load_asset(&state, &id).await?;
-    Ok(Json(AssetResponse::from(&asset)))
+    Ok(())
 }
 
 /// Answer "which of the ids I already know can you still serve?".
@@ -636,19 +738,420 @@ pub(super) async fn asset_states(
     let assets = ids
         .into_iter()
         .map(|id| {
-            let (state, pinned) = known
-                .get(id.as_str())
-                .copied()
-                .unwrap_or((AssetState::Missing, false));
+            let (state, pinned, kind) =
+                known
+                    .get(id.as_str())
+                    .copied()
+                    .unwrap_or((AssetState::Missing, false, None));
             StateEntryResponse {
                 id: id.to_string(),
                 state,
                 pinned,
+                kind,
             }
         })
         .collect();
 
     Ok(Json(StateResponse { assets }))
+}
+
+/// A browsable page of one collection.
+///
+/// Every filter here is a fact Atlas stores; nothing about meaning is
+/// filterable, because nothing about meaning is Atlas's business.
+pub(super) async fn list_images(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ListParams>,
+) -> Result<Json<ListResponse>, ApiError> {
+    list_collection(state, Kind::Image, headers, params).await
+}
+
+pub(super) async fn list_documents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ListParams>,
+) -> Result<Json<ListResponse>, ApiError> {
+    list_collection(state, Kind::Document, headers, params).await
+}
+
+/// The listing itself, shared by both collections.
+async fn list_collection(
+    state: AppState,
+    kind: Kind,
+    headers: HeaderMap,
+    params: ListParams,
+) -> Result<Json<ListResponse>, ApiError> {
+    let state = &state;
+    authorize(state, &headers)?;
+    let query = params.into_query(kind)?;
+
+    let (assets, total) = state
+        .store
+        .list_assets(query.clone())
+        .await
+        .map_err(ApiError::internal)?;
+    // One extra query for the page's renditions, rather than one per asset.
+    let renditions = state
+        .store
+        .renditions_for(
+            &assets
+                .iter()
+                .map(|stored| &stored.asset.id)
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    let assets = assets
+        .into_iter()
+        .map(|mut stored| {
+            stored.renditions = renditions
+                .get(stored.asset.id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            AssetResponse::from(&stored)
+        })
+        .collect();
+
+    Ok(Json(ListResponse {
+        assets,
+        total,
+        limit: query.limit,
+        offset: query.offset,
+    }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ListParams {
+    state: Option<String>,
+    q: Option<String>,
+    created_after: Option<i64>,
+    created_before: Option<i64>,
+    bytes_min: Option<i64>,
+    bytes_max: Option<i64>,
+    width_min: Option<i64>,
+    height_min: Option<i64>,
+    sort: Option<String>,
+    order: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+impl ListParams {
+    fn into_query(self, kind: Kind) -> Result<ListQuery, ApiError> {
+        let state = match self.state.as_deref() {
+            None | Some("active") => StateFilter::Live,
+            Some("deleted") => StateFilter::Deleted,
+            Some("purged") => StateFilter::Purged,
+            Some("all") => StateFilter::All,
+            Some(_) => {
+                return Err(ApiError::bad_request(
+                    "invalid_state",
+                    "state must be active, deleted, purged or all.",
+                ));
+            }
+        };
+
+        let sort = match self.sort.as_deref() {
+            None | Some("created_at") => Sort::CreatedAt,
+            Some("bytes") => Sort::Bytes,
+            Some("width") => Sort::Width,
+            Some("filename") => Sort::Filename,
+            Some(_) => {
+                return Err(ApiError::bad_request(
+                    "invalid_sort",
+                    "sort must be created_at, bytes, width or filename.",
+                ));
+            }
+        };
+        let order = match self.order.as_deref() {
+            None | Some("desc") => Order::Desc,
+            Some("asc") => Order::Asc,
+            Some(_) => {
+                return Err(ApiError::bad_request(
+                    "invalid_order",
+                    "order must be asc or desc.",
+                ));
+            }
+        };
+
+        Ok(ListQuery {
+            kind,
+            state,
+            name_contains: self.q.filter(|value| !value.is_empty()),
+            created_after: self.created_after,
+            created_before: self.created_before,
+            bytes_min: self.bytes_min,
+            bytes_max: self.bytes_max,
+            width_min: self.width_min,
+            height_min: self.height_min,
+            sort,
+            order,
+            limit: self
+                .limit
+                .unwrap_or(DEFAULT_LIST_LIMIT)
+                .clamp(1, MAX_LIST_LIMIT),
+            offset: self.offset.unwrap_or(0).max(0),
+        })
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct ListResponse {
+    assets: Vec<AssetResponse>,
+    total: i64,
+    limit: i64,
+    offset: i64,
+}
+
+/// Counts and bytes per collection, for a library header.
+pub(super) async fn summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SummaryResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let rows = state.store.summary().await.map_err(ApiError::internal)?;
+    let for_kind = |kind: Kind| -> CollectionSummary {
+        rows.iter()
+            .find(|(stored, _, _)| *stored == kind)
+            .map(|(_, count, bytes)| CollectionSummary {
+                count: *count,
+                bytes: *bytes,
+            })
+            .unwrap_or_default()
+    };
+    let images = for_kind(Kind::Image);
+    let documents = for_kind(Kind::Document);
+    let total = CollectionSummary {
+        count: images.count + documents.count,
+        bytes: images.bytes + documents.bytes,
+    };
+    Ok(Json(SummaryResponse {
+        images,
+        documents,
+        total,
+    }))
+}
+
+#[derive(Default, Serialize)]
+pub(super) struct CollectionSummary {
+    count: i64,
+    bytes: i64,
+}
+
+#[derive(Serialize)]
+pub(super) struct SummaryResponse {
+    images: CollectionSummary,
+    documents: CollectionSummary,
+    total: CollectionSummary,
+}
+
+/// Apply an action to many assets at once.
+///
+/// The whole batch is validated before anything happens: a typo in one id
+/// rejects the batch rather than deleting forty files and failing on the
+/// forty-first. Once it starts, each id reports its own outcome, because a
+/// filesystem operation can still fail halfway and pretending otherwise would be
+/// a lie.
+pub(super) async fn bulk_actions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(kind): Path<String>,
+    Json(body): Json<ActionRequest>,
+) -> Result<Json<ActionsResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let kind = parse_kind(&kind)?;
+    let action = body.action()?;
+
+    if body.ids.len() > MAX_STATE_IDS {
+        return Err(ApiError::bad_request(
+            "too_many_ids",
+            format!("Act on at most {MAX_STATE_IDS} assets at a time."),
+        ));
+    }
+
+    let mut ids = Vec::with_capacity(body.ids.len());
+    for raw in &body.ids {
+        ids.push(AssetId::parse(raw).map_err(|_| {
+            ApiError::bad_request(
+                "invalid_asset_ids",
+                "Every id must be a lowercase base36 asset id of 12 to 24 characters.",
+            )
+        })?);
+    }
+
+    let mut unknown = Vec::new();
+    for id in &ids {
+        if load_asset(&state, id, Some(kind)).await.is_err() {
+            unknown.push(id.to_string());
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(ApiError::bad_request(
+            "unknown_asset",
+            format!(
+                "No action was taken. These ids are not in the {} collection: {}",
+                kind.slug(),
+                unknown.join(", ")
+            ),
+        ));
+    }
+
+    let mut results = Vec::with_capacity(ids.len());
+    for id in ids {
+        let outcome = match action {
+            BulkAction::Delete => delete_inner(&state, &id).await.map(|()| "deleted"),
+            BulkAction::Restore => restore_inner(&state, &id).await.map(|()| "restored"),
+            BulkAction::Pin => set_pinned_inner(&state, &id, true).await.map(|()| "pinned"),
+            BulkAction::Unpin => set_pinned_inner(&state, &id, false)
+                .await
+                .map(|()| "unpinned"),
+        };
+        results.push(match outcome {
+            Ok(status) => ActionResult {
+                id: id.to_string(),
+                status,
+                error: None,
+            },
+            Err(error) => {
+                tracing::error!(asset = %id, "a bulk action failed for one asset");
+                ActionResult {
+                    id: id.to_string(),
+                    status: "error",
+                    error: Some(error.detail().to_owned()),
+                }
+            }
+        });
+    }
+
+    Ok(Json(ActionsResponse { results }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ActionRequest {
+    action: String,
+    ids: Vec<String>,
+}
+
+impl ActionRequest {
+    fn action(&self) -> Result<BulkAction, ApiError> {
+        match self.action.as_str() {
+            "delete" => Ok(BulkAction::Delete),
+            "restore" => Ok(BulkAction::Restore),
+            "pin" => Ok(BulkAction::Pin),
+            "unpin" => Ok(BulkAction::Unpin),
+            _ => Err(ApiError::bad_request(
+                "unknown_action",
+                "action must be delete, restore, pin or unpin.",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BulkAction {
+    Delete,
+    Restore,
+    Pin,
+    Unpin,
+}
+
+#[derive(Serialize)]
+pub(super) struct ActionResult {
+    id: String,
+    status: &'static str,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(super) struct ActionsResponse {
+    results: Vec<ActionResult>,
+}
+
+/// The `src` and `srcset` a consumer can paste, for the images collection.
+///
+/// Each descriptor is the rendition's *actual* width while its URL keeps the
+/// profile it was stored under, which is the distinction a hand-written srcset
+/// gets wrong.
+pub(super) async fn get_srcset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<SrcsetParams>,
+) -> Result<Json<SrcsetResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let id = parse_id(&id)?;
+    let asset = load_asset(&state, &id, Some(Kind::Image)).await?;
+    let widths = params.widths()?;
+
+    // One entry per width: each stored rendition has one row per *format*, and
+    // a srcset descriptor describes a width, not a representation.
+    let mut chosen: Vec<&RenditionRecord> = Vec::new();
+    for width in widths {
+        let Some(rendition) = asset
+            .renditions
+            .iter()
+            .find(|rendition| rendition.max_width == width)
+        else {
+            continue;
+        };
+        chosen.push(rendition);
+    }
+    chosen.sort_by_key(|rendition| rendition.max_width);
+
+    // The fallback `src` is the widest width that was asked for and exists, or
+    // the original when none of the requested widths were generated.
+    let src = match chosen.last() {
+        Some(rendition) => format!("/media/{id}/w{}", rendition.max_width),
+        None => format!("/media/{id}/original"),
+    };
+
+    let srcset = (!chosen.is_empty()).then(|| {
+        chosen
+            .iter()
+            .map(|rendition| format!("/media/{id}/w{} {}w", rendition.max_width, rendition.width))
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+
+    Ok(Json(SrcsetResponse { src, srcset }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct SrcsetParams {
+    widths: Option<String>,
+}
+
+impl SrcsetParams {
+    fn widths(&self) -> Result<Vec<u32>, ApiError> {
+        let raw = self.widths.as_deref().unwrap_or("320,640,960,1280");
+        let widths: Vec<u32> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.parse::<u32>())
+            .collect::<Result<_, _>>()
+            .map_err(|_| {
+                ApiError::bad_request(
+                    "invalid_widths",
+                    "widths must be a comma-separated list of positive integers.",
+                )
+            })?;
+        if widths.is_empty() || widths.len() > 8 || widths.contains(&0) {
+            return Err(ApiError::bad_request(
+                "invalid_widths",
+                "Ask for between 1 and 8 positive widths.",
+            ));
+        }
+        Ok(widths)
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct SrcsetResponse {
+    src: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    srcset: Option<String>,
 }
 
 pub(super) async fn list_trash(
@@ -678,13 +1181,28 @@ pub(super) async fn list_trash(
     }))
 }
 
-async fn load_asset(state: &AppState, id: &AssetId) -> Result<StoredAsset, ApiError> {
-    state
+/// Load an asset, optionally insisting on the collection it belongs to.
+///
+/// An asset in the other collection is `404`, not `409`: from the caller's side
+/// there is no image or document with that id, and answering differently would
+/// turn the collection into an oracle for what exists.
+async fn load_asset(
+    state: &AppState,
+    id: &AssetId,
+    kind: Option<Kind>,
+) -> Result<StoredAsset, ApiError> {
+    let asset = state
         .store
         .get_asset(id)
         .await
         .map_err(ApiError::internal)?
-        .ok_or_else(ApiError::not_found)
+        .ok_or_else(ApiError::not_found)?;
+    if let Some(kind) = kind
+        && asset.asset.kind.is_some_and(|stored| stored != kind)
+    {
+        return Err(ApiError::not_found());
+    }
+    Ok(asset)
 }
 
 pub(super) async fn get_original(
@@ -693,7 +1211,7 @@ pub(super) async fn get_original(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id)?;
-    let asset = load_asset(&state, &id).await?;
+    let asset = load_asset(&state, &id, None).await?;
     if let Some(response) = serve_placeholder_if_retired(&headers, &asset) {
         return Ok(response);
     }
@@ -701,14 +1219,13 @@ pub(super) async fn get_original(
         "original.{}",
         asset.asset.source_format.extension()
     ));
-    let disposition = if matches!(
+    let disposition = disposition_for(
         asset.asset.source_format,
-        SourceFormat::Doc | SourceFormat::Docx
-    ) {
-        "attachment"
-    } else {
-        "inline"
-    };
+        asset
+            .asset
+            .kind
+            .unwrap_or_else(|| default_kind(asset.asset.source_format)),
+    );
     serve_file(
         &headers,
         &path,
@@ -732,7 +1249,7 @@ pub(super) async fn get_rendition(
         .strip_prefix('w')
         .and_then(|value| value.parse::<u32>().ok())
         .ok_or_else(ApiError::not_found)?;
-    let asset = load_asset(&state, &id).await?;
+    let asset = load_asset(&state, &id, None).await?;
     if let Some(response) = serve_placeholder_if_retired(&headers, &asset) {
         return Ok(response);
     }
@@ -809,6 +1326,21 @@ fn resolve_rendition<'a>(
     Ok((selected, path))
 }
 
+/// How a file is presented when it is served.
+///
+/// A document is an attachment, so a browser offers to save it rather than
+/// rendering it in place — including an image that was uploaded to the
+/// documents collection, which is the whole point of putting it there. A PDF is
+/// the exception: browsers display one inline, and a link to a brochure or a
+/// form means "show me this".
+fn disposition_for(source_format: SourceFormat, kind: Kind) -> &'static str {
+    match (kind, source_format) {
+        (_, SourceFormat::Pdf) => "inline",
+        (Kind::Document, _) => "attachment",
+        (Kind::Image, _) => "inline",
+    }
+}
+
 /// Public delivery for a trashed or purged asset.
 ///
 /// The URL keeps working so that pages already referencing it never break, but
@@ -872,6 +1404,11 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     } else {
         Err(ApiError::unauthorized())
     }
+}
+
+/// A collection segment. Anything that is not a collection is not a route.
+fn parse_kind(value: &str) -> Result<Kind, ApiError> {
+    Kind::from_slug(value).ok_or_else(ApiError::not_found)
 }
 
 fn parse_id(value: &str) -> Result<AssetId, ApiError> {
@@ -1298,20 +1835,34 @@ mod tests {
         }
     }
 
+    /// Which collection a content type belongs in. A client makes this choice;
+    /// the URL is where the server learns about it.
+    fn collection_for(content_type: &str) -> &'static str {
+        if content_type.starts_with("image/") {
+            "images"
+        } else {
+            "documents"
+        }
+    }
+
+    fn asset_uri(collection: &str, id: &str) -> String {
+        format!("/api/v1/{collection}/{id}")
+    }
+
     fn upload_request(content_type: &str, body: Vec<u8>) -> Request<Body> {
         Request::builder()
             .method("POST")
-            .uri("/api/v1/assets")
+            .uri(format!("/api/v1/{}", collection_for(content_type)))
             .header("authorization", "Bearer prototype-test-token")
             .header("content-type", content_type)
             .body(Body::from(body))
             .unwrap()
     }
 
-    fn pin_request(id: &str, pinned: bool) -> Request<Body> {
+    fn pin_request(collection: &str, id: &str, pinned: bool) -> Request<Body> {
         Request::builder()
             .method("PUT")
-            .uri(format!("/api/v1/assets/{id}/pin"))
+            .uri(format!("/api/v1/{collection}/{id}/pin"))
             .header("authorization", "Bearer prototype-test-token")
             .header("content-type", "application/json")
             .body(Body::from(format!(r#"{{"pinned":{pinned}}}"#)))
@@ -1339,14 +1890,24 @@ mod tests {
         (status, value)
     }
 
+    /// Upload a document and return its id. Documents live in their own
+    /// collection, so every later call in a test says `/documents/...`.
     async fn upload_document(router: &Router, body: &[u8]) -> String {
         let (status, value) = send(router, upload_request("application/pdf", body.to_vec())).await;
         assert_eq!(status, StatusCode::CREATED);
         value["id"].as_str().unwrap().to_owned()
     }
 
+    /// Upload an image into the images collection.
+    async fn upload_image(router: &Router, body: &[u8]) -> String {
+        let (status, value) = send(router, upload_request("image/png", body.to_vec())).await;
+        assert_eq!(status, StatusCode::CREATED);
+        value["id"].as_str().unwrap().to_owned()
+    }
+
     fn upload_named(content_type: &str, body: &[u8], file_name: &str) -> Request<Body> {
         let mut request = upload_request(content_type, body.to_vec());
+        let _ = &mut request;
         request.headers_mut().insert(
             ORIGINAL_FILENAME_HEADER,
             HeaderValue::from_bytes(file_name.as_bytes()).unwrap(),
@@ -1354,12 +1915,9 @@ mod tests {
         request
     }
 
-    async fn place_in_trash(router: &Router, id: &str) {
-        let (status, _) = send(
-            router,
-            authorized("DELETE", &format!("/api/v1/assets/{id}")),
-        )
-        .await;
+    /// Move an asset to the trash, through the collection it actually belongs to.
+    async fn place_in_trash(router: &Router, collection: &str, id: &str) {
+        let (status, _) = send(router, authorized("DELETE", &asset_uri(collection, id))).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
@@ -1405,22 +1963,20 @@ mod tests {
         let router = app(state);
 
         let id = upload_document(&router, b"%PDF-1.7\ntrash me").await;
-        let (status, body) =
-            send(&router, authorized("GET", &format!("/api/v1/assets/{id}"))).await;
+        let (status, body) = send(&router, authorized("GET", &asset_uri("documents", &id))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "active");
         assert_eq!(body["pinned"], false);
         assert!(body["deleted_at"].is_null());
 
-        place_in_trash(&router, &id).await;
+        place_in_trash(&router, "documents", &id).await;
         assert!(
             !data_dir.join("assets").join(&id).exists(),
             "the live directory is emptied by the delete"
         );
         assert!(data_dir.join("trash").join(&id).exists());
 
-        let (status, body) =
-            send(&router, authorized("GET", &format!("/api/v1/assets/{id}"))).await;
+        let (status, body) = send(&router, authorized("GET", &asset_uri("documents", &id))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "deleted");
         assert!(body["deleted_at"].is_i64());
@@ -1466,10 +2022,10 @@ mod tests {
             "public, max-age=60"
         );
 
-        let (status, _) = send(
-            &router,
-            authorized("POST", &format!("/api/v1/assets/{id}/restore")),
-        )
+        let (status, _) = send(&router, {
+            let uri = asset_uri("documents", &id);
+            authorized("POST", &format!("{uri}/restore"))
+        })
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert!(data_dir.join("assets").join(&id).exists());
@@ -1492,8 +2048,7 @@ mod tests {
             "public, max-age=31536000, immutable"
         );
 
-        let (status, body) =
-            send(&router, authorized("GET", &format!("/api/v1/assets/{id}"))).await;
+        let (status, body) = send(&router, authorized("GET", &asset_uri("documents", &id))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "active");
         assert!(body["deleted_at"].is_null());
@@ -1514,6 +2069,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_collection_refuses_what_it_cannot_hold() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        // The classification is enforced, not trusted: a PDF posted to the
+        // images collection is refused rather than stored as a picture.
+        let (status, created) = send(
+            &router,
+            upload_request("application/pdf", b"%PDF-1.7\nwrong home".to_vec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "documents accept it");
+        assert_eq!(created["kind"], "document");
+        let document = created["id"].as_str().unwrap().to_owned();
+
+        let mut misfiled = upload_request("application/pdf", b"%PDF-1.7\nworse".to_vec());
+        *misfiled.uri_mut() = "/api/v1/images".parse().unwrap();
+        let (status, error) = send(&router, misfiled).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(error["error"]["code"], "unsupported_media_type");
+
+        // ...and a document cannot be read through the images collection.
+        for method in ["GET", "DELETE"] {
+            let (status, _) =
+                send(&router, authorized(method, &asset_uri("images", &document))).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} through the wrong collection"
+            );
+        }
+        let (status, _) = send(
+            &router,
+            authorized(
+                "POST",
+                &format!("{}/restore", asset_uri("images", &document)),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Public delivery is addressed by id, so it does not care.
+        let (status, _, _) = fetch(&router, &format!("/media/{document}/original")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_document_collection_stores_an_image_without_converting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("diagram.png");
+        let image = write_test_image(&source, "800x600");
+        let data_dir = directory.path().join("atlas");
+        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
+
+        let mut request = upload_request("image/png", image);
+        *request.uri_mut() = "/api/v1/documents".parse().unwrap();
+        let (status, body) = send(&router, request).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["kind"], "document");
+        assert_eq!(
+            body["renditions"].as_array().unwrap().len(),
+            0,
+            "an image stored as a document is not converted"
+        );
+        let id = body["id"].as_str().unwrap().to_owned();
+
+        let stored = std::fs::read_dir(data_dir.join("assets").join(&id))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(stored, ["original.png".to_owned()].into());
+
+        // It is served as a document: an attachment, not an inline picture.
+        let (status, headers, _) = fetch(&router, &format!("/media/{id}/original")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            headers["content-disposition"]
+                .to_str()
+                .unwrap()
+                .starts_with("attachment")
+        );
+
+        // And there is no rendition route for documents at all.
+        let (status, _) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/documents/{id}/srcset")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn identical_bytes_do_not_leak_across_collections() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("both.png");
+        let image = write_test_image(&source, "640x480");
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let (status, photo) = send(&router, upload_request("image/png", image.clone())).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let photo_id = photo["id"].as_str().unwrap().to_owned();
+        assert_eq!(photo["renditions"].as_array().unwrap().len(), 2);
+
+        // The same bytes as a document is a different asset, not the photo.
+        let mut request = upload_request("image/png", image);
+        *request.uri_mut() = "/api/v1/documents".parse().unwrap();
+        let (status, document) = send(&router, request).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_ne!(document["id"], photo_id.as_str());
+        assert_eq!(document["renditions"].as_array().unwrap().len(), 0);
+
+        // And uploading it again as a document deduplicates against the
+        // document, never against the photo.
+        let mut again = upload_request("image/png", std::fs::read(&source).unwrap());
+        *again.uri_mut() = "/api/v1/documents".parse().unwrap();
+        let (status, repeated) = send(&router, again).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(repeated["id"], document["id"]);
+        assert_eq!(repeated["deduplicated"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
     async fn one_call_reports_the_state_of_every_id_it_is_given() {
         let directory = tempfile::tempdir().unwrap();
         let router = app(AppState::new(test_config(directory.path().join("atlas")))
@@ -1523,9 +2204,9 @@ mod tests {
         let live = upload_document(&router, b"%PDF-1.7\nlive").await;
         let deleted = upload_document(&router, b"%PDF-1.7\ndeleted").await;
         let purged = upload_document(&router, b"%PDF-1.7\npurged").await;
-        place_in_trash(&router, &deleted).await;
-        place_in_trash(&router, &purged).await;
-        let (status, _) = send(&router, pin_request(&deleted, true)).await;
+        place_in_trash(&router, "documents", &deleted).await;
+        place_in_trash(&router, "documents", &purged).await;
+        let (status, _) = send(&router, pin_request("documents", &deleted, true)).await;
         assert_eq!(status, StatusCode::OK);
 
         let (status, body) =
@@ -1779,7 +2460,7 @@ mod tests {
         let (status, first) = send(&router, upload_request("application/pdf", body.clone())).await;
         assert_eq!(status, StatusCode::CREATED);
         let first_id = first["id"].as_str().unwrap().to_owned();
-        place_in_trash(&router, &first_id).await;
+        place_in_trash(&router, "documents", &first_id).await;
 
         let (status, second) = send(&router, upload_request("application/pdf", body)).await;
         assert_eq!(
@@ -1810,6 +2491,427 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::CREATED, "upload {index}");
         }
+    }
+
+    async fn listing(router: &Router, query: &str) -> serde_json::Value {
+        let (status, body) = send(
+            router,
+            authorized("GET", &format!("/api/v1/images?{query}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        body
+    }
+
+    fn ids_of(page: &serde_json::Value) -> Vec<String> {
+        page["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_listing_page_filters_sorts_and_counts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.variant_widths = vec![320];
+        let router = app(AppState::new(config.clone()).await.unwrap());
+
+        let mut expected = Vec::new();
+        for (name, size) in [
+            ("alpha.png", "40x30"),
+            ("beta.png", "120x90"),
+            ("gamma.png", "60x45"),
+        ] {
+            let image = write_test_image(&directory.path().join(name), size);
+            let (status, value) = send(&router, upload_named("image/png", &image, name)).await;
+            assert_eq!(status, StatusCode::CREATED);
+            expected.push(value["id"].as_str().unwrap().to_owned());
+        }
+        // A document is not in the images listing at all.
+        let (status, _) = send(
+            &router,
+            upload_request("application/pdf", b"%PDF-1.7\nnot listed".to_vec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let page = listing(&router, "").await;
+        assert_eq!(page["total"], 3);
+        assert_eq!(page["limit"], 50);
+        assert_eq!(page["offset"], 0);
+        assert_eq!(page["assets"].as_array().unwrap()[0]["kind"], "image");
+        assert_eq!(
+            page["assets"][0]["renditions"].as_array().unwrap().len(),
+            1,
+            "a listing carries the widths a grid needs for srcset"
+        );
+
+        // Name search, with the LIKE wildcards treated literally.
+        assert_eq!(
+            ids_of(&listing(&router, "q=bet").await),
+            vec![expected[1].clone()]
+        );
+        assert!(
+            ids_of(&listing(&router, "q=%25").await).is_empty(),
+            "% is literal"
+        );
+
+        // Size and dimension filters.
+        let wide = ids_of(&listing(&router, "width_min=100").await);
+        assert_eq!(wide, vec![expected[1].clone()]);
+
+        // Sorting, and a stable tiebreaker so pages cannot overlap or skip.
+        let by_name = ids_of(&listing(&router, "sort=filename&order=asc&limit=2").await);
+        assert_eq!(by_name, vec![expected[0].clone(), expected[1].clone()]);
+        let second = ids_of(&listing(&router, "sort=filename&order=asc&limit=2&offset=2").await);
+        assert_eq!(second, vec![expected[2].clone()]);
+
+        // Junk is refused rather than silently ignored.
+        for (query, code) in [
+            ("sort=colour", "invalid_sort"),
+            ("order=sideways", "invalid_order"),
+            ("state=elsewhere", "invalid_state"),
+        ] {
+            let (status, error) = send(
+                &router,
+                authorized("GET", &format!("/api/v1/images?{query}")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+            assert_eq!(error["error"]["code"], code, "{query}");
+        }
+
+        // An unknown collection is not a route.
+        let (status, _) = send(&router, authorized("GET", "/api/v1/pictures")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_listing_can_see_retired_assets_or_only_live_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        let id = upload_document(&router, b"%PDF-1.7\nlisted").await;
+
+        assert_eq!(
+            listing(&router, "").await["total"],
+            0,
+            "documents are not in the images listing"
+        );
+        let (status, documents) = send(&router, authorized("GET", "/api/v1/documents")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(documents["total"], 1);
+
+        place_in_trash(&router, "documents", &id).await;
+        let (_, live) = send(&router, authorized("GET", "/api/v1/documents")).await;
+        assert_eq!(live["total"], 0, "the default view is live assets");
+        let (_, all) = send(&router, authorized("GET", "/api/v1/documents?state=all")).await;
+        assert_eq!(all["total"], 1);
+        assert_eq!(all["assets"][0]["state"], "deleted");
+        let (_, retired) = send(
+            &router,
+            authorized("GET", "/api/v1/documents?state=deleted"),
+        )
+        .await;
+        assert_eq!(retired["total"], 1);
+        let (_, purged) = send(&router, authorized("GET", "/api/v1/documents?state=purged")).await;
+        assert_eq!(
+            purged["total"], 0,
+            "still in the trash is not purged: a restore would work"
+        );
+    }
+
+    /// `state=deleted` and `state=purged` are different questions, and a
+    /// consumer asking the second one must not get the first one's answer.
+    #[tokio::test]
+    async fn a_listing_separates_the_trash_from_the_tombstones() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = test_config(directory.path().join("atlas"));
+        let state = AppState::new(config.clone()).await.unwrap();
+        let expired = upload_document(&app(state.clone()), b"%PDF-1.7\nexpired").await;
+        let recent = upload_document(&app(state.clone()), b"%PDF-1.7\trecent").await;
+        let router = app(state.clone());
+        place_in_trash(&router, "documents", &expired).await;
+        place_in_trash(&router, "documents", &recent).await;
+
+        // Age one of them past the retention window and restart, which is when
+        // purge runs.
+        let long_ago = crate::unix_now().unwrap() - 40 * 24 * 60 * 60;
+        state
+            .store
+            .backdate_deletion(&AssetId::parse(&expired).unwrap(), long_ago)
+            .await;
+        drop(state);
+        drop(router);
+
+        let state = AppState::new(config).await.unwrap();
+        let router = app(state);
+
+        let (_, deleted) = send(
+            &router,
+            authorized("GET", "/api/v1/documents?state=deleted"),
+        )
+        .await;
+        assert_eq!(deleted["total"], 1);
+        assert_eq!(
+            deleted["assets"][0]["id"], recent,
+            "the one that can still be restored"
+        );
+
+        let (_, purged) = send(&router, authorized("GET", "/api/v1/documents?state=purged")).await;
+        assert_eq!(purged["total"], 1);
+        assert_eq!(purged["assets"][0]["id"], expired);
+
+        let (_, all) = send(&router, authorized("GET", "/api/v1/documents?state=all")).await;
+        assert_eq!(all["total"], 2, "and `all` still means every state");
+    }
+
+    #[tokio::test]
+    async fn a_listing_needs_the_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/images")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_summary_counts_each_collection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.variant_widths = vec![320];
+        let router = app(AppState::new(config).await.unwrap());
+
+        let image = write_test_image(&directory.path().join("one.png"), "40x30");
+        upload_image(&router, &image).await;
+        upload_document(&router, b"%PDF-1.7\none").await;
+        upload_document(&router, b"%PDF-1.7\ntwo").await;
+
+        let (status, body) = send(&router, authorized("GET", "/api/v1/summary")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["images"]["count"], 1);
+        assert_eq!(body["documents"]["count"], 2);
+        assert_eq!(body["total"]["count"], 3);
+        assert!(body["total"]["bytes"].as_i64().unwrap() > 0);
+    }
+
+    fn action_request(collection: &str, action: &str, ids: &[&str]) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/{collection}/actions"))
+            .header("authorization", "Bearer prototype-test-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "action": action, "ids": ids }).to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_bulk_action_applies_to_every_asset_in_the_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.variant_widths = vec![320];
+        let state = AppState::new(config.clone()).await.unwrap();
+        let router = app(state.clone());
+
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            // Distinct bytes: identical ones would deduplicate into one asset.
+            let image = write_test_image(
+                &directory.path().join(format!("bulk{index}.png")),
+                &format!("{}x30", 40 + index),
+            );
+            ids.push(upload_image(&router, &image).await);
+        }
+        let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
+        drop(router);
+        drop(state);
+
+        let router = app(AppState::new(config.clone()).await.unwrap());
+        let (status, body) = send(&router, action_request("images", "delete", &borrowed)).await;
+        assert_eq!(status, StatusCode::OK);
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|entry| entry["status"] == "deleted"));
+        for id in &ids {
+            assert!(
+                directory
+                    .path()
+                    .join("atlas")
+                    .join("trash")
+                    .join(id)
+                    .exists()
+            );
+        }
+
+        let (status, _) = send(&router, action_request("images", "restore", &borrowed)).await;
+        assert_eq!(status, StatusCode::OK);
+        for id in &ids {
+            assert!(
+                directory
+                    .path()
+                    .join("atlas")
+                    .join("assets")
+                    .join(id)
+                    .exists()
+            );
+        }
+
+        let (status, body) = send(&router, action_request("images", "pin", &borrowed)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["status"] == "pinned")
+        );
+        let (_, listing) = send(&router, authorized("GET", "/api/v1/images")).await;
+        assert_eq!(listing["assets"][0]["pinned"], true);
+    }
+
+    #[tokio::test]
+    async fn a_bulk_batch_is_all_or_nothing_before_it_starts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.variant_widths = vec![320];
+        let router = app(AppState::new(config.clone()).await.unwrap());
+
+        let image = write_test_image(&directory.path().join("one.png"), "40x30");
+        let id = upload_image(&router, &image).await;
+        let document = upload_document(&router, b"%PDF-1.7\nother collection").await;
+
+        // A typo in one id takes the whole batch, before anything is deleted.
+        let (status, error) = send(
+            &router,
+            action_request("images", "delete", &[&id, "aaaaaaaaaaaaaaaaaaaa"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "unknown_asset");
+        assert!(
+            directory
+                .path()
+                .join("atlas")
+                .join("assets")
+                .join(&id)
+                .exists()
+        );
+
+        // So does an asset that exists but is in the other collection.
+        let (status, error) = send(
+            &router,
+            action_request("images", "delete", &[&id, &document]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "unknown_asset");
+
+        for (action, ids, code) in [
+            ("delete", ["not-an-id"], "invalid_asset_ids"),
+            ("incinerate", ["aaaaaaaaaaaaaaaaaaaa"], "unknown_action"),
+        ] {
+            let (status, error) = send(&router, action_request("images", action, &ids)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{action}");
+            assert_eq!(error["error"]["code"], code, "{action}");
+        }
+
+        // Deleting an already-deleted asset is a successful no-op.
+        place_in_trash(&router, "images", &id).await;
+        let (status, body) = send(&router, action_request("images", "delete", &[&id])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["results"][0]["status"], "deleted");
+    }
+
+    #[tokio::test]
+    async fn srcset_describes_real_widths_and_falls_back_to_the_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        // A 500-pixel photo stored under four profiles.
+        let small = write_test_image(&directory.path().join("small.png"), "500x375");
+        let small_id = upload_image(&router, &small).await;
+        let (status, body) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/images/{small_id}/srcset")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["src"],
+            format!("/media/{small_id}/w640"),
+            "the fallback src is the widest requested width that exists"
+        );
+        assert_eq!(
+            body["srcset"],
+            format!("/media/{small_id}/w320 320w, /media/{small_id}/w640 500w"),
+            "descriptors are the widths that were actually produced"
+        );
+
+        // A width that was never generated simply does not appear.
+        let (_, body) = send(
+            &router,
+            authorized(
+                "GET",
+                &format!("/api/v1/images/{small_id}/srcset?widths=960"),
+            ),
+        )
+        .await;
+        assert_eq!(body["src"], format!("/media/{small_id}/original"));
+        assert!(
+            body.get("srcset").is_none(),
+            "no srcset key at all rather than an empty one"
+        );
+
+        // A document has no srcset route, and a document id is not an image.
+        let document = upload_document(&router, b"%PDF-1.7\nno srcset").await;
+        let (status, _) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/images/{document}/srcset")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, error) = send(
+            &router,
+            authorized(
+                "GET",
+                &format!("/api/v1/images/{small_id}/srcset?widths=lots"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "invalid_widths");
+
+        // It is authenticated, like everything that describes stored bytes.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/images/{small_id}/srcset"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1855,7 +2957,7 @@ mod tests {
         let (status, value) = send(&router, upload_request("image/png", image)).await;
         assert_eq!(status, StatusCode::CREATED);
         let id = value["id"].as_str().unwrap().to_owned();
-        place_in_trash(&router, &id).await;
+        place_in_trash(&router, "images", &id).await;
 
         let response = router
             .clone()
@@ -1897,7 +2999,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["assets"].as_array().unwrap().len(), 0);
 
-        place_in_trash(&router, &id).await;
+        place_in_trash(&router, "documents", &id).await;
         let (status, body) = send(&router, authorized("GET", "/api/v1/trash")).await;
         assert_eq!(status, StatusCode::OK);
         let entries = body["assets"].as_array().unwrap();
@@ -1906,12 +3008,12 @@ mod tests {
         assert_eq!(entries[0]["state"], "deleted");
         assert_eq!(entries[0]["content_type"], "application/pdf");
 
-        let (status, body) = send(&router, pin_request(&id, true)).await;
+        let (status, body) = send(&router, pin_request("documents", &id, true)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["pinned"], true);
 
         let unknown = "aaaaaaaaaaaaaaaaaaaa";
-        let (status, _) = send(&router, pin_request(unknown, true)).await;
+        let (status, _) = send(&router, pin_request("documents", unknown, true)).await;
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
@@ -1932,7 +3034,7 @@ mod tests {
             let (status, value) = send(&router, upload_request("application/pdf", body)).await;
             assert_eq!(status, StatusCode::CREATED);
             let id = value["id"].as_str().unwrap().to_owned();
-            place_in_trash(&router, &id).await;
+            place_in_trash(&router, "documents", &id).await;
         }
         drop(router);
 
@@ -2007,9 +3109,12 @@ mod tests {
         let unknown = "aaaaaaaaaaaaaaaaaaaa";
 
         for (method, uri) in [
-            ("DELETE", format!("/api/v1/assets/{unknown}")),
-            ("POST", format!("/api/v1/assets/{unknown}/restore")),
-            ("GET", format!("/api/v1/assets/{unknown}")),
+            ("DELETE", asset_uri("documents", unknown)),
+            (
+                "POST",
+                format!("{}/restore", asset_uri("documents", unknown)),
+            ),
+            ("GET", asset_uri("documents", unknown)),
         ] {
             let (status, _) = send(&router, authorized(method, &uri)).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
@@ -2039,14 +3144,14 @@ mod tests {
         let expired = upload_document(&app(state.clone()), b"%PDF-1.7\nexpired").await;
         let kept = upload_document(&app(state.clone()), b"%PDF-1.7\tkept").await;
         let router = app(state.clone());
-        place_in_trash(&router, &expired).await;
-        place_in_trash(&router, &kept).await;
+        place_in_trash(&router, "documents", &expired).await;
+        place_in_trash(&router, "documents", &kept).await;
 
         let (status, body) = send(&router, authorized("GET", "/api/v1/trash")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["assets"].as_array().unwrap().len(), 2);
 
-        let (status, _) = send(&router, pin_request(&kept, true)).await;
+        let (status, _) = send(&router, pin_request("documents", &kept, true)).await;
         assert_eq!(status, StatusCode::OK);
 
         let long_ago = crate::unix_now().unwrap() - 40 * 24 * 60 * 60;
@@ -2067,7 +3172,7 @@ mod tests {
 
         let (status, body) = send(
             &router,
-            authorized("GET", &format!("/api/v1/assets/{expired}")),
+            authorized("GET", &asset_uri("documents", &expired)),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -2079,11 +3184,7 @@ mod tests {
             "a tombstone does not advertise bytes that are gone"
         );
 
-        let (status, body) = send(
-            &router,
-            authorized("GET", &format!("/api/v1/assets/{kept}")),
-        )
-        .await;
+        let (status, body) = send(&router, authorized("GET", &asset_uri("documents", &kept))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "deleted");
         assert_eq!(body["pinned"], true);
@@ -2101,7 +3202,10 @@ mod tests {
 
         let (status, _) = send(
             &router,
-            authorized("POST", &format!("/api/v1/assets/{expired}/restore")),
+            authorized(
+                "POST",
+                &format!("{}/restore", asset_uri("documents", &expired)),
+            ),
         )
         .await;
         assert_eq!(
@@ -2112,7 +3216,10 @@ mod tests {
 
         let (status, _) = send(
             &router,
-            authorized("POST", &format!("/api/v1/assets/{kept}/restore")),
+            authorized(
+                "POST",
+                &format!("{}/restore", asset_uri("documents", &kept)),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
@@ -2474,7 +3581,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/assets")
+                    .uri("/api/v1/images")
                     .header("content-type", "application/pdf")
                     .body(Body::from("%PDF-1.7"))
                     .unwrap(),
@@ -2579,7 +3686,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(format!("/api/v1/assets/{id}"))
+                        .uri(asset_uri("images", id))
                         .header("authorization", "Bearer prototype-test-token")
                         .body(Body::empty())
                         .unwrap(),
