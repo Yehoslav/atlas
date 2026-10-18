@@ -165,22 +165,26 @@ impl ImageProcessor {
                 + u64::from(dimensions.width) / 2)
                 / u64::from(dimensions.width)) as u32;
 
-            let mut outputs: Vec<(RenditionFormat, PathBuf)> = vec![
+            let mut outputs: Vec<(RenditionFormat, PathBuf, String)> = vec![
                 (
                     RenditionFormat::Jxl,
                     staging_dir.join(format!("w{width}.jxl")),
+                    format!("w{width}.jxl"),
                 ),
                 (
                     RenditionFormat::Avif,
                     staging_dir.join(format!("w{width}.avif")),
+                    format!("w{width}.avif"),
                 ),
                 (
                     RenditionFormat::Webp,
                     staging_dir.join(format!("w{width}.webp")),
+                    format!("w{width}.webp"),
                 ),
                 (
                     fallback,
                     staging_dir.join(format!("w{width}.{}", fallback.extension())),
+                    format!("w{width}.{}", fallback.extension()),
                 ),
             ];
 
@@ -233,7 +237,7 @@ impl ImageProcessor {
 
             self.run(args, staging_dir).await?;
 
-            for (format, path) in outputs.drain(..) {
+            for (format, path, file_name) in outputs.drain(..) {
                 let bytes = tokio::fs::metadata(&path).await?.len();
                 if bytes == 0 {
                     return Err(MediaError::ProcessFailed);
@@ -246,6 +250,7 @@ impl ImageProcessor {
                     format,
                     bytes,
                     sha256,
+                    file_name,
                 });
             }
         }

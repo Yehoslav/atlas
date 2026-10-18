@@ -30,10 +30,22 @@ media files and media metadata only.
   dimensions. The consuming site decides the image's role and supplies its own
   `srcset`/`sizes` layout hints. Server-side crop/art-direction renditions are
   deferred.
+- A `/w{max_width}` URL requests an image *no wider* than that width, not a
+  specific file. Atlas serves the stored rendition for that profile when one
+  exists, otherwise the widest stored rendition no wider than the request. A
+  photo narrower than the largest profile therefore answers every profile with
+  its own size instead of a blank response, nothing is ever upscaled, and a
+  request narrower than anything stored is a distinct `rendition_not_found`,
+  never a generic `asset_not_found`. Consumers should describe each stored
+  rendition with its actual output width, which metadata reports separately
+  from the requested profile.
+- Each rendition records the name of the file that holds its bytes, because the
+  file is named after the actual output width rather than the profile.
 - At each width, generate JXL, AVIF, WebP, and one conventional fallback
   (JPEG for JPEG or opaque WebP sources; PNG for PNG or transparent WebP
   sources). Width profiles larger than the source do not upscale; duplicate
-  actual widths are generated only once. Public rendition URLs negotiate among
+  actual widths are generated only once, and the skipped profiles resolve to the
+  stored rendition on read. Public rendition URLs negotiate among
   pre-generated representations from `Accept`; they do not perform image work
   on reads and send `Vary: Accept`.
 - Asset URLs are immutable. Replacing bytes means uploading a new asset ID.
@@ -127,7 +139,11 @@ HTTP errors use a small JSON envelope. Relevant statuses include `401`
 unauthorized, `409` when a purged asset cannot be restored, `413` upload too
 large, `415` unsupported/mismatched media type, `422` invalid or
 unprocessable media, and `406` when no stored format matches the request's
-`Accept` header.
+`Accept` header. Two `404` codes separate "no such asset"
+(`asset_not_found`) from "that asset holds no rendition this narrow"
+(`rendition_not_found`, which lists the stored widths). Metadata that records a
+file that is not on disk is a `500`, not a `404`: the request was valid and
+storage is damaged.
 
 ## Example consumer
 

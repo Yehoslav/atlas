@@ -185,8 +185,8 @@ impl Store {
         for rendition in renditions {
             sqlx::query(
                 "INSERT INTO renditions
-                    (asset_id, max_width, width, height, format, bytes, sha256)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (asset_id, max_width, width, height, format, bytes, sha256, file_name)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(asset.id.as_str())
             .bind(i64::from(rendition.max_width))
@@ -195,6 +195,7 @@ impl Store {
             .bind(rendition.format.key())
             .bind(i64::try_from(rendition.bytes).unwrap_or(i64::MAX))
             .bind(&rendition.sha256)
+            .bind(&rendition.file_name)
             .execute(&mut *transaction)
             .await?;
         }
@@ -268,30 +269,14 @@ impl Store {
         };
 
         let rows = sqlx::query(
-            "SELECT max_width, width, height, format, bytes, sha256
+            "SELECT max_width, width, height, format, bytes, sha256, file_name
              FROM renditions WHERE asset_id = ? ORDER BY max_width ASC, format ASC",
         )
         .bind(id.as_str())
         .fetch_all(&self.pool)
         .await?;
 
-        let renditions = rows
-            .into_iter()
-            .filter_map(|row| {
-                let format = row
-                    .try_get::<String, _>("format")
-                    .ok()
-                    .and_then(|value| RenditionFormat::from_database(&value))?;
-                Some(RenditionRecord {
-                    max_width: u32::try_from(row.try_get::<i64, _>("max_width").ok()?).ok()?,
-                    width: u32::try_from(row.try_get::<i64, _>("width").ok()?).ok()?,
-                    height: u32::try_from(row.try_get::<i64, _>("height").ok()?).ok()?,
-                    format,
-                    bytes: row.try_get::<i64, _>("bytes").ok()?.max(0) as u64,
-                    sha256: row.try_get("sha256").ok()?,
-                })
-            })
-            .collect();
+        let renditions = rows.into_iter().filter_map(to_rendition).collect();
 
         Ok(Some(StoredAsset { asset, renditions }))
     }
@@ -429,6 +414,36 @@ impl Store {
     }
 }
 
+fn to_rendition(row: sqlx::sqlite::SqliteRow) -> Option<RenditionRecord> {
+    let format = row
+        .try_get::<String, _>("format")
+        .ok()
+        .and_then(|value| RenditionFormat::from_database(&value))?;
+    let max_width = u32::try_from(row.try_get::<i64, _>("max_width").ok()?).ok()?;
+    let width = u32::try_from(row.try_get::<i64, _>("width").ok()?).ok()?;
+    let file_name = match row.try_get::<Option<String>, _>("file_name").ok().flatten() {
+        Some(name) => name,
+        None => {
+            // A row written before renditions recorded their file name. The
+            // backfill in migration 0003 covers the database as a whole; this
+            // keeps one odd row from silently losing its rendition. Files have
+            // always been named after the actual width.
+            tracing::warn!(asset = %row.try_get::<String, _>("asset_id").unwrap_or_default(), max_width, "rendition row has no file name; using the legacy name");
+            format!("w{width}.{}", format.extension())
+        }
+    };
+
+    Some(RenditionRecord {
+        max_width,
+        width,
+        height: u32::try_from(row.try_get::<i64, _>("height").ok()?).ok()?,
+        format,
+        bytes: row.try_get::<i64, _>("bytes").ok()?.max(0) as u64,
+        sha256: row.try_get("sha256").ok()?,
+        file_name,
+    })
+}
+
 fn state_from(row: &sqlx::sqlite::SqliteRow) -> AssetState {
     if row
         .try_get::<Option<i64>, _>("purged_at")
@@ -483,6 +498,7 @@ mod tests {
             format: RenditionFormat::Jpeg,
             bytes: 512,
             sha256: "def456".to_owned(),
+            file_name: "w320.jpg".to_owned(),
         }
     }
 
@@ -730,6 +746,32 @@ mod tests {
         assert_eq!(stored.asset.deleted_at, Some(1_700_000_100));
         assert!(store.foreign_key_violations().await.unwrap().is_empty());
         assert!(store.purge_candidates(i64::MAX).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn renditions_record_the_name_of_the_file_they_were_written_to() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, id) = store_with_asset(directory.path()).await;
+        let stored = store.get_asset(&id).await.unwrap().unwrap();
+        assert_eq!(stored.renditions.len(), 1);
+        assert_eq!(stored.renditions[0].file_name, "w320.jpg");
+    }
+
+    #[tokio::test]
+    async fn a_rendition_without_a_file_name_still_resolves() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, id) = store_with_asset(directory.path()).await;
+        sqlx::query("UPDATE renditions SET file_name = NULL WHERE asset_id = ?")
+            .bind(id.as_str())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let stored = store.get_asset(&id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.renditions[0].file_name, "w320.jpg",
+            "a row the backfill missed keeps the legacy name instead of vanishing"
+        );
     }
 
     #[tokio::test]

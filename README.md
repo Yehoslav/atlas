@@ -37,6 +37,34 @@ on public requests. Consuming sites can use the URLs in `srcset` and set their
 own `sizes` value. Atlas does not currently provide listing, search, or
 arbitrary transformation endpoints, and never converts or re-encodes on a read.
 
+## How a rendition URL resolves
+
+`/media/{id}/w960` asks for an image **no wider than** 960 pixels, not for a
+particular file. Atlas serves the rendition stored under the `960` profile when
+there is one, and otherwise the widest stored rendition that is not wider than
+the request.
+
+That distinction matters for small photos. A 500-pixel photo asked for `w960`
+has no 960-pixel rendition, because Atlas does not upscale, so it is answered
+with its 500-pixel rendition rather than a blank response. Metadata reports the
+two separately: `max_width` is the requested profile, `width` is what was
+actually produced. Describe a stored rendition in `srcset` with `width` — the
+real output width — while keeping the URL pointed at the profile:
+
+```html
+<!-- A 500-pixel photo stored under profiles 320, 640, 960 and 1280 -->
+<img src="/media/4f2k9xq7m1b8w3z0pd/w960" srcset="/media/4f2k9xq7m1b8w3z0pd/w320 320w, /media/4f2k9xq7m1b8w3z0pd/w640 500w" sizes="640px" alt="…">
+```
+
+Asking for something narrower than anything stored is a `404` with
+`rendition_not_found`, listing the widths that do exist. That is deliberately
+different from `asset_not_found`, which means Atlas has never heard of the ID:
+
+```sh
+curl http://127.0.0.1:3000/media/4f2k9xq7m1b8w3z0pd/w64
+{"error":{"code":"rendition_not_found","message":"The asset has no rendition at or below 64 pixels; stored widths are 320, 640, 960, 1280."}}
+```
+
 ## Asset IDs
 
 Asset IDs are random lowercase base36 strings, 18 characters by default

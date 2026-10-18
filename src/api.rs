@@ -585,18 +585,8 @@ pub(super) async fn get_rendition(
     if let Some(response) = serve_placeholder_if_retired(&headers, &asset) {
         return Ok(response);
     }
-    let available: Vec<_> = asset
-        .renditions
-        .iter()
-        .filter(|rendition| rendition.max_width == max_width)
-        .collect();
-    if available.is_empty() {
-        return Err(ApiError::not_found());
-    }
-    let selected = select_format(&headers, &available).ok_or_else(ApiError::not_acceptable)?;
-    let path = state
-        .asset_dir(&id)
-        .join(format!("w{max_width}.{}", selected.format.extension()));
+
+    let (selected, path) = resolve_rendition(&state, &asset, &headers, max_width)?;
     serve_file(
         &headers,
         &path,
@@ -607,6 +597,64 @@ pub(super) async fn get_rendition(
         true,
     )
     .await
+}
+
+/// Choose the stored representation for a `/w{max_width}` request.
+///
+/// A rendition URL asks for an image no wider than `max_width`, which is what
+/// the profile list promises. The exact profile is used when it exists;
+/// otherwise the widest stored rendition that is no wider than the request is
+/// served. That keeps every configured profile reachable for a photo smaller
+/// than the largest one — a 500-pixel photo asked for `w960` gets its 500-pixel
+/// rendition, not a blank response — and it never upscales.
+///
+/// The same fallback covers profiles that generation deduplicated: when several
+/// requested widths produce one actual width, only the first is stored, and the
+/// skipped profiles resolve here.
+fn resolve_rendition<'a>(
+    state: &AppState,
+    asset: &'a StoredAsset,
+    headers: &HeaderMap,
+    max_width: u32,
+) -> Result<(&'a RenditionRecord, std::path::PathBuf), ApiError> {
+    let group: Vec<&RenditionRecord> = {
+        let exact: Vec<_> = asset
+            .renditions
+            .iter()
+            .filter(|rendition| rendition.max_width == max_width)
+            .collect();
+        if !exact.is_empty() {
+            exact
+        } else {
+            let widest = asset
+                .renditions
+                .iter()
+                .filter(|rendition| rendition.width <= max_width)
+                .map(|rendition| rendition.width)
+                .max();
+            let Some(widest) = widest else {
+                let mut available: Vec<u32> = asset
+                    .renditions
+                    .iter()
+                    .map(|rendition| rendition.max_width)
+                    .collect();
+                available.sort_unstable();
+                available.dedup();
+                return Err(ApiError::rendition_not_found(max_width, &available));
+            };
+            // Every stored representation of that one width, so format
+            // negotiation still chooses between them.
+            asset
+                .renditions
+                .iter()
+                .filter(|rendition| rendition.width == widest)
+                .collect()
+        }
+    };
+
+    let selected = select_format(headers, &group).ok_or_else(ApiError::not_acceptable)?;
+    let path = state.asset_dir(&asset.asset.id).join(&selected.file_name);
+    Ok((selected, path))
 }
 
 /// Public delivery for a trashed or purged asset.
@@ -891,7 +939,13 @@ async fn serve_file(
 
     let mut file = File::open(path).await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
-            ApiError::not_found()
+            // Metadata says these bytes exist, so this is a damaged data
+            // directory rather than a request for something that never did.
+            tracing::error!(
+                path = %path.display(),
+                "metadata records this file but it is missing from storage"
+            );
+            ApiError::internal("asset file missing from storage")
         } else {
             ApiError::internal(error)
         }
@@ -1007,6 +1061,7 @@ mod tests {
             format,
             bytes: 1024,
             sha256: "deadbeef".to_owned(),
+            file_name: "w640.jpg".to_owned(),
         }
     }
 
@@ -1142,6 +1197,40 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
+    /// A public media request, keeping the headers so a test can compare ETags.
+    async fn fetch(router: &Router, uri: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        (status, headers, body.to_vec())
+    }
+
+    async fn fetch_error(router: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let (status, _, body) = fetch(router, uri).await;
+        let value = serde_json::from_slice(&body).unwrap();
+        (status, value)
+    }
+
+    fn write_test_image(path: &std::path::Path, size: &str) -> Vec<u8> {
+        let generated = Command::new("magick")
+            .args(["-size", size, "xc:red"])
+            .arg(format!("PNG:{}", path.display()))
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "could not generate a {size} test image"
+        );
+        std::fs::read(path).unwrap()
+    }
+
     #[tokio::test]
     async fn delete_stops_serving_bytes_and_restore_brings_them_back() {
         let directory = tempfile::tempdir().unwrap();
@@ -1242,6 +1331,139 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "active");
         assert!(body["deleted_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_photo_smaller_than_every_profile_still_answers_each_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_test_image(&directory.path().join("small.png"), "200x150");
+        let data_dir = directory.path().join("atlas");
+
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![320, 640, 960];
+        let router = app(AppState::new(config).await.unwrap());
+
+        let (status, body) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = body["id"].as_str().unwrap().to_owned();
+
+        // 640 and 960 collapse into the same actual width as 320, so exactly
+        // one rendition is generated and it is named for the real width.
+        let renditions = body["renditions"].as_array().unwrap();
+        assert_eq!(renditions.len(), 1);
+        assert_eq!(renditions[0]["max_width"], 320);
+        assert_eq!(
+            renditions[0]["width"], 200,
+            "Atlas reports the actual output width, not the profile"
+        );
+        assert!(
+            data_dir.join("assets").join(&id).join("w200.png").exists(),
+            "the stored file is named after the actual width"
+        );
+
+        // Every profile resolves, including the two generation deduplicated.
+        let (status, _, bytes) = fetch(&router, &format!("/media/{id}/w320")).await;
+        assert_eq!(status, StatusCode::OK);
+        let expected = bytes.len();
+        assert!(expected > 0);
+        for requested in [640, 960, 5000] {
+            let (status, _, body) = fetch(&router, &format!("/media/{id}/w{requested}")).await;
+            assert_eq!(status, StatusCode::OK, "w{requested}");
+            assert_eq!(
+                body.len(),
+                expected,
+                "w{requested} serves the one rendition that exists"
+            );
+        }
+
+        // Nothing is narrower than the stored rendition, and Atlas never
+        // upscales, so this asks for something that was never generated.
+        let (status, error) = fetch_error(&router, &format!("/media/{id}/w160")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error["error"]["code"], "rendition_not_found");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("stored widths are 320"),
+            "{}",
+            error["error"]["message"]
+        );
+
+        // A missing asset is a different answer to the same status code.
+        let (status, error) = fetch_error(&router, "/media/aaaaaaaaaaaaaaaaaaaa/w320").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error["error"]["code"], "asset_not_found");
+
+        // The original is untouched and still served.
+        let (status, headers, body) = fetch(&router, &format!("/media/{id}/original")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "image/png");
+        assert!(
+            body.len() > expected,
+            "the original is larger than its rendition"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_between_profiles_gets_the_nearest_width_at_or_below() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_test_image(&directory.path().join("wide.png"), "1600x1200");
+        let mut config = test_config(directory.path().join("atlas"));
+        config.variant_widths = vec![320, 640, 960];
+        let router = app(AppState::new(config).await.unwrap());
+
+        let (status, body) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = body["id"].as_str().unwrap().to_owned();
+        assert_eq!(body["renditions"].as_array().unwrap().len(), 3);
+
+        let mut etags = Vec::new();
+        for width in [320, 640, 960] {
+            let (status, headers, _) = fetch(&router, &format!("/media/{id}/w{width}")).await;
+            assert_eq!(status, StatusCode::OK, "w{width}");
+            etags.push(headers["etag"].to_str().unwrap().to_owned());
+        }
+        assert_eq!(
+            etags.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "each profile serves its own rendition"
+        );
+
+        // A width that is not a profile resolves to the widest stored
+        // rendition that is not wider than the request.
+        let (_, headers, _) = fetch(&router, &format!("/media/{id}/w800")).await;
+        assert_eq!(headers["etag"], etags[1], "w800 resolves to w640");
+        let (status, headers, _) = fetch(&router, &format!("/media/{id}/w3000")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["etag"], etags[2], "w3000 resolves to w960");
+        let (status, error) = fetch_error(&router, &format!("/media/{id}/w100")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error["error"]["code"], "rendition_not_found");
+    }
+
+    #[tokio::test]
+    async fn a_recorded_rendition_whose_file_is_gone_is_an_internal_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_test_image(&directory.path().join("gone.png"), "800x600");
+        let data_dir = directory.path().join("atlas");
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![320, 640];
+        let router = app(AppState::new(config).await.unwrap());
+
+        let (status, body) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = body["id"].as_str().unwrap().to_owned();
+        for entry in std::fs::read_dir(data_dir.join("assets").join(&id)).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+
+        let (status, error) = fetch_error(&router, &format!("/media/{id}/w320")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error["error"]["code"], "internal_error",
+            "metadata and storage disagree, which is not a missing rendition"
+        );
     }
 
     #[tokio::test]

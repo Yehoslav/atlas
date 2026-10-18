@@ -209,6 +209,9 @@ pub struct RenditionRecord {
     pub format: RenditionFormat,
     pub bytes: u64,
     pub sha256: String,
+    /// File name inside the asset directory, relative to it. Named after the
+    /// actual output width, which may be smaller than `max_width`.
+    pub file_name: String,
 }
 
 #[derive(Clone, Debug)]

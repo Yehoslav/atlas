@@ -43,9 +43,28 @@ impl ApiError {
     pub fn not_found() -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
-            "not_found",
+            "asset_not_found",
             "The asset was not found.",
         )
+    }
+
+    /// The asset exists, but it holds no rendition at or below the requested
+    /// width. This is deliberately a different code from a missing asset: the
+    /// upload succeeded, the caller simply asked for something too small.
+    pub fn rendition_not_found(max_width: u32, available: &[u32]) -> Self {
+        let detail = if available.is_empty() {
+            "The asset has no renditions.".to_owned()
+        } else {
+            format!(
+                "The asset has no rendition at or below {max_width} pixels; stored widths are {}.",
+                available
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        Self::new(StatusCode::NOT_FOUND, "rendition_not_found", detail)
     }
 
     pub fn not_acceptable() -> Self {
