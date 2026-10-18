@@ -309,6 +309,28 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
+### End-to-end check against a real binary
+
+The test suite drives the router in process, and the example's tests replace
+Atlas with an in-memory fake. Neither can notice when the two disagree about the
+API, which is a real risk when one side is written by the same hand as the other.
+`scripts/smoke.py` starts the built binary on a throwaway data directory, checks
+the HTTP contract over a real socket with real conversions, points the example
+consumer's own client at it, and always stops the server afterwards:
+
+```sh
+cargo build
+python -m venv examples/family-album/.venv
+examples/family-album/.venv/bin/pip install -q -r examples/family-album/requirements-dev.txt
+examples/family-album/.venv/bin/python scripts/smoke.py
+```
+
+It exits non-zero on the first failed expectation, prints which checks were
+skipped rather than reporting them as passes, and needs no arguments: the port,
+binary, and data directory all have defaults that `--port`, `--bin` and `--data`
+can override. The album client check is skipped, not silently passed, when
+`requests` is not importable.
+
 ## Example consumer
 
 [`examples/family-album/`](examples/family-album/) is a small Flask site that
@@ -320,9 +342,16 @@ in `srcset`. Its own tests run against a fake Atlas:
 ```sh
 cd examples/family-album
 python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt pytest
+pip install -r requirements-dev.txt
 python -m pytest tests -q
+ruff check .
+ruff format --check .
+ty check
 ```
+
+`requirements-dev.txt` adds the test and lint tools. `ty check` needs the
+virtualenv active so it can see Flask and `requests`; run it from this
+directory or from the repository root, not from a bare interpreter.
 
 ## Configuration
 
@@ -450,7 +479,7 @@ clear it.
 
 1. `GET /healthz` returns `ok` — this already proves the migrations applied and
    both `PRAGMA` checks passed.
-2. `GET /api/v1/assets/{id}` for a known asset returns its metadata.
+2. `GET /api/v1/images/{id}` for a known asset returns its metadata.
 3. `GET /media/{id}/original` returns `200` with the expected length, not a
    placeholder.
 

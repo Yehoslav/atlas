@@ -1,0 +1,14 @@
+# Python tooling for the example consumer and the smoke test.
+#
+# The Rust side is configured in Cargo.toml; this file exists so that `ruff` and
+# `ty` can be run from the repository root and still find the example's modules
+# the way the example itself imports them.
+
+[tool.ty.environment]
+python-version = "3.13"
+# scripts/smoke.py imports the example's client by adding that directory to
+# sys.path at run time; this tells `ty` the same thing statically.
+extra-paths = ["examples/family-album"]
+
+[tool.ruff]
+extend-exclude = ["target"]

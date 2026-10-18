@@ -1,0 +1,10 @@
+# Tools for working on the Family Album example. Not needed to run it.
+-r requirements.txt
+
+pytest>=8.0
+
+# Lint and format:
+ruff>=0.6
+# Type check. Fast, and it catches the argument mistakes that a fake-backed
+# test suite will happily let through:
+ty>=0.0.1a16
