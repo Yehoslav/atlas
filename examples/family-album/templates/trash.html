@@ -32,7 +32,7 @@
             <td>{{ timestamp(entry.deleted_at) }}</td>
             <td>
               {% if entry.is_restorable %}
-                <form method="post" action="{{ url_for('restore', asset_id=entry.id) }}" class="inline">
+                <form method="post" action="{{ url_for('restore', collection=collection_for(entry.content_type), asset_id=entry.id) }}" class="inline">
                   <button type="submit">Restore</button>
                 </form>
               {% else %}

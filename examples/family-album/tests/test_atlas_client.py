@@ -20,6 +20,7 @@ from atlas_client import AtlasClient, AtlasError, Rendition, content_type_for
 
 UPLOAD_RESPONSE = {
     "id": "aaaaaaaaaaaaaaaaaaaa",
+    "kind": "image",
     "created_at": 1_700_000_000,
     "state": "active",
     "deleted_at": None,
@@ -92,7 +93,7 @@ def test_a_refused_connection_becomes_an_atlas_error():
     session = ScriptedSession(error=requests.ConnectionError("connection refused"))
 
     with pytest.raises(AtlasError) as failure:
-        client_with(session).get_asset("aaaaaaaaaaaaaaaaaaaa")
+        client_with(session).get_asset("images", "aaaaaaaaaaaaaaaaaaaa")
 
     assert "could not be reached" in failure.value.message
 
@@ -107,15 +108,15 @@ def test_every_call_reports_an_unreachable_atlas(call):
 
     with pytest.raises(AtlasError):
         if call == "get_asset":
-            client.get_asset(asset_id)
+            client.get_asset("images", asset_id)
         elif call == "delete":
-            client.delete(asset_id)
+            client.delete("images", asset_id)
         elif call == "restore":
-            client.restore(asset_id)
+            client.restore("images", asset_id)
         elif call == "trash":
             client.trash()
         else:
-            client.set_pinned(asset_id, True)
+            client.set_pinned("images", asset_id, True)
 
 
 def test_an_atlas_error_message_is_preferred_over_the_status():
@@ -125,7 +126,7 @@ def test_an_atlas_error_message_is_preferred_over_the_status():
 
     with pytest.raises(AtlasError) as failure:
         client_with(ScriptedSession(response=response(404, body))).set_pinned(
-            "aaaaaaaaaaaaaaaaaaaa", True
+            "images", "aaaaaaaaaaaaaaaaaaaa", True
         )
 
     assert failure.value.message == "No rendition that narrow."
@@ -134,7 +135,7 @@ def test_an_atlas_error_message_is_preferred_over_the_status():
 
 def test_an_unknown_asset_is_none_rather_than_an_error():
     client = client_with(ScriptedSession(response=response(404)))
-    assert client.get_asset("aaaaaaaaaaaaaaaaaaaa") is None
+    assert client.get_asset("images", "aaaaaaaaaaaaaaaaaaaa") is None
 
 
 def test_an_upload_response_becomes_an_asset():
@@ -148,7 +149,10 @@ def test_an_upload_response_becomes_an_asset():
         Rendition(max_width=320, width=320, height=240, formats=("avif", "png")),
     )
     method, url = session.calls[0]
-    assert (method, url) == ("POST", "http://atlas.invalid:3000/api/v1/assets")
+    assert (method, url) == ("POST", "http://atlas.invalid:3000/api/v1/images")
+    assert asset.kind == "image"
+    assert asset.collection == "images", "the route segment, not the JSON word"
+    assert asset.deduplicated is False
 
 
 def test_an_upload_sends_the_name_percent_encoded():
@@ -158,6 +162,99 @@ def test_an_upload_sends_the_name_percent_encoded():
 
     assert session.headers_seen["X-Original-Filename"] == "Unsere%20Familie.png"
     assert session.headers_seen["Content-Type"] == "image/png"
+
+
+def test_an_upload_can_choose_the_documents_collection():
+    session = ScriptedSession(response=response(201, UPLOAD_RESPONSE))
+
+    client_with(session).upload(
+        io.BytesIO(b"bytes"), "image/png", collection="documents"
+    )
+
+    assert session.paths == ["/api/v1/documents"], "a picture stored as a document"
+
+
+ASSET_ID = "aaaaaaaaaaaaaaaaaaaa"
+
+
+def test_every_call_about_one_asset_addresses_it_by_path():
+    """A path, not a URL, because `_send` puts the host in front.
+
+    These four calls were never exercised against a transport before, so a
+    helper that returned a full URL made every one of them send
+    `http://hosthttp://host/...`, which fails only at the socket.
+    """
+    session = ScriptedSession(response=response(200, UPLOAD_RESPONSE))
+    client = client_with(session)
+
+    client.get_asset("images", ASSET_ID)
+    client.delete("documents", ASSET_ID)
+    client.restore("documents", ASSET_ID)
+    client.set_pinned("documents", ASSET_ID, True)
+
+    assert session.calls == [
+        ("GET", f"http://atlas.invalid:3000/api/v1/images/{ASSET_ID}"),
+        ("DELETE", f"http://atlas.invalid:3000/api/v1/documents/{ASSET_ID}"),
+        ("POST", f"http://atlas.invalid:3000/api/v1/documents/{ASSET_ID}/restore"),
+        ("PUT", f"http://atlas.invalid:3000/api/v1/documents/{ASSET_ID}/pin"),
+    ]
+    assert session.bodies[-1] == {"pinned": True}
+
+
+def test_the_rest_of_the_client_addresses_the_api_consistently():
+    session = ScriptedSession(response=response(200, UPLOAD_RESPONSE))
+    client = client_with(session)
+
+    client.list_assets("documents", "state=deleted")
+    client.summary()
+    client.act("documents", "delete", [ASSET_ID])
+    client.srcset(ASSET_ID)
+
+    assert session.paths == [
+        "/api/v1/documents?state=deleted",
+        "/api/v1/summary",
+        "/api/v1/documents/actions",
+        f"/api/v1/images/{ASSET_ID}/srcset?widths=320,640,960,1280",
+    ]
+    assert session.methods == ["GET", "GET", "POST", "GET"]
+
+
+def test_the_batch_state_call_is_the_one_untyped_path():
+    """It has to be: ids come from anywhere and may be of either collection."""
+    session = ScriptedSession(
+        response=response(
+            200, {"assets": [{"id": ASSET_ID, "state": "active", "pinned": True}]}
+        )
+    )
+
+    states = client_with(session).states([ASSET_ID])
+
+    assert session.paths == ["/api/v1/assets/state"]
+    assert states[ASSET_ID].pinned is True
+
+
+def test_the_default_collection_follows_the_content_type():
+    client = client_with(ScriptedSession())
+    assert client.collection_for("image/png") == "images"
+    assert client.collection_for("image/jpeg") == "images"
+    assert client.collection_for("application/pdf") == "documents"
+
+
+def test_a_listing_and_a_bulk_action_address_one_collection():
+    session = ScriptedSession(response=response(200, {"assets": [], "total": 0}))
+    client = client_with(session)
+
+    client.list_assets("documents", "limit=10")
+    client.act("images", "delete", ["aaaaaaaaaaaaaaaaaaaa"])
+    client.summary()
+    client.srcset("aaaaaaaaaaaaaaaaaaaa")
+
+    assert session.paths == [
+        "/api/v1/documents?limit=10",
+        "/api/v1/images/actions",
+        "/api/v1/summary",
+        "/api/v1/images/aaaaaaaaaaaaaaaaaaaa/srcset?widths=320,640,960,1280",
+    ]
 
 
 def test_an_upload_without_a_name_sends_no_name_header():

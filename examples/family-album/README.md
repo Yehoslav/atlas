@@ -14,7 +14,10 @@ here.
 ## What it demonstrates
 
 - **Its own database.** `schema.sql` holds folders, photos, renditions, posts,
-  and the post/photo join. Not one of those tables exists in Atlas.
+  and the post/photo join. Not one of those tables exists in Atlas. The one
+  exception is `photos.kind`, which records *which Atlas collection* the asset
+  lives in: not meaning, just the address of the API route the album needs for
+  the asset's whole life.
 - **A server-side Atlas client.** `atlas_client.py` is the only thing that knows
   the API token. It streams uploads rather than buffering them, and it is never
   imported by anything the browser sees.
@@ -33,7 +36,7 @@ here.
   published references and returns `409` with a confirm button. Atlas cannot do
   this: it has no idea which of its assets a published page shows.
 - **Usage registration.** Attaching a photo to a post pins the asset in Atlas
-  (`PUT /api/v1/assets/{id}/pin`), so the retention sweep will never discard
+  (`PUT /api/v1/images/{id}/pin`), so the retention sweep will never discard
   bytes a reader can currently see.
 - **Renditions used properly.** `w320` for thumbnails, `w640`/`w960` for the
   grid's `srcset`, and the widest stored rendition for the full-size view. The
@@ -47,6 +50,12 @@ here.
   or Atlas unreachable. The reason matters — "deleted" has a way back and
   "purged" does not. A small `error`-listener catches the one race left: an
   asset retired between the check and the browser's request.
+- **Saying which collection, not guessing.** Atlas's routes are typed
+  (`/api/v1/images` vs `/api/v1/documents`), so the album records the collection
+  with each photo and never infers it later. The upload form's "store as
+  documents" box is the visible consequence: a screenshot or a diagram is kept
+  byte-for-byte with no renditions and served as a download, because
+  re-encoding it would blur the very text the reader needs.
 
 ## Two processes, not one
 
@@ -99,7 +108,7 @@ read it from a config file so a committed config can never carry a secret.
 | --- | --- | --- |
 | `/`, `/photos/…`, `/upload`, `/posts`, `/trash` | album | no (there is no login here) |
 | `/media/{id}/original`, `/media/{id}/w{width}` | Atlas | no, deliberately public |
-| `/api/v1/assets…` | Atlas | yes, Bearer token |
+| `/api/v1/images…`, `/api/v1/documents…` | Atlas | yes, Bearer token |
 
 This example has no accounts: it is a single-family reference app, and adding
 login would only hide the integration. A real site puts its own authentication
@@ -120,8 +129,9 @@ in front of these album routes and keeps the Atlas token behind them.
 ## Availability, and what it costs
 
 The album cannot know on its own whether Atlas will still serve an asset: Atlas
-has no listing endpoint, and its whole design is that it forgets files without
-telling anyone. So it asks, once per page, through
+gives no way to ask "is this id still there?" without naming it, and its whole
+design is that it forgets files without telling anyone. So it asks, once per
+page, through
 `POST /api/v1/assets/state` with every asset ID on that page — one call, up to
 500 ids, answered from the request cache so a photo rendered twice costs
 nothing. Before that endpoint existed this was one call per photo, which is the
@@ -152,31 +162,47 @@ broken image, and when it cannot show one it says which of five things happened.
 | `POST /photos/<id>/attach` | Add this photo to a post and pin the asset |
 | `GET /posts` | Posts, publishing, and the photos in a post |
 | `GET /trash` | Atlas's trashed and purged assets (first page) |
-| `POST /trash/<asset_id>/restore` | Restore one |
+| `POST /trash/<collection>/<asset_id>/restore` | Restore one |
 
 ## Deleting, end to end
 
 1. The album checks its own `posts` table. A published post referencing the
    photo returns `409` and names the post; nothing is deleted without
    `confirm=yes`.
-2. `DELETE /api/v1/assets/{id}` moves the bytes into Atlas's trash. Atlas stamps
+2. `DELETE /api/v1/images/{id}` moves the bytes into Atlas's trash. Atlas stamps
    the delete *before* the files move, so the public URLs start serving a
    placeholder immediately.
 3. The album drops its own row. Published posts now show a placeholder rather
    than a broken image.
-4. `POST /trash/{id}/restore` brings the original bytes back at the same URLs.
+4. `POST /trash/<collection>/{id}/restore` brings the original bytes back at the
+   same URLs. The album knows the collection because it recorded it at upload.
 5. If nobody restores it, Atlas purges it after `ATLAS_TRASH_RETENTION_DAYS` and
    keeps a tombstone. The album's row says the asset was purged; that is the
-   point of `GET /api/v1/assets/{id}` reporting `state`.
+   point of `GET /api/v1/images/{id}` reporting `state`.
 
 ## Tests
 
 ```sh
-pip install -r requirements.txt pytest
+pip install -r requirements-dev.txt
 python -m pytest tests -q
+ruff check .
+ruff format --check .
+ty check
 ```
 
 The tests replace Atlas with an in-memory fake, so they need no running service.
+
+Two layers of fake back this up, and they are not the same thing. `test_app.py`
+runs the album's own views against `FakeAtlas`, so it tests the album. The
+`ScriptedSession` tests in `test_atlas_client.py` run the *real* client against
+a recorded transport, so they test the URLs the client actually builds. That
+layer is what catches a client disagreeing with Atlas about the API, which a
+fake-backed test cannot see.
+
+`ty check` needs the virtualenv active. It is worth running: it found a method
+called `list` shadowing the builtin and quietly corrupting every later type
+annotation in that file, and a fake calling a method it did not have from a
+branch that no test reached.
 They cover the upload report, the rendition widths the album renders, metadata
 edits that never reach Atlas, the referential guard, pin registration, and what
 the pages do when an asset has gone missing. `tests/test_atlas_client.py` covers

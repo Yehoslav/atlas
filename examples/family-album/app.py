@@ -18,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import album_db
+from atlas_client import AtlasClient, AtlasError, AtlasLike, content_type_for
 from flask import (
     Flask,
     abort,
@@ -28,11 +30,9 @@ from flask import (
     request,
     url_for,
 )
+from flask.typing import ResponseReturnValue
 from werkzeug import Response
 from werkzeug.exceptions import HTTPException
-
-import album_db
-from atlas_client import AtlasClient, AtlasError, content_type_for
 
 HERE = Path(__file__).parent
 
@@ -125,7 +125,7 @@ class AlbumImages:
     time. The album never asks Atlas to transform anything on the fly.
     """
 
-    def __init__(self, atlas: AtlasClient) -> None:
+    def __init__(self, atlas: AtlasLike) -> None:
         self._atlas = atlas
 
     def _widths(self, photo: album_db.Photo) -> list[int]:
@@ -195,11 +195,13 @@ class AlbumImages:
 
 
 def create_app(
-    atlas: AtlasClient | None = None,
+    atlas: AtlasLike | None = None,
     database: str | Path | None = None,
 ) -> Flask:
     app = Flask(__name__)
-    atlas = atlas or AtlasClient.from_env()
+    # Narrowed once, here, rather than as `AtlasClient | None` in every closure
+    # below: by the time anything below runs, there is a client.
+    client: AtlasLike = atlas or AtlasClient.from_env()
     database_path = Path(
         database or os.environ.get("ALBUM_DATABASE", HERE / "album.sqlite3")
     )
@@ -244,7 +246,7 @@ def create_app(
         for start in range(0, len(wanted), STATE_CHUNK):
             chunk = wanted[start : start + STATE_CHUNK]
             try:
-                found = atlas.states(chunk)
+                found = client.states(chunk)
             except AtlasError:
                 cache.update(
                     {asset_id: AssetCheck("unreachable") for asset_id in chunk}
@@ -258,18 +260,23 @@ def create_app(
             )
         return {asset_id: cache[asset_id] for asset_id in wanted} | cache
 
-    images = AlbumImages(atlas)
-    app.jinja_env.globals.update(
-        atlas=atlas,
-        images=images,
-        check_assets=check_assets,
-        fallback_reason=FALLBACK_REASON,
-        human_bytes=human_bytes,
-        timestamp=format_timestamp,
-        max_upload_bytes=max_upload_bytes,
-        grid_widths=GRID_WIDTHS,
-        thumbnail_width=THUMBNAIL_WIDTH,
-    )
+    images = AlbumImages(client)
+    # A dict rather than keyword arguments: Jinja's globals hold anything, and
+    # a type checker would otherwise have to accept that every value here is
+    # one of the handful of types it can guess for a keyword.
+    template_globals: dict[str, Any] = {
+        "atlas": client,
+        "images": images,
+        "check_assets": check_assets,
+        "collection_for": collection_for,
+        "fallback_reason": FALLBACK_REASON,
+        "human_bytes": human_bytes,
+        "timestamp": format_timestamp,
+        "max_upload_bytes": max_upload_bytes,
+        "grid_widths": GRID_WIDTHS,
+        "thumbnail_width": THUMBNAIL_WIDTH,
+    }
+    app.jinja_env.globals.update(template_globals)
 
     @app.get("/")
     def index() -> str | Response:
@@ -288,7 +295,7 @@ def create_app(
         )
 
     @app.route("/upload", methods=["GET", "POST"])
-    def upload() -> str:
+    def upload() -> ResponseReturnValue:
         if request.method == "GET":
             return render_template("upload.html", results=[])
 
@@ -300,13 +307,19 @@ def create_app(
         # Strictly one at a time. Atlas takes two concurrent uploads but runs a
         # single conversion, so a burst of ten would earn a 503 from half of
         # them; sequential uploads are slower and boring, which is the point.
+        #
+        # `as_document` is the album's whole reason for Atlas having two
+        # collections: a file that must not be re-encoded, such as a diagram or
+        # a screenshot, is stored whole even when it is a picture.
+        as_document = request.form.get("as_document") == "yes"
         results = [
-            _upload_one(get_db(), atlas, item, max_upload_bytes) for item in uploads
+            _upload_one(get_db(), client, item, max_upload_bytes, as_document)
+            for item in uploads
         ]
         return render_template("upload.html", results=results)
 
     @app.get("/photos/<int:photo_id>")
-    def photo_detail(photo_id: int) -> str:
+    def photo_detail(photo_id: int) -> ResponseReturnValue:
         connection = get_db()
         photo = album_db.get_photo(connection, photo_id) or abort(404)
         return render_template(
@@ -336,7 +349,7 @@ def create_app(
         return redirect(url_for("photo_detail", photo_id=photo_id))
 
     @app.post("/photos/<int:photo_id>/delete")
-    def delete_photo(photo_id: int) -> tuple[str, int]:
+    def delete_photo(photo_id: int) -> ResponseReturnValue:
         connection = get_db()
         photo = album_db.get_photo(connection, photo_id) or abort(404)
         references = album_db.references_for_photo(connection, photo_id)
@@ -359,7 +372,7 @@ def create_app(
             )
 
         try:
-            atlas.delete(photo.asset_id)
+            client.delete(photo.collection, photo.asset_id)
         except AtlasError as error:
             flash(f"Atlas refused to delete the asset: {error.message}", "error")
             return redirect(url_for("photo_detail", photo_id=photo_id))
@@ -376,11 +389,11 @@ def create_app(
         return redirect(url_for("index"))
 
     @app.post("/photos/<int:photo_id>/pin")
-    def toggle_pin(photo_id: int) -> str:
+    def toggle_pin(photo_id: int) -> ResponseReturnValue:
         photo = album_db.get_photo(get_db(), photo_id) or abort(404)
         wanted = not check_assets([photo.asset_id])[photo.asset_id].pinned
         try:
-            atlas.set_pinned(photo.asset_id, wanted)
+            client.set_pinned(photo.collection, photo.asset_id, wanted)
         except AtlasError as error:
             flash(f"Atlas refused to change the pin: {error.message}", "error")
         else:
@@ -391,7 +404,7 @@ def create_app(
         return redirect(url_for("photo_detail", photo_id=photo_id))
 
     @app.get("/posts")
-    def posts() -> str:
+    def posts() -> ResponseReturnValue:
         connection = get_db()
         post_id = request.args.get("post", type=int)
         photos = album_db.post_photos(connection, post_id) if post_id else []
@@ -404,7 +417,7 @@ def create_app(
         )
 
     @app.post("/posts")
-    def create_post() -> str:
+    def create_post() -> ResponseReturnValue:
         title = request.form.get("title", "").strip()
         if not title:
             flash("A post needs a title.", "error")
@@ -414,7 +427,7 @@ def create_app(
         return redirect(url_for("posts", post=post_id))
 
     @app.post("/posts/<int:post_id>/publish")
-    def publish_post(post_id: int) -> str:
+    def publish_post(post_id: int) -> ResponseReturnValue:
         connection = get_db()
         album_db.get_post(connection, post_id) or abort(404)
         album_db.set_post_published(
@@ -423,7 +436,7 @@ def create_app(
         return redirect(url_for("posts", post=post_id))
 
     @app.post("/posts/<int:post_id>/photos/<int:photo_id>")
-    def toggle_post_photo(post_id: int, photo_id: int) -> str:
+    def toggle_post_photo(post_id: int, photo_id: int) -> ResponseReturnValue:
         connection = get_db()
         album_db.get_post(connection, post_id) or abort(404)
         photo = album_db.get_photo(connection, photo_id) or abort(404)
@@ -439,11 +452,11 @@ def create_app(
         else:
             album_db.attach_photo(connection, post_id, photo_id)
 
-        _sync_pin(connection, atlas, photo, flash_message=True)
+        _sync_pin(connection, client, photo, flash_message=True)
         return redirect(request.referrer or url_for("photo_detail", photo_id=photo_id))
 
     @app.post("/photos/<int:photo_id>/attach")
-    def attach_to_post(photo_id: int) -> str:
+    def attach_to_post(photo_id: int) -> ResponseReturnValue:
         connection = get_db()
         photo = album_db.get_photo(connection, photo_id) or abort(404)
         post_id = request.form.get("post_id", type=int)
@@ -452,21 +465,25 @@ def create_app(
             return redirect(url_for("photo_detail", photo_id=photo_id))
         album_db.get_post(connection, post_id) or abort(404)
         album_db.attach_photo(connection, post_id, photo_id)
-        _sync_pin(connection, atlas, photo, flash_message=True)
+        _sync_pin(connection, client, photo, flash_message=True)
         return redirect(url_for("photo_detail", photo_id=photo_id))
 
     @app.get("/trash")
-    def trash() -> str:
+    def trash() -> ResponseReturnValue:
         try:
-            entries, error = atlas.trash(), None
+            entries, error = client.trash(), None
         except AtlasError as failure:
             entries, error = [], failure.message
         return render_template("trash.html", entries=entries, atlas_error=error)
 
-    @app.post("/trash/<asset_id>/restore")
-    def restore(asset_id: str) -> str:
+    @app.post("/trash/<collection>/<asset_id>/restore")
+    def restore(collection: str, asset_id: str) -> ResponseReturnValue:
+        if collection not in ("images", "documents"):
+            abort(404)
         try:
-            atlas.restore(asset_id)
+            # The collection is part of Atlas's route, and the trash listing is
+            # where the album learned which one this asset is in.
+            client.restore(collection, asset_id)
         except AtlasError as error:
             flash(f"Atlas refused to restore that asset: {error.message}", "error")
         else:
@@ -474,7 +491,7 @@ def create_app(
         return redirect(url_for("trash"))
 
     @app.post("/folders")
-    def create_folder() -> str:
+    def create_folder() -> ResponseReturnValue:
         name = request.form.get("name", "").strip()
         if not name:
             flash("A folder needs a name.", "error")
@@ -484,7 +501,7 @@ def create_app(
         return redirect(request.referrer or url_for("index"))
 
     @app.post("/folders/<int:folder_id>/delete")
-    def delete_folder(folder_id: int) -> str:
+    def delete_folder(folder_id: int) -> ResponseReturnValue:
         album_db.delete_folder(get_db(), folder_id)
         flash("Folder removed. Its photos are still in the album.", "ok")
         return redirect(url_for("index"))
@@ -500,9 +517,10 @@ def create_app(
 
 def _upload_one(
     connection: sqlite3.Connection,
-    atlas: AtlasClient,
+    atlas: AtlasLike,
     storage: Any,
     max_bytes: int,
+    as_document: bool = False,
 ) -> UploadResult:
     filename = storage.filename
     content_type = content_type_for(filename)
@@ -523,16 +541,28 @@ def _upload_one(
             f"{human_bytes(size)} is over the {human_bytes(max_bytes)} limit.",
         )
 
+    # Which Atlas collection this file belongs in. A picture can be stored as a
+    # document: Atlas then keeps the original untouched, generates no renditions,
+    # and serves it as an attachment, which is what a diagram full of small text
+    # or a screenshot of an error message needs.
+    collection = "documents" if as_document else collection_for(content_type)
+
     try:
-        asset = atlas.upload(storage.stream, content_type, file_name=filename)
+        asset = atlas.upload(
+            storage.stream,
+            content_type,
+            file_name=filename,
+            collection=collection,
+        )
     except AtlasError as error:
         return UploadResult(filename, False, error.message)
 
     try:
         photo_id = album_db.add_photo(connection, asset)
     except sqlite3.IntegrityError:
-        # Atlas deduplicates identical bytes and hands back the existing asset.
-        # The album keeps one row per asset, so this file is already here.
+        # Atlas deduplicates identical bytes and says so, but the album keeps one
+        # row per asset, so a repeat of a file already here is reported either
+        # way: from the flag first, and from the database if it is missing.
         existing = album_db.get_photo_by_asset(connection, asset.id)
         title = existing.description if existing and existing.description else "a photo"
         return UploadResult(
@@ -556,9 +586,19 @@ def _upload_one(
     )
 
 
+def collection_for(content_type: str) -> str:
+    """Which Atlas collection a content type belongs in.
+
+    Atlas's routes are typed, so the album decides per upload instead of asking
+    afterwards. An image that should be stored untouched would be uploaded to
+    `documents` instead; nothing else changes.
+    """
+    return "images" if content_type.startswith("image/") else "documents"
+
+
 def _sync_pin(
     connection: sqlite3.Connection,
-    atlas: AtlasClient,
+    atlas: AtlasLike,
     photo: album_db.Photo,
     flash_message: bool,
 ) -> None:
@@ -569,7 +609,7 @@ def _sync_pin(
     """
     wanted = album_db.photo_is_referenced(connection, photo.id)
     try:
-        atlas.set_pinned(photo.asset_id, wanted)
+        atlas.set_pinned(photo.collection, photo.asset_id, wanted)
     except AtlasError as error:
         if flash_message:
             flash(f"Could not update the Atlas pin: {error.message}", "error")

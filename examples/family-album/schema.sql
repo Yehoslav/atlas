@@ -15,6 +15,11 @@ CREATE TABLE IF NOT EXISTS folders (
 CREATE TABLE IF NOT EXISTS photos (
     id           INTEGER PRIMARY KEY,
     asset_id     TEXT    NOT NULL UNIQUE,
+    -- Which Atlas collection this asset is in, spelled as the route spells it.
+    -- Atlas's routes are typed, so the album has to remember this beside the id
+    -- rather than guess it from the content type: an image can live in either
+    -- collection.
+    collection   TEXT    NOT NULL DEFAULT 'images',
     description  TEXT    NOT NULL DEFAULT '',
     alt_text     TEXT    NOT NULL DEFAULT '',
     tags         TEXT    NOT NULL DEFAULT '',

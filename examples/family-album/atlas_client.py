@@ -14,7 +14,7 @@ import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Protocol
 from urllib.parse import quote
 
 import requests
@@ -61,10 +61,22 @@ class Rendition:
     formats: tuple[str, ...]
 
 
+#: How Atlas reports a collection in JSON, and the URL segment that collection
+#: has. The words differ on purpose: an asset is an "image", a route is under
+#: "images", and the mapping lives in exactly one place.
+COLLECTION_FOR_KIND = {"image": "images", "document": "documents"}
+
+
 @dataclass(frozen=True)
 class Asset:
     id: str
+    # Which collection Atlas stored it in, as Atlas spells it: "image" or
+    # "document". Typed routes need it, so it is remembered rather than derived
+    # from the content type.
+    kind: str
     created_at: int
+    # True when this upload matched bytes Atlas already had.
+    deduplicated: bool
     state: str
     pinned: bool
     deleted_at: int | None
@@ -76,6 +88,11 @@ class Asset:
     height: int | None
     original_url: str
     renditions: tuple[Rendition, ...]
+
+    @property
+    def collection(self) -> str:
+        """The URL segment addressing this asset: "images" or "documents"."""
+        return COLLECTION_FOR_KIND[self.kind]
 
     @property
     def is_live(self) -> bool:
@@ -124,7 +141,9 @@ def _parse_asset(payload: dict[str, Any], base_url: str) -> Asset:
     original = payload["original"]
     return Asset(
         id=payload["id"],
+        kind=payload["kind"],
         created_at=payload["created_at"],
+        deduplicated=payload.get("deduplicated", False),
         state=payload["state"],
         pinned=payload["pinned"],
         deleted_at=payload["deleted_at"],
@@ -188,6 +207,22 @@ class AtlasClient:
             media_base_url=os.environ.get("ATLAS_MEDIA_URL", ""),
         )
 
+    # --- collections --------------------------------------------------------
+
+    @staticmethod
+    def collection_for(content_type: str) -> str:
+        """Which collection a content type belongs in, by Atlas's own rules."""
+        return "images" if content_type.startswith("image/") else "documents"
+
+    def collection_path(self, collection: str, asset_id: str) -> str:
+        """The path for one asset's routes.
+
+        A path, not a full URL: every call goes through `_send`, which puts
+        `api_url` in front. Returning an absolute URL here would be prepended
+        a second time.
+        """
+        return f"/api/v1/{collection}/{asset_id}"
+
     # --- media URLs --------------------------------------------------------
 
     def original_url(self, asset_id: str) -> str:
@@ -203,6 +238,7 @@ class AtlasClient:
         stream: BinaryIO,
         content_type: str,
         file_name: str | None = None,
+        collection: str | None = None,
         retries: int = 1,
         retry_delay: float = 2.0,
     ) -> Asset:
@@ -215,7 +251,12 @@ class AtlasClient:
 
         `file_name` goes out percent-encoded because Python's HTTP layer encodes
         header values as Latin-1 and would raise on anything else.
+
+        `collection` is "images" or "documents" and decides what Atlas will do
+        with the bytes: an image uploaded as a document is stored untouched, with
+        no renditions. It defaults to the obvious one for the content type.
         """
+        collection = collection or self.collection_for(content_type)
         headers = {
             "Authorization": f"Bearer {self._token}",
             "Content-Type": content_type,
@@ -226,7 +267,7 @@ class AtlasClient:
         while True:
             try:
                 response = self._send(
-                    "POST", "/api/v1/assets", data=stream, headers=headers
+                    "POST", f"/api/v1/{collection}", data=stream, headers=headers
                 )
             except AtlasError:
                 if attempt < retries:
@@ -246,15 +287,65 @@ class AtlasClient:
             self._raise_for_status(response)
             return _parse_asset(response.json(), self.media_base_url)
 
-    def get_asset(self, asset_id: str) -> Asset | None:
-        """Metadata for one asset, or None when Atlas has never heard of it."""
+    def get_asset(self, collection: str, asset_id: str) -> Asset | None:
+        """Metadata for one asset, or None when Atlas has never heard of it.
+
+        The collection is part of the call because it is part of the API: an
+        asset in the other collection is not found, exactly as if it did not
+        exist at all.
+        """
         response = self._send(
-            "GET", f"/api/v1/assets/{asset_id}", headers=self._headers()
+            "GET", self.collection_path(collection, asset_id), headers=self._headers()
         )
         if response.status_code == 404:
             return None
         self._raise_for_status(response)
         return _parse_asset(response.json(), self.media_base_url)
+
+    def list_assets(self, collection: str, query: str = "") -> dict:
+        """One page of a collection, with Atlas's own filters already applied.
+
+        Not named `list`: a method called `list` shadows the builtin inside the
+        class body, and every later `list[str]` annotation in this file would
+        then describe the method rather than the type.
+        """
+        suffix = f"?{query}" if query else ""
+        response = self._send(
+            "GET", f"/api/v1/{collection}{suffix}", headers=self._headers()
+        )
+        self._raise_for_status(response)
+        return response.json()
+
+    def summary(self) -> dict:
+        """Counts and bytes per collection, for a library header."""
+        response = self._send("GET", "/api/v1/summary", headers=self._headers())
+        self._raise_for_status(response)
+        return response.json()
+
+    def act(self, collection: str, action: str, ids: list[str]) -> dict:
+        """One action on many assets; the result says what happened to each."""
+        response = self._send(
+            "POST",
+            f"/api/v1/{collection}/actions",
+            json={"action": action, "ids": ids},
+            headers=self._headers(),
+        )
+        self._raise_for_status(response)
+        return response.json()
+
+    def srcset(self, asset_id: str, widths: str = "320,640,960,1280") -> dict:
+        """The `src`/`srcset` Atlas built, described by real output widths.
+
+        Every consumer would otherwise have to learn that a srcset descriptor
+        is the width that was produced while the URL keeps the profile.
+        """
+        response = self._send(
+            "GET",
+            f"/api/v1/images/{asset_id}/srcset?widths={widths}",
+            headers=self._headers(),
+        )
+        self._raise_for_status(response)
+        return response.json()
 
     def states(self, asset_ids: list[str]) -> dict[str, AssetState]:
         """Lifecycle state for ids the caller already knows, in one call.
@@ -283,20 +374,26 @@ class AtlasClient:
             for entry in response.json()["assets"]
         }
 
-    def delete(self, asset_id: str) -> None:
+    def delete(self, collection: str, asset_id: str) -> None:
         """Move an asset to Atlas's trash. The bytes are still restorable there."""
         self._raise_for_status(
-            self._send("DELETE", f"/api/v1/assets/{asset_id}", headers=self._headers())
-        )
-
-    def restore(self, asset_id: str) -> None:
-        self._raise_for_status(
             self._send(
-                "POST", f"/api/v1/assets/{asset_id}/restore", headers=self._headers()
+                "DELETE",
+                self.collection_path(collection, asset_id),
+                headers=self._headers(),
             )
         )
 
-    def set_pinned(self, asset_id: str, pinned: bool) -> Asset:
+    def restore(self, collection: str, asset_id: str) -> None:
+        self._raise_for_status(
+            self._send(
+                "POST",
+                f"{self.collection_path(collection, asset_id)}/restore",
+                headers=self._headers(),
+            )
+        )
+
+    def set_pinned(self, collection: str, asset_id: str, pinned: bool) -> Asset:
         """Tell Atlas a published post still uses this asset, so purge skips it.
 
         This is the only signal Atlas ever gets about consumer content, which is
@@ -304,7 +401,7 @@ class AtlasClient:
         """
         response = self._send(
             "PUT",
-            f"/api/v1/assets/{asset_id}/pin",
+            f"{self.collection_path(collection, asset_id)}/pin",
             json={"pinned": pinned},
             headers=self._headers(),
         )
@@ -372,3 +469,37 @@ def widths_available(photo: Any, wanted: Iterable[int]) -> list[int]:
     """The subset of `wanted` widths that Atlas actually generated for a photo."""
     available = {rendition.max_width for rendition in photo.renditions}
     return [width for width in wanted if width in available]
+
+
+class AtlasLike(Protocol):
+    """What the album actually needs from Atlas.
+
+    `create_app` takes one of these rather than an `AtlasClient`, so the
+    album's own tests can pass a fake that answers the same questions without
+    being told to subclass a class it does not use. Anything the album starts
+    calling shows up here as a type error, which is the point.
+    """
+
+    def upload(
+        self,
+        stream: BinaryIO,
+        content_type: str,
+        file_name: str | None = None,
+        collection: str | None = None,
+    ) -> Asset: ...
+
+    def get_asset(self, collection: str, asset_id: str) -> Asset | None: ...
+
+    def delete(self, collection: str, asset_id: str) -> None: ...
+
+    def restore(self, collection: str, asset_id: str) -> None: ...
+
+    def set_pinned(self, collection: str, asset_id: str, pinned: bool) -> Asset: ...
+
+    def states(self, asset_ids: list[str]) -> dict[str, AssetState]: ...
+
+    def trash(self) -> list[TrashEntry]: ...
+
+    def original_url(self, asset_id: str) -> str: ...
+
+    def rendition_url(self, asset_id: str, max_width: int) -> str: ...

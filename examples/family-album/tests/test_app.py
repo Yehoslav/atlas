@@ -7,6 +7,7 @@ sends, and what it does when an asset is missing - without a running Atlas.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import sys
@@ -17,7 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import album_db
-from app import create_app
+from app import collection_for, create_app
 from atlas_client import (
     Asset,
     AssetState,
@@ -52,23 +53,32 @@ class FakeAtlas:
         state: str = "active",
         pinned: bool = False,
         file_name: str | None = None,
+        kind: str = "images",
+        content_type: str = "image/png",
     ) -> Asset:
         self.next_id += 1
         asset_id = f"{self.next_id:018d}"
         source = self.source_width
+        is_image = content_type.startswith("image/")
         asset = Asset(
             id=asset_id,
+            # Atlas spells the collection in JSON as a singular noun, while the
+            # route uses the plural. The fake says it the way the server does, or
+            # it stops being able to catch a mismatch.
+            kind={"images": "image", "documents": "document"}[kind],
             created_at=1_700_000_000,
+            deduplicated=False,
             state=state,
             pinned=pinned,
             deleted_at=None if state == "active" else 1_700_000_100,
             purged_at=None,
-            content_type="image/png",
+            content_type=content_type,
             bytes=2048,
             sha256="deadbeef",
-            width=source,
-            height=int(source * 3 / 4),
+            width=source if is_image else None,
+            height=int(source * 3 / 4) if is_image else None,
             original_url=f"/media/{asset_id}/original",
+            # Documents are stored whole: no renditions at all.
             renditions=tuple(
                 Rendition(
                     max_width=profile,
@@ -77,6 +87,7 @@ class FakeAtlas:
                     formats=("webp", "png"),
                 )
                 for profile in (320, 640, 960, 1280)
+                if kind == "images"
             ),
         )
         self.assets[asset_id] = asset
@@ -84,21 +95,33 @@ class FakeAtlas:
 
     # --- the interface app.py uses -----------------------------------------
 
-    def upload(self, stream, content_type: str, file_name: str | None = None) -> Asset:
+    def upload(
+        self,
+        stream,
+        content_type: str,
+        file_name: str | None = None,
+        collection: str | None = None,
+    ) -> Asset:
         if self.fail_next_upload:
             message, self.fail_next_upload = self.fail_next_upload, None
             raise AtlasError(message, status=415)
-        digest = hashlib.sha256(stream.read()).hexdigest()
+        collection = collection or collection_for(content_type)
+        digest = f"{collection}:{hashlib.sha256(stream.read()).hexdigest()}"
         stream.seek(0)
         if digest in self.by_digest:
-            return self.by_digest[digest]
+            existing = self.by_digest[digest]
+            return dataclasses.replace(existing, deduplicated=True)
         self.file_names.append(file_name)
-        asset = self._make(file_name=file_name)
+        asset = self._make(
+            file_name=file_name, kind=collection, content_type=content_type
+        )
         self.by_digest[digest] = asset
         return asset
 
-    def get_asset(self, asset_id: str) -> Asset | None:
-        return self.assets.get(asset_id)
+    def get_asset(self, collection: str, asset_id: str) -> Asset | None:
+        asset = self.assets.get(asset_id)
+        # A typed route: an asset in the other collection is not found.
+        return asset if asset and asset.collection == collection else None
 
     def states(self, asset_ids: list[str]) -> dict[str, AssetState]:
         self.state_calls.append(list(asset_ids))
@@ -112,19 +135,19 @@ class FakeAtlas:
             )
         return found
 
-    def delete(self, asset_id: str) -> None:
+    def delete(self, collection: str, asset_id: str) -> None:
         self.deleted.append(asset_id)
         self.assets.pop(asset_id, None)
 
-    def restore(self, asset_id: str) -> None:
+    def restore(self, collection: str, asset_id: str) -> None:
         self.restored.append(asset_id)
 
-    def set_pinned(self, asset_id: str, pinned: bool) -> Asset:
+    def set_pinned(self, collection: str, asset_id: str, pinned: bool) -> Asset:
         self.pins[asset_id] = pinned
         asset = self.assets.get(asset_id)
-        if asset is None:
+        if asset is None or asset.collection != collection:
             raise AtlasError("The asset was not found.", status=404)
-        updated = Asset(**{**asset.__dict__, "pinned": pinned})
+        updated = dataclasses.replace(asset, pinned=pinned)
         self.assets[asset_id] = updated
         return updated
 
@@ -325,6 +348,61 @@ def test_a_repeated_upload_of_a_document_reports_the_existing_photo(client, atla
     assert f"/photos/{photo_id}" in page
 
 
+def test_a_picture_can_be_stored_as_a_document_instead_of_being_converted(
+    client, atlas
+):
+    """The reason Atlas has two collections: keep this file exactly as it is.
+
+    Atlas's routes are typed, so the album says which collection it means by
+    ticking a box. Nothing else changes, and the album remembers the answer
+    because later calls need it.
+    """
+    response = client.post(
+        "/upload",
+        data={
+            "photos": (io.BytesIO(png_bytes("diagram")), "diagram.png"),
+            "as_document": "yes",
+        },
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 200
+
+    stored = atlas.assets[next(iter(atlas.assets))]
+    assert stored.collection == "documents", "stored whole, not converted"
+    assert stored.kind == "document", "Atlas's own word for it"
+    assert stored.renditions == (), "no renditions for a document"
+
+    connection = album_db.connect(client.application.config["DATABASE"])
+    try:
+        photos = album_db.list_photos(connection)
+    finally:
+        connection.close()
+    assert len(photos) == 1
+    assert photos[0].collection == "documents", "and remembered for later calls"
+
+    # The album still renders it, and still asks Atlas what it can serve.
+    page = client.get(f"/photos/{photos[0].id}")
+    assert page.status_code == 200
+    assert "No image to show" not in page.get_data(as_text=True)
+
+
+def test_the_album_remembers_which_collection_each_asset_is_in(client, atlas):
+    upload_png(client)
+    upload_document(client)
+
+    connection = album_db.connect(client.application.config["DATABASE"])
+    try:
+        collections = {
+            photo.content_type: photo.collection
+            for photo in album_db.list_photos(connection)
+        }
+    finally:
+        connection.close()
+
+    assert collections["image/png"] == "images"
+    assert collections["application/pdf"] == "documents"
+
+
 def test_metadata_editing_never_touches_atlas(client, atlas):
     upload_png(client)
     photo_id = _only_photo_id(client, atlas)
@@ -424,9 +502,7 @@ def test_a_purged_asset_is_explained_as_unrecoverable(client, atlas):
     upload_png(client)
     photo_id = _only_photo_id(client, atlas)
     asset_id = next(iter(atlas.assets))
-    atlas.assets[asset_id] = Asset(
-        **{**atlas.assets[asset_id].__dict__, "state": "purged"}
-    )
+    atlas.assets[asset_id] = dataclasses.replace(atlas.assets[asset_id], state="purged")
 
     body = client.get(f"/photos/{photo_id}").get_data(as_text=True)
     assert "Purged by Atlas" in body
@@ -496,28 +572,22 @@ def test_a_trashed_asset_offers_a_restore(client, atlas):
     photo_id = _only_photo_id(client, atlas)
     asset_id = next(iter(atlas.assets))
 
-    atlas.assets[asset_id] = Asset(
-        **{
-            **atlas.assets[asset_id].__dict__,
-            "state": "deleted",
-            "deleted_at": 1_700_000_100,
-        }
+    atlas.assets[asset_id] = dataclasses.replace(
+        atlas.assets[asset_id], state="deleted", deleted_at=1_700_000_100
     )
 
     body = client.get(f"/photos/{photo_id}").get_data(as_text=True)
     assert "deleted" in body
     assert "Restore from the trash" in body
 
-    assert client.post(f"/trash/{asset_id}/restore").status_code == 302
+    assert client.post(f"/trash/images/{asset_id}/restore").status_code == 302
     assert atlas.restored == [asset_id]
 
 
 def test_trash_page_lists_purged_tombstones(client, atlas):
     upload_png(client)
     asset_id = next(iter(atlas.assets))
-    atlas.assets[asset_id] = Asset(
-        **{**atlas.assets[asset_id].__dict__, "state": "purged"}
-    )
+    atlas.assets[asset_id] = dataclasses.replace(atlas.assets[asset_id], state="purged")
 
     body = client.get("/trash").get_data(as_text=True)
     assert asset_id in body
@@ -528,7 +598,7 @@ def test_atlas_failures_are_reported_not_swallowed(client, atlas):
     upload_png(client)
     photo_id = _only_photo_id(client, atlas)
 
-    def explode(asset_id: str) -> None:
+    def explode(collection: str, asset_id: str) -> None:
         raise AtlasError(
             "The asset is in the trash but its files were not moved.", status=500
         )

@@ -28,6 +28,10 @@ class Photo:
 
     id: int
     asset_id: str
+    # Which Atlas collection the asset is in, spelled as the route spells it:
+    # "images" or "documents". Not meaning, just the address the album needs for
+    # every later call about this asset.
+    collection: str
     description: str
     alt_text: str
     tags: tuple[str, ...]
@@ -52,9 +56,48 @@ def connect(database: str | Path) -> sqlite3.Connection:
     return connection
 
 
+def inserted_id(cursor: sqlite3.Cursor) -> int:
+    """The id of the row just inserted.
+
+    An `INSERT` always produces one, but the type says otherwise, and silently
+    turning `None` into `0` would point the caller at some other row.
+    """
+    if cursor.lastrowid is None:  # pragma: no cover - unreachable for INSERT
+        raise RuntimeError("the insert produced no row id")
+    return cursor.lastrowid
+
+
 def init(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    migrate(connection)
     connection.commit()
+
+
+def migrate(connection: sqlite3.Connection) -> None:
+    """Bring an older album database up to the current schema.
+
+    A real application would keep these as numbered migrations; this example
+    has a couple, and the shape of the change is what matters: add a column
+    with a default, backfill it, and keep working.
+    """
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(photos)")}
+    if "kind" in columns and "collection" not in columns:
+        # An earlier development build recorded Atlas's word for it ("image").
+        # The route segment is what the album actually calls.
+        connection.execute("ALTER TABLE photos RENAME COLUMN kind TO collection")
+        connection.execute(
+            "UPDATE photos SET collection ="
+            " CASE WHEN collection = 'image' THEN 'images'"
+            " WHEN collection = 'document' THEN 'documents' ELSE collection END"
+        )
+    if "collection" not in columns:
+        connection.execute(
+            "ALTER TABLE photos ADD COLUMN collection TEXT NOT NULL DEFAULT 'images'"
+        )
+        connection.execute(
+            "UPDATE photos SET collection ="
+            " CASE WHEN content_type LIKE 'image/%' THEN 'images' ELSE 'documents' END"
+        )
 
 
 # --- folders ---------------------------------------------------------------
@@ -82,7 +125,7 @@ def create_folder(connection: sqlite3.Connection, name: str) -> int:
         "INSERT INTO folders (name, position) VALUES (?, ?)", (name.strip(), position)
     )
     connection.commit()
-    return int(cursor.lastrowid)
+    return inserted_id(cursor)
 
 
 def delete_folder(connection: sqlite3.Connection, folder_id: int) -> None:
@@ -142,11 +185,12 @@ def get_photo_by_asset(connection: sqlite3.Connection, asset_id: str) -> Photo |
 def add_photo(connection: sqlite3.Connection, asset: Any) -> int:
     """Record a freshly uploaded asset. The argument is Atlas's upload response."""
     cursor = connection.execute(
-        "INSERT INTO photos (asset_id, description, alt_text, tags, folder_id,"
+        "INSERT INTO photos (asset_id, collection, description, alt_text, tags, folder_id,"
         " content_type, bytes, width, height, uploaded_at)"
-        " VALUES (?, '', '', '', NULL, ?, ?, ?, ?, ?)",
+        " VALUES (?, ?, '', '', '', NULL, ?, ?, ?, ?, ?)",
         (
             asset.id,
+            asset.collection,
             asset.content_type,
             asset.bytes,
             asset.width,
@@ -154,7 +198,7 @@ def add_photo(connection: sqlite3.Connection, asset: Any) -> int:
             utcnow(),
         ),
     )
-    photo_id = int(cursor.lastrowid)
+    photo_id = inserted_id(cursor)
     save_renditions(connection, asset.id, asset.renditions)
     connection.commit()
     return photo_id
@@ -236,6 +280,7 @@ def _to_photo(connection: sqlite3.Connection, row: sqlite3.Row) -> Photo:
     return Photo(
         id=row["id"],
         asset_id=row["asset_id"],
+        collection=row["collection"],
         description=row["description"],
         alt_text=row["alt_text"],
         tags=tuple(tag for tag in (row["tags"] or "").split(", ") if tag),
@@ -271,7 +316,7 @@ def create_post(connection: sqlite3.Connection, title: str, body: str = "") -> i
         (title.strip(), body.strip(), utcnow()),
     )
     connection.commit()
-    return int(cursor.lastrowid)
+    return inserted_id(cursor)
 
 
 def set_post_published(

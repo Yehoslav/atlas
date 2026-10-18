@@ -26,7 +26,7 @@
           <strong>No image to show</strong>
           <span>{{ check.reason }}</span>
           {% if check.status == 'deleted' %}
-            <form method="post" action="{{ url_for('restore', asset_id=photo.asset_id) }}">
+            <form method="post" action="{{ url_for('restore', collection=photo.collection, asset_id=photo.asset_id) }}">
               <button type="submit">Restore from the trash</button>
             </form>
           {% endif %}
