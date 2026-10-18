@@ -11,6 +11,11 @@
 
 * { box-sizing: border-box; }
 
+/* `hidden` has to win against any explicit `display` below it. Without this,
+   `.missing { display: flex }` resurrects every hidden fallback and the album
+   renders both an image and an empty state. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   color: var(--ink);
@@ -87,14 +92,31 @@ a { color: var(--accent); }
 
 .missing {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 0.35rem;
   height: 220px;
+  padding: 0 1rem;
   background: var(--wash);
   color: var(--muted);
   font-size: 0.85rem;
+  text-align: center;
   border: 1px dashed var(--line);
 }
+
+.missing strong { color: var(--ink); font-size: 0.95rem; }
+.missing span { max-width: 30ch; }
+.missing-large { height: 320px; font-size: 0.95rem; }
+
+/* Say which kind of "missing" this is, so a tile reads at a glance. */
+.missing[data-state="deleted"] { border-color: #e0c48a; background: #fdf3e2; color: var(--warn); }
+.missing[data-state="deleted"] strong { color: var(--warn); }
+.missing[data-state="purged"] { border-color: #e5b8ba; background: #fbeaea; color: var(--error); }
+.missing[data-state="purged"] strong { color: var(--error); }
+.missing[data-state="unreachable"] { border-style: dotted; }
+
+.tile-missing .caption { color: var(--muted); }
 
 .caption { display: block; padding: 0.6rem 0.75rem 0; font-size: 0.9rem; }
 .tags { margin: 0.25rem 0.75rem 0.75rem; font-size: 0.8rem; }

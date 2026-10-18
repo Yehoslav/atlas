@@ -32,10 +32,14 @@ class FakeAtlas:
         self.pins: dict[str, bool] = {}
         self.next_id = 0
         self.fail_next_upload: str | None = None
+        # Source width of the next upload. Atlas caps renditions at the source,
+        # so a small photo stores narrower images than its profiles ask for.
+        self.source_width = 1600
 
     def _make(self, state: str = "active", pinned: bool = False) -> Asset:
         self.next_id += 1
         asset_id = f"{self.next_id:018d}"
+        source = self.source_width
         asset = Asset(
             id=asset_id,
             created_at=1_700_000_000,
@@ -46,22 +50,17 @@ class FakeAtlas:
             content_type="image/png",
             bytes=2048,
             sha256="deadbeef",
-            width=1600,
-            height=1200,
+            width=source,
+            height=int(source * 3 / 4),
             original_url=f"/media/{asset_id}/original",
-            renditions=(
+            renditions=tuple(
                 Rendition(
-                    max_width=320, width=320, height=240, formats=("webp", "png")
-                ),
-                Rendition(
-                    max_width=640, width=640, height=480, formats=("webp", "png")
-                ),
-                Rendition(
-                    max_width=960, width=960, height=720, formats=("webp", "png")
-                ),
-                Rendition(
-                    max_width=1280, width=1280, height=960, formats=("webp", "png")
-                ),
+                    max_width=profile,
+                    width=min(profile, source),
+                    height=int(min(profile, source) * 3 / 4),
+                    formats=("webp", "png"),
+                )
+                for profile in (320, 640, 960, 1280)
             ),
         )
         self.assets[asset_id] = asset
@@ -196,6 +195,33 @@ def test_a_failed_upload_does_not_stop_the_rest(client, atlas):
     assert "1 of 2 uploaded" in body
 
 
+def test_a_small_photo_renders_its_real_width_in_the_srcset(client, atlas):
+    """A photo narrower than the largest profile still gets a correct srcset.
+
+    Atlas caps every rendition at the source width, so `max_width` is what was
+    asked for and `width` is what came out. The descriptor has to be the real
+    one, or the browser reserves space for an image that does not exist. The URL
+    keeps pointing at the profile Atlas stored it under, because that is the URL
+    Atlas serves.
+    """
+    atlas.source_width = 500
+
+    upload_png(client)
+    asset_id = next(iter(atlas.assets))
+    stored = atlas.assets[asset_id].renditions
+    assert [r.max_width for r in stored] == [320, 640, 960, 1280]
+    assert [r.width for r in stored] == [320, 500, 500, 500]
+
+    grid = client.get("/").get_data(as_text=True)
+    assert f"/media/{asset_id}/w640 500w" in grid
+    assert " 640w" not in grid, "no descriptor claims a width that was never produced"
+
+    photo_id = _only_photo_id(client, atlas)
+    detail = client.get(f"/photos/{photo_id}").get_data(as_text=True)
+    assert f"/media/{asset_id}/w960 500w" in detail
+    assert f"/media/{asset_id}/w1280 500w" in detail
+
+
 def test_metadata_editing_never_touches_atlas(client, atlas):
     upload_png(client)
     photo_id = _only_photo_id(client, atlas)
@@ -253,21 +279,90 @@ def test_deleting_an_unused_photo_is_allowed(client, atlas):
     assert "Nothing here yet" in client.get("/").get_data(as_text=True)
 
 
-def test_a_missing_asset_degrades_instead_of_breaking_the_page(client, atlas):
+def test_a_live_photo_renders_an_image_and_no_empty_state(client, atlas):
+    upload_png(client)
+    asset_id = next(iter(atlas.assets))
+
+    for page in (
+        client.get("/"),
+        client.get(f"/photos/{_only_photo_id(client, atlas)}"),
+    ):
+        body = page.get_data(as_text=True)
+        assert f"/media/{asset_id}" in body
+        assert "No image to show" not in body, (
+            "a live photo must not show an empty state"
+        )
+        # The fallback is in the markup but stays hidden until a load fails.
+        assert '<div class="missing" data-fallback hidden>' in body
+
+
+def test_a_missing_asset_says_so_instead_of_showing_a_broken_image(client, atlas):
     upload_png(client)
     photo_id = _only_photo_id(client, atlas)
 
     # Atlas forgot about it - a purged tombstone, or a wiped database.
     atlas.assets.clear()
 
+    detail = client.get(f"/photos/{photo_id}")
+    assert detail.status_code == 200
+    body = detail.get_data(as_text=True)
+    assert "No image to show" in body
+    assert "Atlas has no record of this asset" in body
+    assert 'data-state="missing"' in body
+
+    grid = client.get("/")
+    assert grid.status_code == 200
+    grid_body = grid.get_data(as_text=True)
+    assert "No image to show" in grid_body
+    assert "<img" not in grid_body, "an unknown asset gets an empty state, not an <img>"
+
+
+def test_a_purged_asset_is_explained_as_unrecoverable(client, atlas):
+    upload_png(client)
+    photo_id = _only_photo_id(client, atlas)
+    asset_id = next(iter(atlas.assets))
+    atlas.assets[asset_id] = Asset(
+        **{**atlas.assets[asset_id].__dict__, "state": "purged"}
+    )
+
+    body = client.get(f"/photos/{photo_id}").get_data(as_text=True)
+    assert "Purged by Atlas" in body
+    assert "gone for good" in body
+    assert "Restore from the trash" not in body, "purged bytes cannot be restored"
+
+
+def test_an_unreachable_atlas_is_reported_without_breaking_the_page(client, atlas):
+    upload_png(client)
+    photo_id = _only_photo_id(client, atlas)
+
+    def explode(asset_id: str) -> None:
+        raise AtlasError("connection refused", status=503)
+
+    atlas.get_asset = explode  # type: ignore[method-assign]
+
     page = client.get(f"/photos/{photo_id}")
     assert page.status_code == 200
     body = page.get_data(as_text=True)
-    assert "Atlas has no record of this asset" in body
-    assert "onerror" in body  # the grid and detail images degrade themselves
+    assert "Atlas did not answer" in body
+    assert "could not be reached" in body
 
-    grid = client.get("/").get_data(as_text=True)
-    assert f"/media/{photo_id}" not in grid or "onerror" in grid
+
+def test_each_asset_is_asked_about_once_per_page(client, atlas):
+    upload_png(client)
+    photo_id = _only_photo_id(client, atlas)
+
+    calls: list[str] = []
+    original = atlas.get_asset
+
+    def counting(asset_id: str):
+        calls.append(asset_id)
+        return original(asset_id)
+
+    atlas.get_asset = counting  # type: ignore[method-assign]
+
+    page = client.get(f"/photos/{photo_id}")
+    assert page.status_code == 200
+    assert calls == [next(iter(atlas.assets))]
 
 
 def test_a_trashed_asset_offers_a_restore(client, atlas):

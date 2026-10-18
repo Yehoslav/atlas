@@ -3,21 +3,33 @@
 
 {% block content %}
   {% set full_url, full_width, full_height = images.full_size(photo) %}
+  {% set check = check_asset(photo.asset_id) if photo.is_image else None %}
 
   <article class="detail">
     <div class="detail-media">
-      {% if photo.is_image %}
+      {% if photo.is_image and check.live %}
         {# The largest rendition Atlas stored, falling back to the original. #}
         <img
           src="{{ full_url }}"
-          srcset="{{ images.srcset(photo, grid_widths + (full_width or 0,)) }}"
+          srcset="{{ images.srcset_all(photo) }}"
           sizes="(max-width: 900px) 100vw, 900px"
           alt="{{ photo.alt_text or photo.description or 'Family photo' }}"
           width="{{ full_width or photo.width or '' }}"
-          height="{{ full_height or photo.height or '' }}"
-          onerror="this.hidden = true; this.nextElementSibling.hidden = false;">
-        <div class="missing" hidden>
-          <span>Atlas is not serving this photo right now.</span>
+          height="{{ full_height or photo.height or '' }}">
+        <div class="missing" data-fallback hidden>
+          <strong>Image unavailable</strong>
+          <span>{{ fallback_reason }}</span>
+        </div>
+      {% elif photo.is_image %}
+        {# Say why, and offer the way out where one exists. #}
+        <div class="missing missing-large" data-state="{{ check.status }}">
+          <strong>No image to show</strong>
+          <span>{{ check.reason }}</span>
+          {% if check.status == 'deleted' %}
+            <form method="post" action="{{ url_for('restore', asset_id=photo.asset_id) }}">
+              <button type="submit">Restore from the trash</button>
+            </form>
+          {% endif %}
         </div>
       {% else %}
         <p><a href="{{ images.original_url(photo) }}">Download {{ photo.content_type }}</a></p>
@@ -30,21 +42,12 @@
     </div>
 
     <div class="detail-side">
-      {% if atlas_error %}
-        <p class="notice notice-error">{{ atlas_error }}</p>
-      {% elif asset and not asset.is_live %}
-        <p class="notice notice-warn">
-          Atlas reports this asset as <strong>{{ asset.state }}</strong>.
-          {% if asset.state == 'deleted' %}
-            Its bytes are still in the trash:
-            <form method="post" action="{{ url_for('restore', asset_id=photo.asset_id) }}" class="inline">
-              <button type="submit">Restore from the trash</button>
-            </form>
-          {% else %}
-            Its bytes were purged and cannot come back; the image above is a placeholder.
-          {% endif %}
+      {% if check and check.status == 'unreachable' %}
+        <p class="notice notice-error">
+          Atlas did not answer, so this page cannot tell what Atlas would serve.
+          The photo may well be fine.
         </p>
-      {% elif asset and asset.pinned %}
+      {% elif check and check.live and check.asset.pinned %}
         <p class="notice">
           Pinned: Atlas will not purge this asset while a post uses it.
         </p>
@@ -129,7 +132,7 @@
 
         <form method="post" action="{{ url_for('toggle_pin', photo_id=photo.id) }}">
           <button type="submit">
-            {% if asset and asset.pinned %}Unpin from Atlas{% else %}Pin in Atlas{% endif %}
+            {% if check and check.live and check.asset.pinned %}Unpin from Atlas{% else %}Pin in Atlas{% endif %}
           </button>
         </form>
       </section>

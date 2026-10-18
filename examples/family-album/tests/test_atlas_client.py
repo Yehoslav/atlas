@@ -1,0 +1,160 @@
+"""The Atlas client, tested without a running Atlas.
+
+A stopped Atlas is a normal state for a page, not a crash: every transport
+failure has to arrive as an AtlasError, or the album returns a 500 instead of
+an explanation.
+"""
+
+from __future__ import annotations
+
+import io
+import sys
+from pathlib import Path
+
+import pytest
+import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from atlas_client import AtlasClient, AtlasError, Rendition, content_type_for
+
+UPLOAD_RESPONSE = {
+    "id": "aaaaaaaaaaaaaaaaaaaa",
+    "created_at": 1_700_000_000,
+    "state": "active",
+    "deleted_at": None,
+    "purged_at": None,
+    "pinned": False,
+    "original": {
+        "url": "/media/aaaaaaaaaaaaaaaaaaaa/original",
+        "content_type": "image/png",
+        "bytes": 2048,
+        "sha256": "deadbeef",
+        "width": 1600,
+        "height": 1200,
+    },
+    "renditions": [
+        {
+            "max_width": 320,
+            "width": 320,
+            "height": 240,
+            "url": "/media/aaaaaaaaaaaaaaaaaaaa/w320",
+            "formats": ["avif", "png"],
+        }
+    ],
+}
+
+
+class ScriptedSession:
+    """A requests session that replays one response and records the calls."""
+
+    def __init__(
+        self, response: requests.Response | None = None, error: Exception | None = None
+    ):
+        self.response = response
+        self.error = error
+        self.calls: list[tuple[str, str]] = []
+
+    def request(self, method: str, url: str, **kwargs) -> requests.Response:
+        self.calls.append((method, url))
+        if self.error:
+            raise self.error
+        assert self.response is not None
+        return self.response
+
+
+def response(status: int, payload: dict | None = None) -> requests.Response:
+    result = requests.Response()
+    result.status_code = status
+    result._content = (
+        b"{}" if payload is None else __import__("json").dumps(payload).encode()
+    )
+    return result
+
+
+def client_with(session) -> AtlasClient:
+    return AtlasClient(
+        api_url="http://atlas.invalid:3000",
+        token="secret",
+        session=session,
+    )
+
+
+def test_a_refused_connection_becomes_an_atlas_error():
+    session = ScriptedSession(error=requests.ConnectionError("connection refused"))
+
+    with pytest.raises(AtlasError) as failure:
+        client_with(session).get_asset("aaaaaaaaaaaaaaaaaaaa")
+
+    assert "could not be reached" in failure.value.message
+
+
+@pytest.mark.parametrize(
+    "call", ["get_asset", "delete", "restore", "trash", "set_pinned"]
+)
+def test_every_call_reports_an_unreachable_atlas(call):
+    session = ScriptedSession(error=requests.ConnectionError("connection refused"))
+    client = client_with(session)
+    asset_id = "aaaaaaaaaaaaaaaaaaaa"
+
+    with pytest.raises(AtlasError):
+        if call == "get_asset":
+            client.get_asset(asset_id)
+        elif call == "delete":
+            client.delete(asset_id)
+        elif call == "restore":
+            client.restore(asset_id)
+        elif call == "trash":
+            client.trash()
+        else:
+            client.set_pinned(asset_id, True)
+
+
+def test_an_atlas_error_message_is_preferred_over_the_status():
+    body = {
+        "error": {"code": "rendition_not_found", "message": "No rendition that narrow."}
+    }
+
+    with pytest.raises(AtlasError) as failure:
+        client_with(ScriptedSession(response=response(404, body))).set_pinned(
+            "aaaaaaaaaaaaaaaaaaaa", True
+        )
+
+    assert failure.value.message == "No rendition that narrow."
+    assert failure.value.status == 404
+
+
+def test_an_unknown_asset_is_none_rather_than_an_error():
+    client = client_with(ScriptedSession(response=response(404)))
+    assert client.get_asset("aaaaaaaaaaaaaaaaaaaa") is None
+
+
+def test_an_upload_response_becomes_an_asset():
+    session = ScriptedSession(response=response(201, UPLOAD_RESPONSE))
+
+    asset = client_with(session).upload(io.BytesIO(b"bytes"), "image/png")
+
+    assert asset.id == "aaaaaaaaaaaaaaaaaaaa"
+    assert asset.is_live
+    assert asset.renditions == (
+        Rendition(max_width=320, width=320, height=240, formats=("avif", "png")),
+    )
+    method, url = session.calls[0]
+    assert (method, url) == ("POST", "http://atlas.invalid:3000/api/v1/assets")
+
+
+def test_media_urls_are_absolute_only_when_a_media_base_is_configured():
+    same_origin = AtlasClient("http://atlas.invalid:3000", "secret", media_base_url="")
+    assert same_origin.rendition_url("abc", 640) == "/media/abc/w640"
+
+    proxied = AtlasClient(
+        "http://atlas.invalid:3000", "secret", media_base_url="http://127.0.0.1:3000"
+    )
+    assert proxied.rendition_url("abc", 640) == "http://127.0.0.1:3000/media/abc/w640"
+
+
+def test_only_supported_content_types_are_named():
+    assert content_type_for("holiday.JPG") == "image/jpeg"
+    assert content_type_for("report.pdf") == "application/pdf"
+    assert content_type_for("raw.cr2") is None
+    assert content_type_for("script.sh") is None

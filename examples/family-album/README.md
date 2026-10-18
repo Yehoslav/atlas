@@ -32,10 +32,15 @@ here.
 - **Renditions used properly.** `w320` for thumbnails, `w640`/`w960` for the
   grid's `srcset`, and the widest stored rendition for the full-size view. The
   widths come from the upload response and are stored, so the album never asks
-  Atlas to transform anything on a read.
-- **Graceful degradation.** Images carry an `onerror` fallback, and a photo page
-  whose asset Atlas has forgotten says so in words instead of showing a broken
-  image.
+  Atlas to transform anything on a read. Atlas treats `/wN` as a maximum width
+  and never upscales, so a `srcset` descriptor is the rendition's **actual**
+  width while its URL stays pointed at the profile Atlas stored it under.
+- **Graceful degradation.** The album asks Atlas about each photo it is about to
+  render, and renders either the image or an empty state that says *why*: live,
+  deleted in Atlas (still restorable), purged (gone for good), unknown to Atlas,
+  or Atlas unreachable. The reason matters — "deleted" has a way back and
+  "purged" does not. A small `error`-listener catches the one race left: an
+  asset retired between the check and the browser's request.
 
 ## Two processes, not one
 
@@ -106,6 +111,25 @@ in front of these album routes and keeps the Atlas token behind them.
 | `ALBUM_MAX_REQUEST_BYTES` | 200 MiB | Whole-request ceiling for a bulk upload |
 | `ALBUM_HOST` / `ALBUM_PORT` | `127.0.0.1` / `5000` | Where the album listens |
 
+## Availability, and what it costs
+
+The album cannot know on its own whether Atlas will still serve an asset: Atlas
+has no listing endpoint, and its whole design is that it forgets files without
+telling anyone. So the album calls `GET /api/v1/assets/{id}` once per photo on
+the page and caches the answer for that request. A grid of 50 photos costs 50
+local HTTP calls, which is why this is an example and not a framework.
+
+That cost buys the only thing worth having here: the album never renders a
+broken image, and when it cannot show one it says which of five things happened.
+
+| State | What the page shows |
+| --- | --- |
+| `active` | The image |
+| `deleted` | "Deleted in Atlas. The bytes are still in the trash and can be restored", with a Restore button on the photo page |
+| `purged` | "Purged by Atlas after its retention window. The bytes are gone for good" |
+| `404` | "Atlas has no record of this asset" |
+| Atlas down | "Atlas could not be reached, so whether it can serve this photo is unknown" |
+
 ## Routes
 
 | Route | What it does |
@@ -146,7 +170,9 @@ python -m pytest tests -q
 The tests replace Atlas with an in-memory fake, so they need no running service.
 They cover the upload report, the rendition widths the album renders, metadata
 edits that never reach Atlas, the referential guard, pin registration, and what
-the pages do when an asset has gone missing.
+the pages do when an asset has gone missing. `tests/test_atlas_client.py` covers
+the client itself, including that a stopped Atlas arrives as an explanation
+rather than a traceback.
 
 The source is formatted with [`ruff`](https://docs.astral.sh/ruff/) if you have
 it: `ruff format . && ruff check .`

@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS photos (
 -- The widths Atlas actually generated for this photo, copied from the upload
 -- response. The album needs them to write a correct srcset without asking Atlas
 -- about every image on every page load.
+--
+-- `max_width` is the profile that was requested; `width` is what came out, which
+-- is smaller when the photo is narrower than the profile. Atlas never upscales,
+-- and a srcset descriptor has to be `width`.
 CREATE TABLE IF NOT EXISTS renditions (
     asset_id   TEXT    NOT NULL REFERENCES photos (asset_id) ON DELETE CASCADE,
     max_width  INTEGER NOT NULL,

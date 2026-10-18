@@ -197,19 +197,16 @@ class AtlasClient:
         attempt = 0
         while True:
             try:
-                response = self._session.post(
-                    f"{self.api_url}/api/v1/assets",
-                    data=stream,
-                    headers=headers,
-                    timeout=self.timeout,
+                response = self._send(
+                    "POST", "/api/v1/assets", data=stream, headers=headers
                 )
-            except requests.RequestException as error:
+            except AtlasError:
                 if attempt < retries:
                     attempt += 1
                     time.sleep(retry_delay)
                     stream.seek(0)
                     continue
-                raise AtlasError(f"could not reach Atlas: {error}") from error
+                raise
 
             if response.status_code == 503 and attempt < retries:
                 # Atlas accepts two uploads but runs one conversion at a time.
@@ -223,10 +220,8 @@ class AtlasClient:
 
     def get_asset(self, asset_id: str) -> Asset | None:
         """Metadata for one asset, or None when Atlas has never heard of it."""
-        response = self._session.get(
-            f"{self.api_url}/api/v1/assets/{asset_id}",
-            headers=self._headers(),
-            timeout=self.timeout,
+        response = self._send(
+            "GET", f"/api/v1/assets/{asset_id}", headers=self._headers()
         )
         if response.status_code == 404:
             return None
@@ -235,20 +230,14 @@ class AtlasClient:
 
     def delete(self, asset_id: str) -> None:
         """Move an asset to Atlas's trash. The bytes are still restorable there."""
-        self._expect_empty(
-            self._session.delete(
-                f"{self.api_url}/api/v1/assets/{asset_id}",
-                headers=self._headers(),
-                timeout=self.timeout,
-            )
+        self._raise_for_status(
+            self._send("DELETE", f"/api/v1/assets/{asset_id}", headers=self._headers())
         )
 
     def restore(self, asset_id: str) -> None:
-        self._expect_empty(
-            self._session.post(
-                f"{self.api_url}/api/v1/assets/{asset_id}/restore",
-                headers=self._headers(),
-                timeout=self.timeout,
+        self._raise_for_status(
+            self._send(
+                "POST", f"/api/v1/assets/{asset_id}/restore", headers=self._headers()
             )
         )
 
@@ -258,21 +247,17 @@ class AtlasClient:
         This is the only signal Atlas ever gets about consumer content, which is
         why it is a single boolean with no opinions attached.
         """
-        response = self._session.put(
-            f"{self.api_url}/api/v1/assets/{asset_id}/pin",
+        response = self._send(
+            "PUT",
+            f"/api/v1/assets/{asset_id}/pin",
             json={"pinned": pinned},
             headers=self._headers(),
-            timeout=self.timeout,
         )
         self._raise_for_status(response)
         return _parse_asset(response.json(), self.media_base_url)
 
     def trash(self) -> list[TrashEntry]:
-        response = self._session.get(
-            f"{self.api_url}/api/v1/trash",
-            headers=self._headers(),
-            timeout=self.timeout,
-        )
+        response = self._send("GET", "/api/v1/trash", headers=self._headers())
         self._raise_for_status(response)
         return [
             TrashEntry(
@@ -295,9 +280,26 @@ class AtlasClient:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token}"}
 
-    @staticmethod
-    def _expect_empty(response: requests.Response) -> None:
-        AtlasClient._raise_for_status(response)
+    def _send(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        """One API call, with every transport failure named.
+
+        A stopped Atlas is an expected state for a page, not an exception: the
+        album has to be able to say "Atlas is unreachable" instead of returning
+        a 500.
+        """
+        try:
+            return self._session.request(
+                method,
+                f"{self.api_url}{path}",
+                timeout=self.timeout,
+                **kwargs,
+            )
+        except requests.RequestException as error:
+            # The message is read by whoever is looking at the page, so it stays
+            # short; the chained cause keeps the detail for a log.
+            raise AtlasError(
+                f"Atlas at {self.api_url} could not be reached. Is the service running?"
+            ) from error
 
     @staticmethod
     def _raise_for_status(response: requests.Response) -> None:

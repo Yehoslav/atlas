@@ -38,5 +38,22 @@
         on the server and is never sent to the browser.
       </p>
     </footer>
+
+    <script>
+      // The album already checks each asset with Atlas before rendering it.
+      // This is the race nobody can close: an asset can be retired between that
+      // check and the browser fetching it, so a failed image load swaps in the
+      // fallback the server left beside it. Image load errors do not bubble, so
+      // the listener runs in the capture phase.
+      document.addEventListener('error', (event) => {
+        const image = event.target;
+        if (!(image instanceof HTMLImageElement)) return;
+        const fallback = image.nextElementSibling;
+        if (fallback && fallback.hasAttribute('data-fallback')) {
+          image.hidden = true;
+          fallback.hidden = false;
+        }
+      }, true);
+    </script>
   </body>
 </html>

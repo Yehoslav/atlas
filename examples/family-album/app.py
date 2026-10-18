@@ -28,10 +28,11 @@ from flask import (
     request,
     url_for,
 )
+from werkzeug import Response
 from werkzeug.exceptions import HTTPException
 
 import album_db
-from atlas_client import Asset, AtlasClient, AtlasError, content_type_for
+from atlas_client import AtlasClient, AtlasError, content_type_for
 
 HERE = Path(__file__).parent
 
@@ -57,6 +58,44 @@ class UploadResult:
     message: str
     asset_id: str | None = None
     photo_id: int | None = None
+
+
+#: What the album shows instead of an image, and why. "Why" matters: a photo
+#: that was deleted is recoverable and a photo that was purged is not, and an
+#: unreachable Atlas says nothing about either.
+ASSET_REASONS = {
+    "deleted": "Deleted in Atlas. The bytes are still in the trash and can be restored.",
+    "purged": "Purged by Atlas after its retention window. The bytes are gone for good.",
+    "missing": (
+        "Atlas has no record of this asset: it was never uploaded there, or it "
+        "was removed with the media directory."
+    ),
+    "unreachable": (
+        "Atlas could not be reached, so whether it can serve this photo is unknown."
+    ),
+}
+
+#: Shown when Atlas stops serving an image between the check below and the
+#: browser's request for it.
+FALLBACK_REASON = "Atlas stopped serving this photo while the page was loading."
+
+
+@dataclass(frozen=True)
+class AssetCheck:
+    """What Atlas can tell this album about one asset right now."""
+
+    status: str
+    asset: Any = None
+
+    @property
+    def live(self) -> bool:
+        # Atlas calls it `active`; the album says `live` to avoid two words for
+        # one thing. `deleted` and `purged` are Atlas's own words, kept as-is.
+        return self.status == "active"
+
+    @property
+    def reason(self) -> str:
+        return ASSET_REASONS.get(self.status, "")
 
 
 def human_bytes(count: int) -> str:
@@ -96,14 +135,25 @@ class AlbumImages:
         return self._atlas.original_url(photo.asset_id)
 
     def srcset(self, photo: album_db.Photo, widths: Iterable[int]) -> str:
-        """A srcset containing only widths Atlas actually generated."""
-        available = self._widths(photo)
-        chosen = [width for width in widths if width in available]
-        if not chosen and available:
-            chosen = [available[0]]
+        """A srcset of stored widths, described by their real output width.
+
+        A profile is a maximum, not a promise: Atlas never upscales, so a
+        500-pixel photo stores one rendition under several profiles, and the
+        descriptor has to be the width that was actually produced or the
+        browser will reserve space for an image that does not exist.
+        """
+        by_profile = {rendition.max_width: rendition for rendition in photo.renditions}
+        chosen = [by_profile[width] for width in widths if width in by_profile]
+        if not chosen and by_profile:
+            chosen = [min(by_profile.values(), key=lambda rendition: rendition.width)]
         return ", ".join(
-            f"{self.rendition_url(photo, width)} {width}w" for width in chosen
+            f"{self.rendition_url(photo, rendition.max_width)} {rendition.width}w"
+            for rendition in chosen
         )
+
+    def srcset_all(self, photo: album_db.Photo) -> str:
+        """Every width Atlas stored, for a view that can show any of them."""
+        return self.srcset(photo, self._widths(photo))
 
     def grid_src(self, photo: album_db.Photo) -> str:
         available = self._widths(photo)
@@ -178,10 +228,25 @@ def create_app(
         if connection is not None:
             connection.close()
 
+    def check_asset(asset_id: str) -> AssetCheck:
+        """Ask Atlas once per request what it can serve for this asset.
+
+        The album cannot know on its own: Atlas has no listing endpoint, so the
+        only way to learn that an asset was deleted, purged, or lost is to ask.
+        One request per photo on the page, cached so a photo rendered twice
+        costs one call.
+        """
+        cache = g.setdefault("asset_checks", {})
+        if asset_id not in cache:
+            cache[asset_id] = fetch_asset(atlas, asset_id)
+        return cache[asset_id]
+
     images = AlbumImages(atlas)
     app.jinja_env.globals.update(
         atlas=atlas,
         images=images,
+        check_asset=check_asset,
+        fallback_reason=FALLBACK_REASON,
         human_bytes=human_bytes,
         timestamp=format_timestamp,
         max_upload_bytes=max_upload_bytes,
@@ -190,7 +255,7 @@ def create_app(
     )
 
     @app.get("/")
-    def index() -> str:
+    def index() -> str | Response:
         connection = get_db()
         folder_id = request.args.get("folder", type=int)
         photos = album_db.list_photos(
@@ -226,19 +291,16 @@ def create_app(
     def photo_detail(photo_id: int) -> str:
         connection = get_db()
         photo = album_db.get_photo(connection, photo_id) or abort(404)
-        asset, atlas_error = _asset_or_error(atlas, photo.asset_id)
         return render_template(
             "photo.html",
             photo=photo,
-            asset=asset,
-            atlas_error=atlas_error,
             references=album_db.references_for_photo(connection, photo_id),
             posts=album_db.list_posts(connection),
             folders=album_db.list_folders(connection),
         )
 
     @app.post("/photos/<int:photo_id>")
-    def edit_photo(photo_id: int) -> str:
+    def edit_photo(photo_id: int) -> Response:
         album_db.get_photo(get_db(), photo_id) or abort(404)
         folder_id = request.form.get("folder_id", type=int)
         # Only the album's database is touched. Atlas is not told that a caption
@@ -255,7 +317,7 @@ def create_app(
         return redirect(url_for("photo_detail", photo_id=photo_id))
 
     @app.post("/photos/<int:photo_id>/delete")
-    def delete_photo(photo_id: int) -> str:
+    def delete_photo(photo_id: int) -> tuple[str, int]:
         connection = get_db()
         photo = album_db.get_photo(connection, photo_id) or abort(404)
         references = album_db.references_for_photo(connection, photo_id)
@@ -268,8 +330,6 @@ def create_app(
                 render_template(
                     "photo.html",
                     photo=photo,
-                    asset=_asset_or_error(atlas, photo.asset_id)[0],
-                    atlas_error=None,
                     blocking=references,
                     references=references,
                     posts=album_db.list_posts(connection),
@@ -298,7 +358,7 @@ def create_app(
     @app.post("/photos/<int:photo_id>/pin")
     def toggle_pin(photo_id: int) -> str:
         photo = album_db.get_photo(get_db(), photo_id) or abort(404)
-        asset, _ = _asset_or_error(atlas, photo.asset_id)
+        asset = check_asset(photo.asset_id).asset
         wanted = not (asset.pinned if asset else False)
         try:
             atlas.set_pinned(photo.asset_id, wanted)
@@ -460,6 +520,17 @@ def _upload_one(
     )
 
 
+def fetch_asset(atlas: AtlasClient, asset_id: str) -> AssetCheck:
+    """One Atlas metadata lookup, with every outcome named."""
+    try:
+        asset = atlas.get_asset(asset_id)
+    except AtlasError:
+        return AssetCheck("unreachable")
+    if asset is None:
+        return AssetCheck("missing")
+    return AssetCheck(asset.state, asset)
+
+
 def _sync_pin(
     connection: sqlite3.Connection,
     atlas: AtlasClient,
@@ -489,26 +560,6 @@ def _stream_size(stream: Any) -> int | None:
     except (AttributeError, OSError, ValueError):
         return None
     return int(size)
-
-
-def _asset_or_error(
-    atlas: AtlasClient, asset_id: str
-) -> tuple[Asset | None, str | None]:
-    """Ask Atlas about one asset, turning any failure into a page-level notice.
-
-    A photo whose asset was purged or removed out of band still has a row here.
-    The page says so instead of rendering a broken image.
-    """
-    try:
-        asset = atlas.get_asset(asset_id)
-    except AtlasError as error:
-        return None, error.message
-    if asset is None:
-        return (
-            None,
-            "Atlas has no record of this asset. It was never uploaded, or it was purged.",
-        )
-    return asset, None
 
 
 if __name__ == "__main__":
