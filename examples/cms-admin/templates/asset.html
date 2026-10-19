@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Asset · Library{% endblock %}
+{% block content %}
+  <div class="breadcrumb"><a href="/library?kind={{ kind }}">Library</a><span>/</span><span>{{ asset.id if asset else 'Asset' }}</span></div>
+  {% if error %}
+    <div class="notice notice-error">{{ error }}</div>
+  {% elif asset %}
+    <header class="page-header detail-header">
+      <div><div class="eyebrow">{{ kind }} · {{ asset.state }}</div><h1>{{ asset.original.filename or asset.id }}</h1><p class="page-subtitle"><code>{{ asset.id }}</code></p></div>
+      <div class="header-actions">
+        <form method="post" action="/assets/{{ kind }}/{{ asset.id }}/pin"><button class="button button-secondary" type="submit">{% if asset.pinned %}Unpin{% else %}Pin asset{% endif %}</button></form>
+        {% if asset.state == 'deleted' %}<form method="post" action="/trash/{{ kind }}/{{ asset.id }}/restore"><button class="button button-secondary" type="submit">Restore</button></form>{% endif %}
+        {% if asset.state == 'active' %}<form method="post" action="/assets/{{ kind }}/{{ asset.id }}/delete" onsubmit="return confirm('Move this asset to the Atlas trash?')"><button class="button button-danger-ghost" type="submit">Move to trash</button></form>{% endif %}
+      </div>
+    </header>
+
+    <div class="detail-layout">
+      <section class="detail-main">
+        <div class="detail-preview">
+          {% if kind == 'images' and asset.state == 'active' %}
+            <img src="{{ media_url }}/media/{{ asset.id }}/w960" alt="{{ asset.original.filename or 'Preview' }}">
+          {% else %}
+            <div class="preview-placeholder preview-large"><span>▧</span><small>{{ asset.state }} · {{ asset.original.content_type }}</small></div>
+          {% endif %}
+        </div>
+        <div class="section-heading"><h2>Renditions</h2><span class="muted small">{{ asset.renditions|length }} widths</span></div>
+        {% if asset.renditions %}
+          <div class="table-wrap"><table class="data-table"><thead><tr><th>Profile</th><th>Output</th><th>Formats</th><th>URL</th></tr></thead><tbody>
+          {% for r in asset.renditions %}<tr><td>{{ r.max_width }}w</td><td>{{ r.width }} × {{ r.height }}</td><td>{% for f in r.formats %}<span class="mini-tag">{{ f }}</span>{% endfor %}</td><td><a class="copy-link" href="{{ media_url ~ r.url }}" data-copy="{{ media_url ~ r.url }}">Copy URL</a></td></tr>{% endfor %}
+        </tbody></table></div>
+        {% if srcset %}
+        {% set snippet = '<img src="' ~ srcset.src ~ '" srcset="' ~ srcset.srcset ~ '" sizes="100vw" alt="…">' %}
+        <div class="code-snippet"><div class="code-label">Responsive image · from Atlas srcset</div><code>{{ snippet }}</code><button class="copy-button" data-copy="{{ snippet }}">Copy</button></div>
+        {% endif %}
+        {% else %}<p class="muted">This asset has no image renditions.</p>{% endif %}
+      </section>
+
+      <aside class="detail-side">
+        <section class="panel"><div class="section-heading"><h2>Original</h2><a href="{{ media_url }}/media/{{ asset.id }}/original" class="text-link">Download ↗</a></div>
+          <dl class="properties"><dt>Type</dt><dd>{{ asset.original.content_type }}</dd><dt>Size</dt><dd>{{ asset.original.bytes|human_bytes }}</dd><dt>Dimensions</dt><dd>{{ asset.original.width or '—' }} × {{ asset.original.height or '—' }}</dd><dt>Added</dt><dd>{{ asset.created_at|time }}</dd><dt>SHA-256</dt><dd><code class="hash">{{ asset.original.sha256 }}</code></dd><dt>State</dt><dd><span class="state-chip state-{{ asset.state }}">{{ asset.state }}</span></dd><dt>Pinned</dt><dd>{{ 'Yes' if asset.pinned else 'No' }}</dd></dl>
+        </section>
+        <section class="panel honest-panel"><div class="eyebrow">About references</div><p>Atlas does not know what uses this asset. That information belongs to the site that uses it.</p></section>
+      </aside>
+    </div>
+  {% endif %}
+{% endblock %}

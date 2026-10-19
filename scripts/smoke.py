@@ -22,15 +22,20 @@ Exit codes: 0 all checks passed, 1 a check failed, 2 the harness itself failed.
 from __future__ import annotations
 
 import argparse
+import html
+import http.cookiejar
 import json
 import os
+import re
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from pathlib import Path
@@ -400,7 +405,7 @@ def check_api(checks: Checks) -> None:
     print("\n== a consumer's own data ==", flush=True)
     # Deliberately awkward: unicode, markup, and something that only looks like
     # JSON. It has to come back exactly as it went in.
-    opaque = "Прогулки\n<em>с Alder</em> — {\"looks\": \"like json\"}"
+    opaque = 'Прогулки\n<em>с Alder</em> — {"looks": "like json"}'
     status, _ = checks.request(
         "PUT",
         f"/api/v1/documents/{document_id}/data",
@@ -421,18 +426,14 @@ def check_api(checks: Checks) -> None:
     _, cleared = checks.request("GET", f"/api/v1/documents/{document_id}")
     checks.true("  and clearable", "data" not in cleared)
 
-    checks.request(
-        "PUT", f"/api/v1/documents/{document_id}/data", {"data": "keep me"}
-    )
+    checks.request("PUT", f"/api/v1/documents/{document_id}/data", {"data": "keep me"})
     _, listed = checks.request("GET", "/api/v1/documents")
     entry = next(
         (a for a in listed["assets"] if a["id"] == document_id),
         {},
     )
     checks.true("  absent from listings", "data" not in entry)
-    _, searched = checks.request(
-        "GET", "/api/v1/documents?q=keep%20me"
-    )
+    _, searched = checks.request("GET", "/api/v1/documents?q=keep%20me")
     checks.ok("  and never searched", searched["total"], 0)
 
     checks.ok(
@@ -446,9 +447,9 @@ def check_api(checks: Checks) -> None:
     )
     checks.ok(
         "  addressed by collection",
-        checks.request(
-            "PUT", f"/api/v1/images/{document_id}/data", {"data": "wrong"}
-        )[0],
+        checks.request("PUT", f"/api/v1/images/{document_id}/data", {"data": "wrong"})[
+            0
+        ],
         404,
     )
 
@@ -722,12 +723,236 @@ def check_example_client(checks: Checks, port: int) -> None:
     checks.ok("client restore", fetched("images", image.id).state, "active")
 
 
+def check_dashboard(checks: Checks, binary: Path, atlas_port: int, port: int) -> None:
+    """Walk the CMS admin's real UI against this real Atlas process.
+
+    This is not a mocked service test: upload, listing, detail, pin, delete,
+    trash and restore all cross both actual HTTP servers. The dashboard binary
+    is built separately because it is a standalone example crate.
+    """
+    print("\n== CMS admin consumer ==", flush=True)
+    if not binary.is_file():
+        checks.skip(
+            "CMS admin",
+            f"no binary at {binary}. Build it with: cargo build --manifest-path examples/cms-admin/Cargo.toml",
+        )
+        return
+
+    with tempfile.TemporaryDirectory(prefix="atlas-dashboard-smoke-") as temporary:
+        log_path = Path(temporary) / "dashboard.log"
+        environment = dict(os.environ)
+        environment.update(
+            ATLAS_API_URL=f"http://127.0.0.1:{atlas_port}",
+            ATLAS_API_TOKEN=TOKEN,
+            ADMIN_PASSWORD="dashboard-smoke-password",
+            ADMIN_LISTEN=f"127.0.0.1:{port}",
+        )
+        with log_path.open("wb") as log:
+            process = subprocess.Popen(
+                [str(binary)],
+                env=environment,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        base = f"http://127.0.0.1:{port}"
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise HarnessError(
+                        f"CMS admin exited ({process.returncode}): "
+                        f"{log_path.read_text(errors='replace')}"
+                    )
+                try:
+                    with urllib.request.urlopen(f"{base}/login", timeout=1) as response:
+                        if response.status == 200:
+                            break
+                except (urllib.error.URLError, OSError):
+                    time.sleep(0.1)
+            else:
+                raise HarnessError(
+                    f"CMS admin did not start within 15s: "
+                    f"{log_path.read_text(errors='replace')}"
+                )
+
+            cookies = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(cookies)
+            )
+
+            def page(
+                path: str, data: bytes | None = None, content_type: str | None = None
+            ):
+                headers = {"Content-Type": content_type} if content_type else {}
+                request = urllib.request.Request(
+                    base + path, data=data, headers=headers
+                )
+                try:
+                    with opener.open(request, timeout=30) as response:
+                        return response.status, response.read().decode(
+                            "utf-8", "replace"
+                        )
+                except urllib.error.HTTPError as error:
+                    return error.code, error.read().decode("utf-8", "replace")
+
+            status, _login_page = page("/login")
+            checks.ok("login page", status, 200)
+            login_body = urllib.parse.urlencode(
+                {"password": "dashboard-smoke-password", "next": "/library"}
+            ).encode()
+            status, _ = page("/login", login_body, "application/x-www-form-urlencoded")
+            checks.ok("shared-password login", status, 200)
+            status, library = page("/library")
+            checks.ok("protected library", status, 200)
+            checks.true(
+                "library page renders", "Library" in library and "Images" in library
+            )
+
+            boundary = "atlas-dashboard-smoke-boundary"
+            payload = png_bytes()
+            multipart = (
+                (
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="kind"\r\n\r\nimages\r\n'
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="dashboard.png"\r\n'
+                    "Content-Type: image/png\r\n\r\n"
+                ).encode()
+                + payload
+                + f"\r\n--{boundary}--\r\n".encode()
+            )
+            status, upload_result = page(
+                "/upload", multipart, f"multipart/form-data; boundary={boundary}"
+            )
+            checks.ok("upload through dashboard", status, 200)
+            checks.true("upload reports result", "dashboard.png" in upload_result)
+
+            status, library = page("/library")
+            checks.ok("uploaded asset appears in library", status, 200)
+            checks.true(
+                "grid previews point at Atlas's public media base",
+                f"http://127.0.0.1:{atlas_port}/media/" in html.unescape(library),
+            )
+            asset = re.search(r'href="/assets/images/([a-z0-9]+)"', library)
+            checks.true("library exposes a detail link", asset is not None)
+            if asset is None:
+                return
+            asset_id = asset.group(1)
+
+            status, detail = page(f"/assets/images/{asset_id}")
+            checks.ok("asset detail", status, 200)
+            checks.true(
+                "detail offers a ready-made srcset", "Responsive image" in detail
+            )
+            checks.true(
+                "detail links point at Atlas's public media base",
+                f"http://127.0.0.1:{atlas_port}/media/" in html.unescape(detail),
+            )
+            checks.true(
+                "dashboard does not surface consumer data yet",
+                "Consumer data" not in detail,
+            )
+
+            status, _ = page(
+                f"/assets/images/{asset_id}/pin",
+                b"",
+                "application/x-www-form-urlencoded",
+            )
+            checks.ok("pin action", status, 200)
+            status, _ = page(
+                f"/assets/images/{asset_id}/delete",
+                b"",
+                "application/x-www-form-urlencoded",
+            )
+            checks.ok("move to trash", status, 200)
+            status, trash = page("/trash")
+            checks.ok("global trash page", status, 200)
+            checks.true(
+                "trash entry has its collection",
+                f"/trash/image/{asset_id}/restore" in trash,
+            )
+            status, _ = page(
+                f"/trash/image/{asset_id}/restore",
+                b"",
+                "application/x-www-form-urlencoded",
+            )
+            checks.ok("restore using trash kind", status, 200)
+            status, restored = page("/library")
+            checks.ok("restored asset appears again", status, 200)
+            checks.true("restored asset is listed", asset_id in restored)
+
+            status, bulk = page(
+                "/bulk",
+                urllib.parse.urlencode(
+                    {"kind": "images", "action": "pin", "ids": asset_id}
+                ).encode(),
+                "application/x-www-form-urlencoded",
+            )
+            checks.ok("bulk action through dashboard", status, 200)
+            checks.true("  outcome is surfaced", "pin" in bulk.lower())
+
+            # The same picture stored as a document must use documents for its
+            # typed detail/delete routes, even though its MIME type is image/png.
+            form = (
+                (
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="kind"\r\n\r\ndocuments\r\n'
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="whole.png"\r\n'
+                    "Content-Type: image/png\r\n\r\n"
+                ).encode()
+                + payload
+                + f"\r\n--{boundary}--\r\n".encode()
+            )
+            status, document_upload = page(
+                "/upload", form, f"multipart/form-data; boundary={boundary}"
+            )
+            checks.ok("image stored whole as a document", status, 200)
+            checks.true("  upload was accepted", "whole.png" in document_upload)
+            status, documents = page("/library?kind=documents")
+            checks.ok("documents collection page", status, 200)
+            document = re.search(r'href="/assets/documents/([a-z0-9]+)"', documents)
+            checks.true("  document detail uses its collection", document is not None)
+            if document is not None:
+                document_id = document.group(1)
+                status, _ = page(
+                    f"/assets/documents/{document_id}/delete",
+                    b"",
+                    "application/x-www-form-urlencoded",
+                )
+                checks.ok("  document delete route", status, 200)
+                status, trash = page("/trash")
+                checks.ok("  document appears in trash", status, 200)
+                checks.true(
+                    "    with its collection",
+                    f"/trash/document/{document_id}/restore" in trash,
+                )
+                status, _ = page(
+                    f"/trash/document/{document_id}/restore",
+                    b"",
+                    "application/x-www-form-urlencoded",
+                )
+                checks.ok("    restores through documents", status, 200)
+
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--bin", type=Path, default=REPO / "target" / "debug" / "atlas")
+    parser.add_argument(
+        "--dashboard-bin",
+        type=Path,
+        default=REPO / "examples" / "cms-admin" / "target" / "debug" / "cms-admin",
+    )
     parser.add_argument(
         "--data",
         type=Path,
@@ -760,6 +985,9 @@ def main() -> int:
         check_api(checks)
         if not arguments.no_client:
             check_example_client(checks, arguments.port)
+        check_dashboard(
+            checks, arguments.dashboard_bin, arguments.port, arguments.port + 1
+        )
 
     summary = f"{checks.total - checks.failures}/{checks.total} checks passed"
     if checks.skipped:

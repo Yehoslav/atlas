@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Library{% endblock %}
+{% block content %}
+  <header class="page-header">
+    <div><div class="eyebrow">Your media</div><h1>Library</h1><p class="page-subtitle">Browse the assets Atlas stores for your site.</p></div>
+    <a class="button button-primary" href="/upload"><span aria-hidden="true">↑</span> Upload media</a>
+  </header>
+
+  <section class="toolbar-panel" aria-label="Library filters">
+    <form id="library-filter" class="filter-row" method="get" action="/library"
+      hx-get="/library" hx-target="#library-results" hx-swap="innerHTML" hx-trigger="submit, change, keyup changed delay:300ms from:#search">
+      <div class="segmented" role="group" aria-label="Collection">
+        <button type="submit" name="kind" value="images" class="segment {% if kind == 'images' %}selected{% endif %}">Images</button>
+        <button type="submit" name="kind" value="documents" class="segment {% if kind == 'documents' %}selected{% endif %}">Documents</button>
+      </div>
+      <label class="search-box"><span aria-hidden="true">⌕</span><input id="search" name="q" type="search" value="{{ query.q or '' }}" placeholder="Search filenames…" autocomplete="off"></label>
+      <select class="select-control" name="state" aria-label="State">
+        {% for value, label in [('active','Active'),('deleted','Deleted'),('purged','Purged'),('all','All states')] %}
+          <option value="{{ value }}" {% if (query.state or 'active') == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <select class="select-control" name="sort" aria-label="Sort by">
+        {% for value, label in [('created_at','Date added'),('bytes','File size'),('width','Width'),('filename','Filename')] %}
+          <option value="{{ value }}" {% if (query.sort or 'created_at') == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <select class="select-control" name="mime" aria-label="Media type">
+        <option value="">All types</option>
+        {% if formats %}
+        {% set accepted = formats.images if kind == 'images' else formats.documents %}
+        {% for type in accepted.formats %}
+          <option value="{{ type }}" {% if query.mime == type %}selected{% endif %}>{{ type }}</option>
+        {% endfor %}
+        {% endif %}
+      </select>
+      <input type="hidden" name="order" value="{{ query.order or 'desc' }}">
+      <input type="hidden" name="page" value="1">
+    </form>
+    {% if formats %}
+      <div class="format-hint"><span class="status-dot"></span> Atlas accepts {{ formats.images.formats|length }} image formats · <a href="/upload">See upload types</a></div>
+    {% endif %}
+  </section>
+
+  <div id="library-results">
+    {% if error %}<div class="notice notice-error">{{ error }}</div>{% endif %}
+    {% include "partials/library-results.html" %}
+  </div>
+{% endblock %}

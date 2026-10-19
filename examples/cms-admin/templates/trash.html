@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Trash · Library{% endblock %}
+{% block content %}
+  <header class="page-header"><div><div class="eyebrow">Lifecycle</div><h1>Trash</h1><p class="page-subtitle">Atlas keeps deleted bytes for its retention window; purged entries are tombstones.</p></div></header>
+  {% if error %}<div class="notice notice-error">{{ error }}</div>
+  {% elif trash.assets %}
+    <div class="results-header"><span class="results-count"><strong>{{ trash.total }}</strong> items in Atlas trash</span></div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Asset</th><th>Collection</th><th>State</th><th>Type</th><th>Size</th><th>Deleted</th><th></th></tr></thead><tbody>
+      {% for item in trash.assets %}<tr><td><a href="/assets/{{ item.kind }}/{{ item.id }}">{{ item.id }}</a></td><td>{{ item.kind }}</td><td><span class="state-chip state-{{ item.state }}">{{ item.state }}</span>{% if item.pinned %}<span class="pin-chip">pinned</span>{% endif %}</td><td>{{ item.content_type }}</td><td>{{ item.bytes|human_bytes }}</td><td>{{ item.deleted_at|time }}</td><td>{% if item.state == 'deleted' %}<form method="post" action="/trash/{{ item.kind }}/{{ item.id }}/restore"><button class="button button-secondary button-small" type="submit">Restore</button></form>{% else %}<span class="muted small">Purged</span>{% endif %}</td></tr>{% endfor %}
+    </tbody></table></div>
+  {% else %}<div class="empty-state"><div class="empty-icon">⌫</div><h2>Trash is empty</h2><p>Deleted assets will appear here until Atlas purges them.</p></div>{% endif %}
+{% endblock %}

@@ -331,6 +331,7 @@ mod tests {
         let config = Config::from_env().unwrap();
         assert_eq!(config.listen_addr, "127.0.0.1:3000");
         assert_eq!(config.id_length, super::DEFAULT_LENGTH);
+        assert_eq!(config.max_consumer_data_bytes, 64 * 1024);
         assert_eq!(config.variant_widths, vec![320, 640, 960, 1280]);
     }
 
@@ -346,6 +347,7 @@ mod tests {
             listen_addr = "0.0.0.0:9000"
             variant_widths = [400, 800]
             max_image_bytes = 1234
+            max_consumer_data_bytes = 8192
             "#,
         );
         set_var("ATLAS_CONFIG", &path.display().to_string());
@@ -355,6 +357,7 @@ mod tests {
         assert_eq!(config.listen_addr, "0.0.0.0:9000");
         assert_eq!(config.variant_widths, vec![400, 800]);
         assert_eq!(config.max_image_bytes, 1234);
+        assert_eq!(config.max_consumer_data_bytes, 8192);
     }
 
     #[test]

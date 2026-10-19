@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Sign in · Atlas Admin</title>
+    <link rel="stylesheet" href="/static/vendor/catppuccin.css">
+    <link rel="stylesheet" href="/static/app.css">
+  </head>
+  <body class="login-body">
+    <main class="login-card">
+      <a class="wordmark login-wordmark" href="/"><span class="wordmark-mark">a</span> atlas<span class="wordmark-sub">/ admin</span></a>
+      <div class="eyebrow">Private media library</div>
+      <h1>Welcome back</h1>
+      <p class="muted">Sign in with the dashboard password.</p>
+      {% if error %}<div class="flash flash-error" role="alert">{{ error }}</div>{% endif %}
+      <form method="post" action="/login" class="stack-form">
+        <input type="hidden" name="next" value="{{ next }}">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+        <button class="button button-primary button-wide" type="submit">Sign in <span aria-hidden="true">→</span></button>
+      </form>
+      <p class="login-footnote"><span class="lock-icon">⌑</span> Your Atlas token stays on this server.</p>
+    </main>
+  </body>
+</html>

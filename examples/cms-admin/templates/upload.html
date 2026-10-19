@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Upload · Library{% endblock %}
+{% block content %}
+  <header class="page-header"><div><div class="eyebrow">Add to Atlas</div><h1>Upload media</h1><p class="page-subtitle">Atlas validates the bytes, keeps the original, and makes configured renditions for images.</p></div></header>
+  {% if error %}<div class="notice notice-error">{{ error }}</div>{% endif %}
+  <section class="upload-panel">
+    <form id="upload-form" method="post" action="/upload" enctype="multipart/form-data">
+      <div class="upload-kind-row">
+        <label for="upload-kind">Store in</label>
+        <select id="upload-kind" class="select-control" name="kind">
+          <option value="images">Images · generate renditions</option>
+          <option value="documents">Documents · preserve untouched</option>
+        </select>
+      </div>
+      <label class="drop-zone" id="drop-zone" for="files">
+        <input id="files" name="files" type="file" multiple required>
+        <span class="drop-icon">↑</span><strong>Drop files here, or <em>browse</em></strong>
+        <span class="muted small">Originals stay untouched · images get renditions · documents do not</span>
+        {% if formats %}<span class="format-list">Images: {{ formats.images.formats|join(', ') }}<br>Documents: PDF, Word, or any accepted image stored whole</span>{% endif %}
+      </label>
+      <div id="upload-queue" class="upload-queue" aria-live="polite"></div>
+      <div class="upload-actions"><button id="upload-button" class="button button-primary" type="submit" disabled>Upload selected files</button><a class="button button-ghost" href="/library">Cancel</a></div>
+    </form>
+    <div id="upload-progress" class="progress-wrap" hidden><div class="progress-label"><span id="progress-name">Uploading…</span><span id="progress-percent">0%</span></div><div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div></div>
+    <div id="upload-results">{% if results %}{% include "partials/upload-results.html" %}{% endif %}</div>
+  </section>
+{% endblock %}
+{% block scripts %}<script defer src="/static/upload.js"></script>{% endblock %}

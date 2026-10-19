@@ -339,20 +339,19 @@ Atlas with an in-memory fake. Neither can notice when the two disagree about the
 API, which is a real risk when one side is written by the same hand as the other.
 `scripts/smoke.py` starts the built binary on a throwaway data directory, checks
 the HTTP contract over a real socket with real conversions, points the example
-consumer's own client at it, and always stops the server afterwards:
+consumers' own clients at it, and always stops the servers afterwards:
 
 ```sh
 cargo build
-python -m venv examples/family-album/.venv
-examples/family-album/.venv/bin/pip install -q -r examples/family-album/requirements-dev.txt
-examples/family-album/.venv/bin/python scripts/smoke.py
+cargo build --manifest-path examples/cms-admin/Cargo.toml
+nix develop --command python3 scripts/smoke.py
 ```
 
 It exits non-zero on the first failed expectation, prints which checks were
 skipped rather than reporting them as passes, and needs no arguments: the port,
 binary, and data directory all have defaults that `--port`, `--bin` and `--data`
-can override. The album client check is skipped, not silently passed, when
-`requests` is not importable.
+can override. It checks the HTTP contract, the album's real Python client, and
+— when its binary exists — the CMS admin UI against the same real Atlas.
 
 ## Example consumer
 
@@ -372,9 +371,30 @@ ruff format --check .
 ty check
 ```
 
-`requirements-dev.txt` adds the test and lint tools. `ty check` needs the
-virtualenv active so it can see Flask and `requests`; run it from this
-directory or from the repository root, not from a bare interpreter.
+`requirements-dev.txt` adds the standalone test and lint tools. The repository's
+Nix development shell also provides Python, Flask, requests, pytest, ruff and
+ty at pinned versions, so `nix develop` is the reproducible path.
+
+### CMS Admin
+
+[`examples/cms-admin/`](examples/cms-admin/) is a second first-party consumer,
+written in Rust, that exercises the same API from a different kind of site. It
+is a standalone crate and does not depend on the Atlas crate: all reads and
+mutations go through HTTP. It provides a password-protected media library with
+search, filters, bulk actions, upload progress, asset detail, and the global
+trash. Its Catppuccin Mocha / HTMX frontend has no Node build step; vendored
+assets and their licences are recorded in the example.
+
+```sh
+nix develop
+export ATLAS_API_URL='http://127.0.0.1:3000'
+export ATLAS_API_TOKEN='the-same-long-random-secret-as-Atlas'
+export ADMIN_PASSWORD='a-long-random-password'
+cargo run --manifest-path examples/cms-admin/Cargo.toml
+```
+
+The dashboard is stateless. It deliberately does not claim to know what uses
+an asset: only the consuming site's own content database can answer that.
 
 ## Configuration
 
@@ -395,6 +415,7 @@ variant_widths = [320, 640, 960, 1280]
 
 max_image_bytes = 20971520
 max_document_bytes = 52428800
+max_consumer_data_bytes = 65536
 max_image_pixels = 40000000
 max_image_dimension = 12000
 

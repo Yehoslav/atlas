@@ -1,0 +1,1 @@
+<div class="upload-results"><h2>Upload results</h2><ul>{% for filename, ok, message in results %}<li class="upload-result {% if ok %}result-ok{% else %}result-error{% endif %}"><span class="result-mark">{% if ok %}✓{% else %}!{% endif %}</span><span><strong>{{ filename }}</strong><small>{{ message }}</small></span></li>{% endfor %}</ul></div>

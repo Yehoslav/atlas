@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>{% block title %}Library{% endblock %} · Atlas</title>
+    <link rel="stylesheet" href="/static/vendor/catppuccin.css">
+    <link rel="stylesheet" href="/static/app.css">
+    <script defer src="/static/vendor/htmx.min.js"></script>
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <a class="wordmark" href="/library"><span class="wordmark-mark">a</span> atlas<span class="wordmark-sub">/ admin</span></a>
+        <div class="sidebar-label">Workspace</div>
+        <nav class="side-nav" aria-label="Main navigation">
+          <a href="/library" class="{% if active == 'library' %}active{% endif %}"><span class="nav-icon">▦</span> Library</a>
+          <a href="/trash" class="{% if active == 'trash' %}active{% endif %}"><span class="nav-icon">⌫</span> Trash</a>
+          <a href="/upload" class="{% if active == 'upload' %}active{% endif %}"><span class="nav-icon">↑</span> Upload</a>
+        </nav>
+        {% if summary %}
+        <div class="sidebar-label sidebar-label-spaced">Storage</div>
+        <div class="storage-card">
+          <div class="storage-number">{{ summary.total.count }}</div>
+          <div class="storage-caption">assets · {{ summary.total.bytes|human_bytes }}</div>
+          <div class="storage-split"><span><i class="dot dot-mauve"></i> {{ summary.images.count }} images</span><span>{{ summary.documents.count }} docs</span></div>
+        </div>
+        {% endif %}
+        <div class="sidebar-bottom">
+          <span class="status-dot"></span><span>Connected to Atlas</span>
+          <form method="post" action="/logout"><button class="link-button" type="submit">Sign out</button></form>
+        </div>
+      </aside>
+      <main class="main-content">
+        {% if flash %}<div class="flash {% if flash_error %}flash-error{% endif %}" role="status">{{ flash }}</div>{% endif %}
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>

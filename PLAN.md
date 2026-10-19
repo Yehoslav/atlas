@@ -280,7 +280,7 @@ unprocessable media, and `406` when no stored format matches the request's
 file that is not on disk is a `500`, not a `404`: the request was valid and
 storage is damaged.
 
-## Example consumer
+## Example consumers
 
 `examples/family-album/` is a small Flask application that consumes Atlas the way
 a real site would. It owns a SQLite database of folders, descriptions, alt text,
@@ -288,6 +288,14 @@ tags, posts, and references; it holds the API token server-side; it deletes only
 after checking its own posts for published references; and it uses the stored
 rendition widths in `srcset`. It exists to prove the integration contract from
 the consumer side and is not part of the service.
+
+`examples/cms-admin/` is a second, standalone Rust consumer. It has no
+dependency on the Atlas crate; all media operations cross the HTTP API. It is a
+stateless, password-protected operator dashboard, with a Catppuccin Mocha / HTMX
+frontend and no Node build step. Together the examples exercise two different
+consumers and two languages against the same API. The dashboard deliberately
+does not claim to know what uses an asset: Atlas cannot know what its consumers
+do with media, and only a consumer with its own content database can answer.
 
 
 ## Operations
@@ -347,7 +355,7 @@ the consumer side and is not part of the service.
 
 ## Deferred scope
 
-- Admin UI and browser upload grants
+- Browser upload grants
 - Rich tagging and folder hierarchy beyond the flat opaque labels above
 - PDF/office rendering, OCR, and document conversion
 - Video transcoding and thumbnail pipelines

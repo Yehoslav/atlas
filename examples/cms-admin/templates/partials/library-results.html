@@ -1,0 +1,51 @@
+<div class="results-header">
+  <span class="results-count"><strong>{{ total }}</strong> {% if total == 1 %}asset{% else %}assets{% endif %}</span>
+  <form id="bulk-form" method="post" action="/bulk" class="bulk-controls" onsubmit="return prepareBulk(this)">
+    <input type="hidden" name="kind" value="{{ kind }}">
+    <input type="hidden" name="ids" value="">
+    <span id="selected-count" class="muted small">0 selected</span>
+    <select name="action" class="select-control select-small" aria-label="Bulk action">
+      <option value="pin">Pin</option><option value="unpin">Unpin</option><option value="delete">Move to trash</option><option value="restore">Restore</option>
+    </select>
+    <button class="button button-secondary button-small" type="submit" id="bulk-submit" disabled>Apply</button>
+  </form>
+</div>
+
+{% if assets %}
+<div class="asset-grid">
+  {% for asset in assets %}
+    {% set cover = asset.renditions|first %}
+    <article class="asset-card">
+      <div class="asset-preview">
+        <label class="select-asset" title="Select asset"><input type="checkbox" class="asset-checkbox" value="{{ asset.id }}" onchange="selectionChanged()"><span></span></label>
+        <a href="/assets/{{ kind }}/{{ asset.id }}" class="preview-link">
+          {% if kind == 'images' and cover and asset.state == 'active' %}
+            <img src="{{ media_url ~ cover.url }}" alt="" loading="lazy">
+          {% elif kind == 'images' %}
+            <div class="preview-placeholder"><span>{% if asset.state == 'purged' %}⌫{% else %}▧{% endif %}</span><small>{{ asset.state }}</small></div>
+          {% else %}
+            <div class="document-preview"><span class="doc-icon">▤</span><span class="doc-type">{{ asset.original.content_type|mime_suffix|upper }}</span></div>
+          {% endif %}
+        </a>
+        <span class="state-chip state-{{ asset.state }}">{{ asset.state }}</span>
+      </div>
+      <div class="asset-card-body">
+        <a class="asset-name" href="/assets/{{ kind }}/{{ asset.id }}">{{ asset.original.filename or asset.id }}</a>
+        <div class="asset-meta"><span>{{ asset.original.bytes|human_bytes }}</span><span>{{ asset.original.width or '—' }} × {{ asset.original.height or '—' }}</span></div>
+        <div class="asset-footer"><code>{{ asset.id }}</code>{% if asset.pinned %}<span class="pin-chip">pinned</span>{% endif %}</div>
+      </div>
+    </article>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state"><div class="empty-icon">⌕</div><h2>No assets found</h2><p>Try a different search or filter, or upload something new.</p><a class="button button-secondary" href="/upload">Upload media</a></div>
+{% endif %}
+
+{% set pages = ((total + limit - 1) // limit) if limit else 1 %}
+{% if pages > 1 %}
+<nav class="pagination" aria-label="Library pages">
+  {% if page > 1 %}<a class="button button-secondary button-small" href="/library?kind={{ kind }}&state={{ query.state or 'active' }}&q={{ query.q or '' }}&page={{ page - 1 }}">← Newer</a>{% else %}<span></span>{% endif %}
+  <span class="muted small">Page {{ page }} of {{ pages }}</span>
+  {% if page < pages %}<a class="button button-secondary button-small" href="/library?kind={{ kind }}&state={{ query.state or 'active' }}&q={{ query.q or '' }}&page={{ page + 1 }}">Older →</a>{% else %}<span></span>{% endif %}
+</nav>
+{% endif %}

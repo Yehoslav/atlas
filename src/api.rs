@@ -3961,6 +3961,16 @@ mod tests {
         let expired = upload_document(&app(state.clone()), b"%PDF-1.7\nexpired").await;
         let kept = upload_document(&app(state.clone()), b"%PDF-1.7\tkept").await;
         let router = app(state.clone());
+        let (status, _) = send(
+            &router,
+            json_request(
+                "PUT",
+                &format!("/api/v1/documents/{expired}/data"),
+                &serde_json::json!({"data": "the consumer's note outlives its bytes"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
         place_in_trash(&router, "documents", &expired).await;
         place_in_trash(&router, "documents", &kept).await;
 
@@ -3994,6 +4004,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "purged");
+        assert_eq!(
+            body["data"], "the consumer's note outlives its bytes",
+            "tombstoning the media does not erase what the consumer knows"
+        );
         assert!(body["purged_at"].is_i64());
         assert_eq!(
             body["renditions"].as_array().unwrap().len(),

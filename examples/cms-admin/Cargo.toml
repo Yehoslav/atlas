@@ -12,14 +12,17 @@ license = "GPL-3.0-only"
 [workspace]
 
 [dependencies]
-axum = { version = "0.8", features = ["macros"] }
-futures-util = "0.3"
+axum = { version = "0.8", features = ["multipart"] }
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+getrandom = "0.3"
 minijinja = { version = "2", features = ["loader"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal"] }
+subtle = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 tower-http = { version = "0.6", features = ["fs"] }
 
 [dev-dependencies]
-tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

@@ -118,10 +118,11 @@ Placed at `examples/family-album/`.
 
 ### For the CMS admin dashboard example
 
-- [ ] **`kind` in the trash listing.** `GET /api/v1/trash` does not say which
-      collection an entry is in, so a consumer listing the whole trash cannot
-      address a per-entry restore. The album never hit this because it lists its
-      own deletions; a dashboard is the consumer that does need it.
+- [x] **`kind` in the trash listing.** `GET /api/v1/trash` now names the
+      collection each entry is in, so a consumer listing the whole trash can
+      address a per-entry restore. The CMS Admin example exercises it with an
+      image stored as a document, where the content type alone would point at
+      the wrong collection.
 
 ## Things that got through, and why
 
@@ -141,4 +142,3 @@ Worth keeping because each shipped green and each was found by hand:
   a draft badge for a case it could never receive.
 - **Check the sibling queries.** The folder count in the sidebar kept counting
   soft-deleted photos, one clause below the query that had just been changed.
-
