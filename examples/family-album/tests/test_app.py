@@ -237,6 +237,56 @@ def test_upload_stores_the_asset_and_its_widths(client, atlas):
     assert "w1280w" not in body
 
 
+def test_a_file_that_is_not_raw_is_not_advised_to_be_converted(client, atlas):
+    """The old message told every rejected file to be converted from raw.
+
+    A text file has nothing to do with a camera, so being told to convert it
+    told the person nothing at all.
+    """
+    response = client.post(
+        "/upload",
+        data={"photos": (io.BytesIO(b"notes"), "notes.txt")},
+        content_type="multipart/form-data",
+    )
+    body = response.get_data(as_text=True)
+
+    assert "does not know what to do with this file type" in body
+    assert "raw" not in body.lower().replace("already", ""), (
+        "a text file should not be told about camera raw"
+    )
+    assert len(atlas.assets) == 0
+
+
+def test_the_album_uploads_the_formats_atlas_now_accepts(client, atlas):
+    """A file Atlas produces should be uploadable, and a phone photo too.
+
+    `.heif` is deliberately not here: it is a container family rather than a
+    format, so the album will not guess what is inside it.
+    """
+    for extension, expected_kind in [
+        ("avif", "image"),
+        ("jxl", "image"),
+        ("heic", "image"),
+    ]:
+        response = client.post(
+            "/upload",
+            data={
+                "photos": (
+                    io.BytesIO(png_bytes(extension)),
+                    f"photo.{extension}",
+                )
+            },
+            content_type="multipart/form-data",
+        )
+        assert response.status_code == 200, extension
+        body = response.get_data(as_text=True)
+        assert "result-failed" not in body, f"{extension} was refused"
+
+    kinds = {asset.collection for asset in atlas.assets.values()}
+    assert kinds == {"images"}, "all three went to the images collection"
+    assert len(atlas.assets) == 3
+
+
 def test_bulk_upload_reports_each_file_separately(client, atlas):
     response = client.post(
         "/upload",
@@ -251,7 +301,7 @@ def test_bulk_upload_reports_each_file_separately(client, atlas):
     )
     body = response.get_data(as_text=True)
     assert "one.png" in body and "three.png" in body
-    assert "camera RAW" in body
+    assert "camera raw file" in body
     assert len(atlas.assets) == 2
 
 

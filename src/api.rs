@@ -283,9 +283,12 @@ async fn upload_into(
         .ok_or_else(|| {
             ApiError::unsupported(match kind {
                 Kind::Image => {
-                    "The images collection accepts image/jpeg, image/png and image/webp."
+                    "The images collection accepts image/jpeg, image/png, image/webp, \
+                     image/avif, image/jxl and image/heic. GET /api/v1/formats lists them."
                 }
-                Kind::Document => "This file type is not accepted.",
+                Kind::Document => {
+                    "This file type is not accepted. GET /api/v1/formats lists what is."
+                }
             })
         })?;
     // The byte limit follows the format, not the collection: an image stored as
@@ -867,14 +870,8 @@ fn parse_mime(value: &str, kind: Kind) -> Result<Vec<&'static str>, ApiError> {
         return Err(ApiError::bad_request(
             "invalid_mime",
             format!(
-                "{value} cannot match the {} collection, which holds {}.",
+                "{value} cannot match the {} collection. GET /api/v1/formats lists what it holds.",
                 kind.slug(),
-                mime_list(
-                    &SourceFormat::ALL
-                        .into_iter()
-                        .filter(|format| kind.accepts(*format))
-                        .collect::<Vec<_>>(),
-                ),
             ),
         ));
     }
@@ -882,29 +879,17 @@ fn parse_mime(value: &str, kind: Kind) -> Result<Vec<&'static str>, ApiError> {
     Ok(selectable.iter().map(|format| format.key()).collect())
 }
 
-/// The accepted values, for an error message. Long, but a caller who gets
-/// this wrong once should not have to guess the spelling next time.
 fn invalid_mime() -> ApiError {
     ApiError::bad_request(
         "invalid_mime",
-        format!(
-            "mime must be one of {} or a group such as image/*.",
-            mime_list(&SourceFormat::ALL)
-        ),
+        "mime must be an accepted media type, such as image/png, or a group such \
+         as image/*. GET /api/v1/formats lists them.",
     )
 }
 
-/// A readable list, because it ends up in a sentence a person reads.
-fn mime_list(formats: &[SourceFormat]) -> String {
-    let names = formats
-        .iter()
-        .map(|format| format.mime_type())
-        .collect::<Vec<_>>();
-    match names.as_slice() {
-        [] => String::new(),
-        [only] => (*only).to_owned(),
-        [rest @ .., last] => format!("{rest} and {last}", rest = rest.join(", ")),
-    }
+/// The media types of a set of formats, in the order they were given.
+fn mime_list(formats: &[SourceFormat]) -> Vec<&'static str> {
+    formats.iter().map(|format| format.mime_type()).collect()
 }
 
 impl ListParams {
@@ -1012,6 +997,55 @@ pub(super) async fn summary(
 pub(super) struct CollectionSummary {
     count: i64,
     bytes: i64,
+}
+
+/// What each collection accepts.
+///
+/// Derived from the same enum the upload path validates against, so this cannot
+/// describe a list Atlas will then reject: a consumer building an upload form
+/// reads it instead of hardcoding types that drift on the next release.
+pub(super) async fn list_formats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<FormatsResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let for_kind = |kind: Kind| -> AcceptedFormats {
+        let formats = SourceFormat::ALL
+            .into_iter()
+            .filter(|format| kind.accepts(*format))
+            .collect::<Vec<_>>();
+        // The groups a `mime` filter may name for this collection: the type
+        // prefixes that actually appear among the formats above.
+        let mut groups = formats
+            .iter()
+            .filter_map(|format| format.mime_type().split_once('/'))
+            .map(|(prefix, _)| format!("{prefix}/*"))
+            .collect::<Vec<_>>();
+        groups.sort();
+        groups.dedup();
+        AcceptedFormats {
+            formats: mime_list(&formats),
+            groups,
+            generates_renditions: kind.generates_renditions(),
+        }
+    };
+    Ok(Json(FormatsResponse {
+        images: for_kind(Kind::Image),
+        documents: for_kind(Kind::Document),
+    }))
+}
+
+#[derive(Serialize)]
+pub(super) struct AcceptedFormats {
+    formats: Vec<&'static str>,
+    groups: Vec<String>,
+    generates_renditions: bool,
+}
+
+#[derive(Serialize)]
+pub(super) struct FormatsResponse {
+    images: AcceptedFormats,
+    documents: AcceptedFormats,
 }
 
 #[derive(Serialize)]
@@ -1817,8 +1851,10 @@ mod tests {
     use crate::{
         AppState, Config, app,
         ident::AssetId,
-        model::{RenditionFormat, RenditionRecord},
+        model::{RenditionFormat, RenditionRecord, SourceFormat},
     };
+
+    use serde_json::json;
 
     use super::{ByteRange, ORIGINAL_FILENAME_HEADER, PLACEHOLDER_PNG, parse_range, select_format};
 
@@ -2606,6 +2642,210 @@ mod tests {
 
     /// Media type, not kind: the documents collection takes a picture too, and
     /// telling "the invoices" from "the diagrams" is the question.
+    /// What an administrator can upload is what Atlas can produce.
+    ///
+    /// Before this, Atlas served AVIF and JPEG XL renditions while refusing
+    /// both on upload, so the file you had just downloaded could not be put
+    /// back. HEIC is here for the same practical reason: it is what a phone
+    /// hands you.
+    #[tokio::test]
+    async fn every_format_atlas_produces_can_also_be_uploaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.variant_widths = vec![320];
+        let router = app(AppState::new(config).await.unwrap());
+
+        for (content_type, magick) in [
+            ("image/avif", "AVIF"),
+            ("image/jxl", "JXL"),
+            ("image/heic", "HEIC"),
+        ] {
+            let extension = content_type.rsplit('/').next().unwrap();
+            let bytes = write_test_image_as(
+                &directory.path().join(format!("src.{extension}")),
+                "100x80",
+                magick,
+            );
+            let (status, asset) = send(&router, upload_named(content_type, &bytes, "photo")).await;
+            assert_eq!(status, StatusCode::CREATED, "{content_type}");
+            assert_eq!(asset["kind"], "image", "{content_type}");
+            assert_eq!(
+                asset["original"]["content_type"], content_type,
+                "stored as what it claimed to be"
+            );
+            assert!(
+                !asset["renditions"].as_array().unwrap().is_empty(),
+                "{content_type} should still get renditions"
+            );
+        }
+    }
+
+    /// The round trip that motivated the above, in the direction that used to
+    /// break: read a rendition off disk and offer it straight back.
+    #[tokio::test]
+    async fn a_rendition_can_be_uploaded_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.variant_widths = vec![320];
+        let state = AppState::new(config).await.unwrap();
+        let data_dir = state.config.data_dir.clone();
+        let router = app(state);
+
+        let image = write_test_image(&directory.path().join("source.png"), "400x300");
+        let (status, asset) = send(&router, upload_named("image/png", &image, "photo.png")).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = asset["id"].as_str().unwrap().to_owned();
+
+        for extension in ["jxl", "avif", "webp"] {
+            let rendition = std::fs::read(
+                data_dir
+                    .join("assets")
+                    .join(&id)
+                    .join(format!("w320.{extension}")),
+            )
+            .unwrap_or_else(|error| panic!("the {extension} rendition should exist: {error}"));
+            let content_type = format!("image/{extension}");
+            let (status, again) =
+                send(&router, upload_named(&content_type, &rendition, "again")).await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "a {extension} rendition should be uploadable again"
+            );
+            assert_eq!(again["kind"], "image", "{extension}");
+        }
+    }
+
+    /// A picture can be stored whole, whatever format it is in.
+    #[tokio::test]
+    async fn a_heic_photo_can_be_stored_as_a_document_without_conversion() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let heic = write_test_image_as(&directory.path().join("diagram.heic"), "120x90", "HEIC");
+        let (status, asset) = send(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/documents")
+                .header("authorization", "Bearer prototype-test-token")
+                .header("content-type", "image/heic")
+                .body(Body::from(heic.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(asset["kind"], "document");
+        assert_eq!(asset["original"]["content_type"], "image/heic");
+        assert_eq!(
+            asset["renditions"].as_array().unwrap().len(),
+            0,
+            "a document is stored whole"
+        );
+    }
+
+    /// Declaring one format and sending another is still refused, including
+    /// between the two formats that share an `ftyp` box.
+    #[tokio::test]
+    async fn bytes_must_match_the_format_they_are_declared_as() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let avif = write_test_image_as(&directory.path().join("real.avif"), "60x40", "AVIF");
+        let heic = write_test_image_as(&directory.path().join("real.heic"), "60x40", "HEIC");
+
+        let (status, error) =
+            send(&router, upload_named("image/heic", &avif, "disguised.heic")).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("do not match the declared media type"),
+            "the answer should say what is wrong, said: {error}"
+        );
+
+        let (status, _) = send(&router, upload_named("image/avif", &heic, "disguised.avif")).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // And the ordinary mismatch, unchanged.
+        let png = write_test_image(&directory.path().join("real.png"), "60x40");
+        let (status, _) = send(&router, upload_named("image/jxl", &png, "disguised.jxl")).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// A consumer building an upload form should be able to ask rather than
+    /// hardcode a list that drifts on the next release.
+    #[tokio::test]
+    async fn the_accepted_formats_are_readable_and_true() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let (status, body) = send(&router, authorized("GET", "/api/v1/formats")).await;
+        assert_eq!(status, StatusCode::OK);
+        let images = body["images"]["formats"].as_array().unwrap();
+        assert_eq!(
+            images,
+            &vec![
+                json!("image/jpeg"),
+                json!("image/png"),
+                json!("image/webp"),
+                json!("image/avif"),
+                json!("image/jxl"),
+                json!("image/heic"),
+            ]
+        );
+        assert_eq!(body["images"]["groups"], json!(["image/*"]));
+        assert_eq!(body["images"]["generates_renditions"], json!(true));
+
+        // Documents take everything, which is the point of the collection.
+        let documents = body["documents"]["formats"].as_array().unwrap();
+        assert_eq!(documents.len(), SourceFormat::ALL.len());
+        assert_eq!(
+            body["documents"]["groups"],
+            json!(["application/*", "image/*"])
+        );
+        assert_eq!(body["documents"]["generates_renditions"], json!(false));
+
+        // Nothing listed may be refused by the endpoint that validates it, so
+        // each advertised type is offered bytes that really are that type.
+        for content_type in images {
+            let content_type = content_type.as_str().unwrap();
+            let format = SourceFormat::parse_content_type(content_type).unwrap();
+            let bytes = write_test_image_as(
+                &directory
+                    .path()
+                    .join(format!("probe.{}", format.extension())),
+                "20x20",
+                format.magick_name().unwrap(),
+            );
+            let (status, error) = send(&router, upload_named(content_type, &bytes, "probe")).await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "{content_type} is advertised but refused: {error}"
+            );
+        }
+
+        let (status, _) = send(&router, authorized("GET", "/api/v1/formats")).await;
+        assert_eq!(status, StatusCode::OK);
+        let anonymous = send(
+            &router,
+            Request::builder()
+                .uri("/api/v1/formats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(anonymous.0, StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn a_listing_can_filter_by_media_type() {
         let directory = tempfile::tempdir().unwrap();
@@ -2680,17 +2920,9 @@ mod tests {
             .unwrap());
 
         for (query, collection, expected) in [
-            (
-                "mime=image%2Ftiff",
-                "images",
-                "image/jpeg, image/png, image/webp",
-            ),
+            ("mime=image%2Ftiff", "images", "such as image/png"),
             ("mime=text%2F%2A", "documents", "a group such as image/*"),
-            (
-                "mime=image%2F%2A%2Fx",
-                "images",
-                "image/jpeg, image/png, image/webp",
-            ),
+            ("mime=image%2F%2A%2Fx", "images", "such as image/png"),
         ] {
             let (status, error) = send(
                 &router,
@@ -2704,12 +2936,19 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains(expected),
-                "{query} should name what is accepted, said: {error}"
+                "{query} should point at the formats listing, said: {error}"
+            );
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/api/v1/formats"),
+                "{query} should say where the list is, said: {error}"
             );
         }
 
         // A real type that this collection cannot hold is the caller's bug,
-        // and the answer says what the collection does hold.
+        // and the answer says which collection was meant.
         let (status, error) = send(
             &router,
             authorized("GET", "/api/v1/images?mime=application%2Fpdf"),
@@ -2723,8 +2962,8 @@ mod tests {
             "said: {message}"
         );
         assert!(
-            message.contains("image/jpeg, image/png and image/webp"),
-            "the caller needs to be told what images holds, said: {message}"
+            message.contains("/api/v1/formats"),
+            "and where to find what it holds, said: {message}"
         );
 
         // The mirror image is fine: a picture stored as a document is real.

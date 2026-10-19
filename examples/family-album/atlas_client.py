@@ -30,16 +30,35 @@ MAX_STATE_IDS = 500
 #: How Atlas learns the name an uploader gave a file.
 ORIGINAL_FILENAME_HEADER = "X-Original-Filename"
 
-#: Atlas serves images and documents; it does not accept camera RAW.
+#: What the album is willing to try, by extension.
+#:
+#: Atlas accepts more than this and `GET /api/v1/formats` is the authority; the
+#: table exists because the album has to pick a `Content-Type` from a filename
+#: before it can ask, and an unknown extension is better refused here with a
+#: sentence than sent and refused there. Camera RAW is absent deliberately:
+#: those need converting before upload, whatever the file is named.
+#:
+#: `.heif` is absent too, though iPhones write `.heic`. HEIF is a container
+#: family whose payload may be AV1 or HEVC, so which one it is has to be read
+#: out of the file rather than guessed from its extension.
 CONTENT_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".png": "image/png",
     ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".jxl": "image/jxl",
+    ".heic": "image/heic",
     ".pdf": "application/pdf",
     ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
+
+#: Extensions that are a camera's own raw data, kept separate only so the
+#: refusal can explain what to do about it.
+RAW_EXTENSIONS = frozenset(
+    {".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2", ".pef", ".srw"}
+)
 
 
 class AtlasError(Exception):

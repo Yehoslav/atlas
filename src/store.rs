@@ -746,10 +746,7 @@ fn asset_from_row(
         },
         None => {
             tracing::warn!(asset = %id, "stored asset has no kind; deriving it from its format");
-            Some(match source_format {
-                SourceFormat::Jpeg | SourceFormat::Png | SourceFormat::Webp => Kind::Image,
-                SourceFormat::Pdf | SourceFormat::Doc | SourceFormat::Docx => Kind::Document,
-            })
+            Some(source_format.kind())
         }
     };
 

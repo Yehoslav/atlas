@@ -22,9 +22,12 @@ media files and media metadata only.
 - No browser-facing Atlas UI or direct browser uploads in the prototype. A
   future UI must keep the permanent token server-side and can use its backend
   to relay uploads or request short-lived upload grants.
-- Preserve originals. Accept only JPEG, PNG, and WebP for image processing;
-  reject camera RAW and other unconfigured formats even if ImageMagick can read
-  them. Accept PDF, legacy Word, and DOCX as unconverted originals.
+- Preserve originals. Accept only web-ready image formats for processing, and
+  those are exactly the formats Atlas itself produces, so a rendition can be
+  uploaded again; reject camera RAW and other unconfigured formats even if
+  ImageMagick can read them. Accept PDF, legacy Word, and DOCX as unconverted
+  originals. `GET /api/v1/formats` reports the list from the same table the
+  upload path validates against, so it cannot drift from it.
 - Generate fixed maximum-width renditions, defaulting to 320, 640, 960, and
   1280 pixels. Preserve aspect ratio, never upscale, and report actual output
   dimensions. The consuming site decides the image's role and supplies its own
@@ -190,6 +193,8 @@ collections.
 - `POST /api/v1/{kind}/actions` — authenticated bulk `pin`, `unpin`, `delete`,
   or `restore` for up to 500 caller-supplied ids, validated all-or-nothing.
 - `GET /api/v1/summary` — authenticated counts and stored bytes, trash included.
+- `GET /api/v1/formats` — authenticated accepted media types per collection,
+  the `mime` groups they answer to, and whether renditions are generated.
 - `POST /api/v1/assets/state` — authenticated batch state for up to 500 ids the
   caller supplies, across collections. Not a listing, and Atlas learns nothing
   from the ids.
@@ -279,7 +284,16 @@ the consumer side and is not part of the service.
 
 - Streaming limits hold with or without `Content-Length`.
 - RAW/mismatched signatures and excessive decoded dimensions are rejected
-  before publication.
+  before publication, including between the formats that share an `ftyp` box:
+  an AVIF renamed `.heic` is refused, and a bare JPEG XL codestream and a
+  container JPEG XL are both recognised.
+- Every format the renditions are written in is also accepted on upload, so a
+  rendition fetched from Atlas can be uploaded again, and every format
+  `GET /api/v1/formats` advertises is accepted by the endpoint that validates
+  it.
+- Every format ImageMagick writes a rendition in is also readable at startup,
+  so a build missing a delegate refuses to start rather than failing on
+  somebody's first upload.
 - ImageMagick failures/timeouts and database failures do not publish partial
   assets; startup cleanup handles unindexed directories left by a crash.
 - Auto-format negotiation honors `Accept` quality values, emits `Vary: Accept`,
@@ -313,3 +327,27 @@ the consumer side and is not part of the service.
 - Video transcoding and thumbnail pipelines
 - Remote object storage, multiple service instances, multi-tenancy, and
   distributed job queues
+- An `animations` kind. Nothing multi-frame can be uploaded today, and the
+  reason is structural rather than a missing check: `inspect` reads the first
+  line of ImageMagick's per-frame report, and `generate` writes one file per
+  `-write` target, so an animated input would be silently flattened *and* burn
+  the conversion timeout. A kind that owns frames needs a rendition model that
+  does too, not a special case in this one.
+- Emitting the JPEG XL ISOBMFF container instead of the bare codestream
+  ImageMagick writes. Progressive rendering does not depend on it — that is a
+  codestream property — but the container carries Exif and XMP, and its `jxlp`
+  boxes enable byte-range progressive delivery. Renditions are generated with
+  `-strip` and so carry neither today. Worth researching whether ImageMagick's
+  coder can be persuaded with a define, or whether that means a `cjxl`
+  delegate.
+- Wide-gamut colour handling. Renditions ask for sRGB before `-strip`, which
+  leaves an untagged or already-sRGB source untouched. Whether that performs a
+  true ICC transform for a Display P3 phone photo is **unverified**: this
+  ImageMagick build ships no ICC profiles (`-list profile` is unsupported and
+  no `.icc` is present), and no Display P3 file was available to test with.
+  Confirm with a real photo before relying on it; the mechanism, if the flag
+  is only tagging, is `-profile <sRGB target>` with profiles available.
+- JPEG XL, AVIF and HEIC signatures are brand-checked rather than merely
+  sniffed, because AVIF and HEIC are both ISO base media files starting with
+  an `ftyp` box; the whole brand list is searched, since a file may declare
+  `mif1` and list `heic` among its compatible brands.

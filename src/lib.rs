@@ -299,6 +299,7 @@ pub fn app(state: AppState) -> Router {
             axum::routing::post(api::asset_states),
         )
         .route("/api/v1/summary", get(api::summary))
+        .route("/api/v1/formats", get(api::list_formats))
         .route("/api/v1/trash", get(api::list_trash))
         // Public delivery is addressed by id and stays untyped.
         .route("/media/{id}/original", get(api::get_original))

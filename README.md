@@ -7,9 +7,13 @@ keeps its own structured content and database.
 
 The prototype supports authenticated backend/CLI uploads and public reads. It
 is designed for occasional administrator uploads and mostly blog-style media,
-not as a complete CMS. Image uploads must be web-ready JPEG, PNG, or WebP;
-camera RAW formats are rejected. PDF and Word documents are stored and served
-without conversion.
+not as a complete CMS. Image uploads must be web-ready JPEG, PNG, WebP, AVIF,
+JPEG XL or HEIC; camera RAW formats are rejected. PDF and Word documents are
+stored and served without conversion.
+
+The image formats Atlas accepts are exactly the ones it produces, so anything
+it serves can be uploaded again — the file you just downloaded is not a dead
+end. `GET /api/v1/formats` is the authority on this list.
 
 ## Implemented prototype API
 
@@ -43,16 +47,15 @@ as an attachment instead of being re-encoded into a picture.
   `deleted` and `purged` are different answers: a deleted asset can still be
   restored, a purged one cannot. An unknown value is a `400 invalid_sort`/
   `invalid_state`/`invalid_mime` rather than a quietly ignored filter. This is
-  a listing of assets the site uploaded; it says
-  nothing about how the site uses them.
+  a listing of assets the site uploaded; it says nothing about how the site
+  uses them.
 
   `mime` takes an exact media type (`image/png`) or a whole group
   (`image/*`), and answers the question a collection cannot: `documents` holds
   PDFs, Word files and pictures stored whole, and `?mime=image/*` is what finds
   the last of those. A value Atlas does not accept, and a value this collection
-  could never hold, are both `400 invalid_mime` — the second names what the
-  collection does hold, because "images holds image/jpeg, image/png and
-  image/webp" is the sentence the caller needs to fix the query.
+  could never hold, are both `400 invalid_mime`; `GET /api/v1/formats` says
+  which types are on offer.
 - `GET /api/v1/{kind}/{id}` — authenticated metadata lookup, including the
   asset's `kind`, `state` (`active`, `deleted`, or `purged`), and `pinned` flag.
 - `POST /api/v1/{kind}/actions` — authenticated bulk action for ids the caller
@@ -62,6 +65,11 @@ as an attachment instead of being re-encoded into a picture.
   rejects the whole batch with `400` and changes nothing.
 - `GET /api/v1/summary` — authenticated counts and stored bytes for the whole
   instance, including the trash. A cheap dashboard number, not a listing.
+- `GET /api/v1/formats` — authenticated list of the media types each collection
+  accepts, the `mime` groups they answer to, and whether they get renditions.
+  Derived from the same table the upload path validates against, so it cannot
+  advertise something Atlas would then refuse. A consumer building an upload
+  form should read this rather than hardcode a list that drifts.
 - `POST /api/v1/assets/state` — authenticated batch state lookup for ids the
   caller already has, across both collections. Not a listing.
 - `DELETE /api/v1/{kind}/{id}` — authenticated move to the trash. Returns `204`.

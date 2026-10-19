@@ -380,8 +380,8 @@ def check_api(checks: Checks) -> None:
     checks.ok("mime, impossible combination is refused", status, 400)
     checks.ok("  with the same code", error["error"]["code"], "invalid_mime")
     checks.true(
-        "  and says what images holds",
-        "image/jpeg, image/png and image/webp" in error["error"]["message"],
+        "  and points at the formats listing",
+        "/api/v1/formats" in error["error"]["message"],
     )
     checks.ok(
         "bad sort is a 400",
@@ -395,6 +395,38 @@ def check_api(checks: Checks) -> None:
     )
     checks.ok(
         "no token is a 401", checks.request("GET", "/api/v1/images", token=None)[0], 401
+    )
+
+    print("\n== formats ==", flush=True)
+    status, formats = checks.request("GET", "/api/v1/formats")
+    checks.ok(
+        "formats needs the token",
+        checks.request("GET", "/api/v1/formats", token=None)[0],
+        401,
+    )
+    checks.ok("formats listing", status, 200)
+    advertised = formats["images"]["formats"]
+    checks.ok(
+        "  advertises what Atlas produces",
+        sorted(advertised),
+        sorted(
+            [
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+                "image/avif",
+                "image/jxl",
+                "image/heic",
+            ]
+        ),
+    )
+    checks.ok("  image group", formats["images"]["groups"], ["image/*"])
+    checks.ok(
+        "  images get renditions", formats["images"]["generates_renditions"], True
+    )
+    checks.ok("  documents take everything", len(formats["documents"]["formats"]), 9)
+    checks.ok(
+        "  documents get none", formats["documents"]["generates_renditions"], False
     )
 
     print("\n== summary and srcset ==", flush=True)
@@ -506,6 +538,27 @@ def check_api(checks: Checks) -> None:
         204,
     )
 
+    print("\n== a rendition can be uploaded again ==", flush=True)
+    # The asymmetry this exists for: Atlas used to serve formats it would not
+    # accept, so the file you had just downloaded could not be put back.
+    for extension in ("jxl", "avif", "webp"):
+        # Renditions are chosen by Accept, not by an extension in the path.
+        status, rendition = checks.request(
+            "GET",
+            f"/media/{image_id}/w320",
+            headers={"Accept": f"image/{extension}"},
+            raw=True,
+            token=None,
+        )
+        checks.ok(f"  fetched the {extension} rendition", status, 200)
+        status, _ = checks.request(
+            "POST",
+            "/api/v1/images",
+            rendition,
+            {"Content-Type": f"image/{extension}"},
+        )
+        checks.ok(f"  and uploaded it back as image/{extension}", status, 201)
+
     print("\n== public delivery ==", flush=True)
     status, body = checks.request(
         "GET", f"/media/{image_id}/w320", raw=True, token=None
@@ -590,7 +643,10 @@ def check_example_client(checks: Checks, port: int) -> None:
     checks.ok("  with no renditions", len(stored.renditions), 0)
 
     listing = client.list_assets("images")
-    checks.ok("client listing", listing["total"], 1)
+    checks.true(
+        "client listing returns what it uploaded",
+        any(entry["id"] == image.id for entry in listing["assets"]),
+    )
     checks.ok("client srcset", len(client.srcset(image.id)["srcset"].split(", ")), 4)
 
     def fetched(collection: str, asset_id: str) -> Any:

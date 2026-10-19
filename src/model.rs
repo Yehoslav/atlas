@@ -73,6 +73,9 @@ pub enum SourceFormat {
     Jpeg,
     Png,
     Webp,
+    Avif,
+    Jxl,
+    Heic,
     Pdf,
     Doc,
     Docx,
@@ -90,6 +93,9 @@ impl SourceFormat {
             "image/jpeg" => Some(Self::Jpeg),
             "image/png" => Some(Self::Png),
             "image/webp" => Some(Self::Webp),
+            "image/avif" => Some(Self::Avif),
+            "image/jxl" => Some(Self::Jxl),
+            "image/heic" => Some(Self::Heic),
             "application/pdf" => Some(Self::Pdf),
             "application/msword" => Some(Self::Doc),
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
@@ -104,6 +110,9 @@ impl SourceFormat {
             "jpeg" => Some(Self::Jpeg),
             "png" => Some(Self::Png),
             "webp" => Some(Self::Webp),
+            "avif" => Some(Self::Avif),
+            "jxl" => Some(Self::Jxl),
+            "heic" => Some(Self::Heic),
             "pdf" => Some(Self::Pdf),
             "doc" => Some(Self::Doc),
             "docx" => Some(Self::Docx),
@@ -116,6 +125,9 @@ impl SourceFormat {
             Self::Jpeg => "jpeg",
             Self::Png => "png",
             Self::Webp => "webp",
+            Self::Avif => "avif",
+            Self::Jxl => "jxl",
+            Self::Heic => "heic",
             Self::Pdf => "pdf",
             Self::Doc => "doc",
             Self::Docx => "docx",
@@ -127,6 +139,9 @@ impl SourceFormat {
             Self::Jpeg => "jpg",
             Self::Png => "png",
             Self::Webp => "webp",
+            Self::Avif => "avif",
+            Self::Jxl => "jxl",
+            Self::Heic => "heic",
             Self::Pdf => "pdf",
             Self::Doc => "doc",
             Self::Docx => "docx",
@@ -138,6 +153,9 @@ impl SourceFormat {
             Self::Jpeg => "image/jpeg",
             Self::Png => "image/png",
             Self::Webp => "image/webp",
+            Self::Avif => "image/avif",
+            Self::Jxl => "image/jxl",
+            Self::Heic => "image/heic",
             Self::Pdf => "application/pdf",
             Self::Doc => "application/msword",
             Self::Docx => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -149,6 +167,9 @@ impl SourceFormat {
             Self::Jpeg => Some("JPEG"),
             Self::Png => Some("PNG"),
             Self::Webp => Some("WEBP"),
+            Self::Avif => Some("AVIF"),
+            Self::Jxl => Some("JXL"),
+            Self::Heic => Some("HEIC"),
             Self::Pdf | Self::Doc | Self::Docx => None,
         }
     }
@@ -158,10 +179,13 @@ impl SourceFormat {
     /// Queries about what an upload *could* be — "which media types may this
     /// collection contain" — are answered from this list rather than a second
     /// one written beside it, which is how the two start disagreeing.
-    pub const ALL: [SourceFormat; 6] = [
+    pub const ALL: [SourceFormat; 9] = [
         SourceFormat::Jpeg,
         SourceFormat::Png,
         SourceFormat::Webp,
+        SourceFormat::Avif,
+        SourceFormat::Jxl,
+        SourceFormat::Heic,
         SourceFormat::Pdf,
         SourceFormat::Doc,
         SourceFormat::Docx,
@@ -173,7 +197,9 @@ impl SourceFormat {
     /// accepts images, because a caller may want a picture stored whole.
     pub fn kind(self) -> Kind {
         match self {
-            Self::Jpeg | Self::Png | Self::Webp => Kind::Image,
+            Self::Jpeg | Self::Png | Self::Webp | Self::Avif | Self::Jxl | Self::Heic => {
+                Kind::Image
+            }
             Self::Pdf | Self::Doc | Self::Docx => Kind::Document,
         }
     }
@@ -186,8 +212,10 @@ impl SourceFormat {
         match self {
             Self::Jpeg => RenditionFormat::Jpeg,
             Self::Png => RenditionFormat::Png,
-            Self::Webp if opaque => RenditionFormat::Jpeg,
-            Self::Webp => RenditionFormat::Png,
+            // Everything else that can carry alpha needs a fallback that does
+            // too; an opaque source is better served by JPEG's ubiquity.
+            Self::Webp | Self::Avif | Self::Jxl | Self::Heic if opaque => RenditionFormat::Jpeg,
+            Self::Webp | Self::Avif | Self::Jxl | Self::Heic => RenditionFormat::Png,
             Self::Pdf | Self::Doc | Self::Docx => RenditionFormat::Png,
         }
     }

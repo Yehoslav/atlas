@@ -24,7 +24,9 @@ here.
 - **Sequential uploads with per-file results.** Atlas takes two concurrent
   uploads but converts one image at a time, so a burst of ten earns a `503` from
   half of them. This uploads one at a time and reports every file's outcome,
-  including camera RAW that Atlas refuses.
+  and says *why* a file was refused: a camera raw file is told to be converted,
+  anything else is told which types the album handles. Telling every rejected
+  file it was raw was telling a person with a `.txt` nothing at all.
 - **Uploading a name.** The album percent-encodes the file name and sends it as
   `X-Original-Filename`, so a download of a PDF is called what the person named
   it instead of `asset.pdf`.

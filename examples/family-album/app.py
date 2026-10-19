@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import album_db
+import atlas_client
 from atlas_client import AtlasClient, AtlasError, AtlasLike, content_type_for
 from flask import (
     Flask,
@@ -515,9 +516,30 @@ def create_app(
     return app
 
 
+def _why_not_accepted(filename: str) -> str:
+    """Say what is wrong with this file, rather than the same thing every time.
+
+    A camera's raw data needs converting before it can be uploaded, and saying
+    so is the whole answer. Everything else — a text file, a video, a format
+    nobody asked for — has nothing to do with RAW, and telling somebody to
+    convert their raw photo was telling them nothing.
+    """
+    _, extension = os.path.splitext(filename.lower())
+    if extension in atlas_client.RAW_EXTENSIONS:
+        return (
+            "This is a camera raw file. Atlas does not accept raw formats; "
+            "convert it to JPEG or PNG first."
+        )
+    return (
+        "The album does not know what to do with this file type. It uploads "
+        "JPEG, PNG, WebP, AVIF, JPEG XL and HEIC pictures, plus PDF and Word "
+        "documents."
+    )
+
+
 def _upload_one(
     connection: sqlite3.Connection,
-    atlas: AtlasLike,
+    atlas: atlas_client.AtlasLike,
     storage: Any,
     max_bytes: int,
     as_document: bool = False,
@@ -525,11 +547,7 @@ def _upload_one(
     filename = storage.filename
     content_type = content_type_for(filename)
     if content_type is None:
-        return UploadResult(
-            filename,
-            False,
-            "Atlas does not accept this file type. Convert camera RAW to JPEG first.",
-        )
+        return UploadResult(filename, False, _why_not_accepted(filename))
 
     size = _stream_size(storage.stream)
     if size is None:
