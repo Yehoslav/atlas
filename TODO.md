@@ -104,3 +104,41 @@ Placed at `examples/family-album/`.
   and the separation is the point.
 - Authentication or multi-user support in the example app.
 - Anything that would push Atlas toward knowing about consumer content.
+
+## Open threads
+
+### Needs a real file, not a test
+
+- [ ] **Verify wide-gamut renditions.** Renditions ask for sRGB before `-strip`,
+      so a Display P3 phone photo should be converted rather than relabelled.
+      Unverified: this ImageMagick build ships no ICC profiles, so there is no
+      P3 fixture to test against, and a CMYK experiment came back byte-identical.
+      Needs one real iPhone photo. If the flag turns out to only tag, the
+      mechanism is `-profile <sRGB target>` with profiles available.
+
+### For the CMS admin dashboard example
+
+- [ ] **`kind` in the trash listing.** `GET /api/v1/trash` does not say which
+      collection an entry is in, so a consumer listing the whole trash cannot
+      address a per-entry restore. The album never hit this because it lists its
+      own deletions; a dashboard is the consumer that does need it.
+
+## Things that got through, and why
+
+Worth keeping because each shipped green and each was found by hand:
+
+- **A fake is shaped like what you hope, not like the server.** `FakeAtlas`
+  answered `kind` as `"images"` where the server says `"image"`, so every real
+  delete, pin and restore would have 404'd while 40 tests passed. Point the real
+  client at the real binary (`scripts/smoke.py`) when the contract changes.
+- **A code path with no test is a code path with a bug.** The index's folder and
+  tag filters were broken for the life of the feature: adding the deleted-photo
+  clause produced two `WHERE` clauses, and no test had ever filtered the index.
+  When a query or a branch is added, test it *with* its filters.
+- **A helper with two callers needs two answers, not one default.**
+  `references_for_photo` filtered to published posts by default, which the
+  delete guard wanted and the "Used by" panel did not. The template even carried
+  a draft badge for a case it could never receive.
+- **Check the sibling queries.** The folder count in the sidebar kept counting
+  soft-deleted photos, one clause below the query that had just been changed.
+

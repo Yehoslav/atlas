@@ -314,6 +314,11 @@ the consumer side and is not part of the service.
   leave no staged files behind.
 - One state lookup covers a page, returns `missing` for unknown ids, refuses
   malformed ones, and is capped.
+- Every filter on a listing is exercised, not just the unfiltered default. A
+  clause that only applies under a filter can go wrong for as long as nobody
+  uses that filter: the album's folder and tag views were broken for the life of
+  the feature because nothing filtered the index, and a sibling query counting
+  the same rows was missed with it.
 - The trash listing is capped and pages without overlapping or skipping.
 - A table rebuild guarded against `ON DELETE CASCADE` preserves child rows,
   and the same rebuild without the guard is caught by a test that proves the
