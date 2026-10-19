@@ -402,8 +402,9 @@ nix develop
 
 The shell provides Rust, Cargo, rustfmt, Clippy, rust-analyzer, SQLite,
 ImageMagick, and build tools. `flake.lock` pins Nixpkgs. On startup, Atlas checks
-that ImageMagick can read/write JPEG, PNG, WebP, AVIF, and JPEG XL. The API
-still accepts only its explicit input allowlist.
+that ImageMagick can read/write JPEG, PNG, WebP, AVIF, JPEG XL and HEIC, and
+refuses to start without them. The API still accepts only its explicit input
+allowlist.
 
 Run locally:
 

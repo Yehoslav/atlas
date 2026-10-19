@@ -6,5 +6,9 @@
 # `/target/` above is anchored to the root.
 /examples/*/target/
 
+# Jujutsu keeps its own metadata here. It ignores itself already, but a
+# git-only reader deserves the rule too.
+/.jj/
+
 __pycache__/
 *.py[cod]
