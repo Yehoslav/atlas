@@ -513,6 +513,48 @@ def test_published_posts_block_a_delete(client, atlas):
     assert forced.headers["Location"] == "/"
 
 
+def test_a_draft_post_using_a_photo_is_still_listed_on_the_photo_page(client, atlas):
+    """ "Used by" is a statement about this photo, so it must be true.
+
+    Only the delete guard filters on published: a draft cannot harm a reader,
+    but a person editing the album still needs to see that the photo is
+    spoken for.
+    """
+    upload_png(client)
+    drafted = _only_photo_id(client, atlas)
+
+    client.post("/posts", data={"title": "Grandma at 70"})
+    client.post(f"/posts/1/photos/{drafted}")
+
+    body = client.get(f"/photos/{drafted}").get_data(as_text=True)
+    assert "Grandma at 70" in body, "a draft that uses the photo must be named"
+    assert "draft" in body
+    assert "No posts use this photo" not in body
+
+    # The delete guard is the other half of this and still ignores drafts.
+    allowed = client.post(f"/photos/{drafted}/delete")
+    assert allowed.status_code == 302, "a draft is not a reason to block a delete"
+
+    # Publishing makes it a reason.
+    upload_png(client, seed="second")
+    connection = album_db.connect(client.application.config["DATABASE"])
+    try:
+        published = album_db.list_photos(connection)[0].id
+    finally:
+        connection.close()
+
+    client.post("/posts", data={"title": "By the sea"})
+    client.post(f"/posts/2/photos/{published}")
+    client.post("/posts/2/publish", data={"publish": "yes"})
+
+    listed = client.get(f"/photos/{published}").get_data(as_text=True)
+    assert "By the sea" in listed
+    assert "published" in listed
+
+    blocked = client.post(f"/photos/{published}/delete")
+    assert blocked.status_code == 409
+
+
 def test_deleting_an_unused_photo_is_allowed(client, atlas):
     upload_png(client)
     photo_id = _only_photo_id(client, atlas)

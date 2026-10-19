@@ -36,7 +36,11 @@ here.
 - **Metadata editing that never calls Atlas.** A caption is the album's business.
 - **A referential guard.** Before deleting, the album checks its own posts for
   published references and returns `409` with a confirm button. Atlas cannot do
-  this: it has no idea which of its assets a published page shows.
+  this: it has no idea which of its assets a published page shows. The photo's
+  own "Used by" panel lists *every* post that uses it, drafts included and
+  badged as such — the guard filters on published because that is what
+  protects a reader, while "Used by" is a statement about the photo and has
+  to be true.
 - **Usage registration.** Attaching a photo to a post pins the asset in Atlas
   (`PUT /api/v1/images/{id}/pin`), so the retention sweep will never discard
   bytes a reader can currently see.

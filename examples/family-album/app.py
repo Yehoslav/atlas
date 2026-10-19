@@ -349,7 +349,13 @@ def create_app(
             "photo.html",
             photo=photo,
             checks=check_assets([photo.asset_id]),
-            references=album_db.references_for_photo(connection, photo_id),
+            # Every post, drafts included: "Used by" is a statement about this
+            # photo, and leaving a draft out of it makes it untrue. The delete
+            # guard is the one that only counts published posts, because that
+            # is the check that protects a reader.
+            references=album_db.references_for_photo(
+                connection, photo_id, published_only=False
+            ),
             posts=album_db.list_posts(connection),
             folders=album_db.list_folders(connection),
         )
