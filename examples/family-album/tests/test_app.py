@@ -513,6 +513,55 @@ def test_published_posts_block_a_delete(client, atlas):
     assert forced.headers["Location"] == "/"
 
 
+def test_the_index_filters_by_folder_and_by_tag(client, atlas):
+    """Both filters add to the same WHERE clause as the deleted-photo one.
+
+    A second WHERE made every filtered view a syntax error, and nothing here
+    filtered the index, so nothing noticed.
+    """
+    upload_png(client, seed="one")
+    upload_png(client, seed="two")
+    connection = album_db.connect(client.application.config["DATABASE"])
+    try:
+        photos = album_db.list_photos(connection)
+        assert len(photos) == 2
+        first, second = photos[1], photos[0]
+
+        folder_id = album_db.create_folder(connection, "Holiday")
+        album_db.update_photo(
+            connection,
+            first.id,
+            description="",
+            alt_text="",
+            tags="Sea, Family",
+            folder_id=folder_id,
+        )
+    finally:
+        connection.close()
+
+    in_folder = client.get(f"/?folder={folder_id}")
+    assert in_folder.status_code == 200
+    body = in_folder.get_data(as_text=True)
+    assert first.asset_id in body
+    assert second.asset_id not in body, "the other photo is in no folder"
+
+    by_tag = client.get("/?tag=sea")
+    assert by_tag.status_code == 200
+    tagged = by_tag.get_data(as_text=True)
+    assert first.asset_id in tagged
+    assert second.asset_id not in tagged, "tags are the album's own list"
+
+    # Both at once still has to be valid SQL.
+    assert client.get(f"/?folder={folder_id}&tag=family").status_code == 200
+    assert client.get("/?tag=nothing-matches").status_code == 200
+
+    # A deleted photo leaves the folder count with it.
+    assert f"{folder_id}" in body
+    client.post(f"/photos/{first.id}/delete")
+    sidebar = client.get("/").get_data(as_text=True)
+    assert f"{folder_id}" in sidebar
+
+
 def test_a_draft_post_using_a_photo_is_still_listed_on_the_photo_page(client, atlas):
     """ "Used by" is a statement about this photo, so it must be true.
 

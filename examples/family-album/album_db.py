@@ -117,7 +117,9 @@ def migrate(connection: sqlite3.Connection) -> None:
 def list_folders(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     return connection.execute(
         "SELECT folders.*,"
-        " (SELECT COUNT(*) FROM photos WHERE folder_id = folders.id) AS photo_count"
+        # A deleted photo has left the album, so it has left the count too.
+        " (SELECT COUNT(*) FROM photos"
+        "  WHERE folder_id = folders.id AND deleted_at IS NULL) AS photo_count"
         " FROM folders ORDER BY position, name"
     ).fetchall()
 
@@ -153,14 +155,10 @@ def list_photos(
     tag: str | None = None,
 ) -> list[Photo]:
     """Photos, newest first. `tag` matches the album's own free-text tags."""
-    sql = [
-        "SELECT photos.*, folders.name AS folder_name"
-        + " FROM photos LEFT JOIN folders ON folders.id = photos.folder_id"
-        # Deleted photos keep their row but leave the album. One clause covers
-        # the index, the folder views and the tag views at once.
-        + " WHERE photos.deleted_at IS NULL"
-    ]
-    clauses: list[str] = []
+    # Deleted photos keep their row but leave the album. This is the first
+    # clause rather than part of the SELECT text, so the folder and tag
+    # filters below add to it instead of starting a second WHERE.
+    clauses: list[str] = ["photos.deleted_at IS NULL"]
     parameters: list[Any] = []
     if folder_id is not None:
         clauses.append("photos.folder_id = ?")
@@ -170,9 +168,13 @@ def list_photos(
         # about them and is never asked about them.
         clauses.append("(',' || photos.tags || ',') LIKE ?")
         parameters.append(f"%,{tag.strip().lower()}%,")
-    if clauses:
-        sql.append("WHERE " + " AND ".join(clauses))
-    sql.append("ORDER BY photos.uploaded_at DESC, photos.id DESC")
+    sql = [
+        "SELECT photos.*, folders.name AS folder_name"
+        + " FROM photos LEFT JOIN folders ON folders.id = photos.folder_id"
+        + " WHERE "
+        + " AND ".join(clauses),
+        "ORDER BY photos.uploaded_at DESC, photos.id DESC",
+    ]
 
     rows = connection.execute(" ".join(sql), parameters)
     return [_to_photo(connection, row) for row in rows]
