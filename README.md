@@ -37,13 +37,22 @@ as an attachment instead of being re-encoded into a picture.
 - `GET /api/v1/{kind}` — authenticated listing of that collection, paged with
   `limit` (default 50, max 200) and `offset`, and returning `total`. Also
   accepts `state=active|deleted|purged|all` (default `active`), a `q` substring
-  of the original filename, the ranges `created_after`, `created_before`,
-  `bytes_min`, `bytes_max`, `width_min`, `height_min`, `sort` of `created_at`,
-  `bytes`, `width` or `filename`, and `order=asc|desc`. `deleted` and `purged`
-  are different answers: a deleted asset can still be restored, a purged one
-  cannot. An unknown value is a `400 invalid_sort`/`invalid_state` rather than a
-  quietly ignored filter. This is a listing of assets the site uploaded; it says
+  of the original filename, a `mime` filter, the ranges `created_after`,
+  `created_before`, `bytes_min`, `bytes_max`, `width_min`, `height_min`, `sort`
+  of `created_at`, `bytes`, `width` or `filename`, and `order=asc|desc`.
+  `deleted` and `purged` are different answers: a deleted asset can still be
+  restored, a purged one cannot. An unknown value is a `400 invalid_sort`/
+  `invalid_state`/`invalid_mime` rather than a quietly ignored filter. This is
+  a listing of assets the site uploaded; it says
   nothing about how the site uses them.
+
+  `mime` takes an exact media type (`image/png`) or a whole group
+  (`image/*`), and answers the question a collection cannot: `documents` holds
+  PDFs, Word files and pictures stored whole, and `?mime=image/*` is what finds
+  the last of those. A value Atlas does not accept, and a value this collection
+  could never hold, are both `400 invalid_mime` — the second names what the
+  collection does hold, because "images holds image/jpeg, image/png and
+  image/webp" is the sentence the caller needs to fix the query.
 - `GET /api/v1/{kind}/{id}` — authenticated metadata lookup, including the
   asset's `kind`, `state` (`active`, `deleted`, or `purged`), and `pinned` flag.
 - `POST /api/v1/{kind}/actions` — authenticated bulk action for ids the caller

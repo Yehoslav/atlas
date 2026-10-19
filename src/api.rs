@@ -171,14 +171,6 @@ pub(super) struct StateResponse {
     assets: Vec<StateEntryResponse>,
 }
 
-/// The collection a row belongs to when its own column is missing.
-fn default_kind(format: SourceFormat) -> Kind {
-    match format {
-        SourceFormat::Jpeg | SourceFormat::Png | SourceFormat::Webp => Kind::Image,
-        SourceFormat::Pdf | SourceFormat::Doc | SourceFormat::Docx => Kind::Document,
-    }
-}
-
 impl AssetResponse {
     fn deduplicated(mut self) -> Self {
         self.deduplicated = Some(true);
@@ -215,9 +207,7 @@ impl From<&StoredAsset> for AssetResponse {
             id: asset.id.to_string(),
             deduplicated: None,
             created_at: asset.created_at,
-            kind: asset
-                .kind
-                .unwrap_or_else(|| default_kind(asset.source_format)),
+            kind: asset.kind.unwrap_or_else(|| asset.source_format.kind()),
             state: asset.state(),
             deleted_at: asset.deleted_at,
             purged_at: asset.purged_at,
@@ -833,8 +823,88 @@ pub(super) struct ListParams {
     height_min: Option<i64>,
     sort: Option<String>,
     order: Option<String>,
+    mime: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
+}
+
+/// Turn a `mime` filter into the format keys it selects.
+///
+/// Two failures, one error code, because a caller who gets either of them
+/// wrote the query wrong and wants to be told rather than handed a page that
+/// quietly contains the wrong thing. An unrecognised value, and a recognised
+/// value that could never match anything in this collection.
+fn parse_mime(value: &str, kind: Kind) -> Result<Vec<&'static str>, ApiError> {
+    let wanted: Vec<SourceFormat> = match value.split_once("/*") {
+        Some((group, "")) => {
+            let wanted = SourceFormat::ALL
+                .into_iter()
+                .filter(|format| format.mime_type().starts_with(&format!("{group}/")))
+                .collect::<Vec<_>>();
+            if wanted.is_empty() {
+                return Err(invalid_mime());
+            }
+            wanted
+        }
+        Some(_) => return Err(invalid_mime()),
+        None => match SourceFormat::parse_content_type(value) {
+            Some(format) => vec![format],
+            None => return Err(invalid_mime()),
+        },
+    };
+
+    // What this collection can hold, which is not the same as the format's
+    // usual home: documents take pictures too.
+    let selectable = wanted
+        .iter()
+        .filter(|format| kind.accepts(**format))
+        .copied()
+        .collect::<Vec<_>>();
+    if selectable.is_empty() {
+        // The type is real, but nothing of it can be in this collection. Say
+        // what the collection does hold, because "images holds image/jpeg,
+        // image/png and image/webp" is the sentence the caller needs.
+        return Err(ApiError::bad_request(
+            "invalid_mime",
+            format!(
+                "{value} cannot match the {} collection, which holds {}.",
+                kind.slug(),
+                mime_list(
+                    &SourceFormat::ALL
+                        .into_iter()
+                        .filter(|format| kind.accepts(*format))
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+        ));
+    }
+
+    Ok(selectable.iter().map(|format| format.key()).collect())
+}
+
+/// The accepted values, for an error message. Long, but a caller who gets
+/// this wrong once should not have to guess the spelling next time.
+fn invalid_mime() -> ApiError {
+    ApiError::bad_request(
+        "invalid_mime",
+        format!(
+            "mime must be one of {} or a group such as image/*.",
+            mime_list(&SourceFormat::ALL)
+        ),
+    )
+}
+
+/// A readable list, because it ends up in a sentence a person reads.
+fn mime_list(formats: &[SourceFormat]) -> String {
+    let names = formats
+        .iter()
+        .map(|format| format.mime_type())
+        .collect::<Vec<_>>();
+    match names.as_slice() {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [rest @ .., last] => format!("{rest} and {last}", rest = rest.join(", ")),
+    }
 }
 
 impl ListParams {
@@ -874,10 +944,15 @@ impl ListParams {
                 ));
             }
         };
+        let mime = match self.mime.as_deref() {
+            None => None,
+            Some(value) => Some(parse_mime(value, kind)?),
+        };
 
         Ok(ListQuery {
             kind,
             state,
+            mime,
             name_contains: self.q.filter(|value| !value.is_empty()),
             created_after: self.created_after,
             created_before: self.created_before,
@@ -1224,7 +1299,7 @@ pub(super) async fn get_original(
         asset
             .asset
             .kind
-            .unwrap_or_else(|| default_kind(asset.asset.source_format)),
+            .unwrap_or_else(|| asset.asset.source_format.kind()),
     );
     serve_file(
         &headers,
@@ -1943,14 +2018,20 @@ mod tests {
     }
 
     fn write_test_image(path: &std::path::Path, size: &str) -> Vec<u8> {
+        write_test_image_as(path, size, "PNG")
+    }
+
+    /// Bytes in the format they claim to be: Atlas checks the signature
+    /// against the content type, so a test cannot hand it a PNG and say JPEG.
+    fn write_test_image_as(path: &std::path::Path, size: &str, format: &str) -> Vec<u8> {
         let generated = Command::new("magick")
             .args(["-size", size, "xc:red"])
-            .arg(format!("PNG:{}", path.display()))
+            .arg(format!("{format}:{}", path.display()))
             .output()
             .unwrap();
         assert!(
             generated.status.success(),
-            "could not generate a {size} test image"
+            "could not generate a {size} test {format}"
         );
         std::fs::read(path).unwrap()
     }
@@ -2499,7 +2580,7 @@ mod tests {
             authorized("GET", &format!("/api/v1/images?{query}")),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{query}");
+        assert_eq!(status, StatusCode::OK, "{query} answered {body}");
         body
     }
 
@@ -2510,6 +2591,149 @@ mod tests {
             .iter()
             .map(|entry| entry["id"].as_str().unwrap().to_owned())
             .collect()
+    }
+
+    /// The kind a listing filter is asking about, for a second collection.
+    async fn document_listing(router: &Router, query: &str) -> serde_json::Value {
+        let (status, body) = send(
+            router,
+            authorized("GET", &format!("/api/v1/documents?{query}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        body
+    }
+
+    /// Media type, not kind: the documents collection takes a picture too, and
+    /// telling "the invoices" from "the diagrams" is the question.
+    #[tokio::test]
+    async fn a_listing_can_filter_by_media_type() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.variant_widths = vec![320];
+        let router = app(AppState::new(config).await.unwrap());
+
+        let png = write_test_image(&directory.path().join("one.png"), "40x30");
+        let (status, value) = send(&router, upload_named("image/png", &png, "one.png")).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let png_id = value["id"].as_str().unwrap().to_owned();
+
+        let jpeg = write_test_image_as(&directory.path().join("two.jpg"), "60x45", "JPEG");
+        let (status, value) = send(&router, upload_named("image/jpeg", &jpeg, "two.jpg")).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let jpeg_id = value["id"].as_str().unwrap().to_owned();
+
+        let (status, _) = send(
+            &router,
+            upload_named("application/pdf", b"%PDF-1.7\ninvoice", "invoice.pdf"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // The same picture, stored whole as a document: the reason the filter
+        // has to work across both collections.
+        let diagram = write_test_image(&directory.path().join("diagram.png"), "80x60");
+        let (status, value) = send(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/documents")
+                .header("authorization", "Bearer prototype-test-token")
+                .header("content-type", "image/png")
+                .body(Body::from(diagram))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let diagram_id = value["id"].as_str().unwrap().to_owned();
+
+        assert_eq!(
+            ids_of(&listing(&router, "mime=image/png").await),
+            vec![png_id.clone()],
+            "an exact type is exact"
+        );
+        let mut grouped = ids_of(&listing(&router, "mime=image%2F%2A").await);
+        grouped.sort();
+        let mut expected = vec![png_id, jpeg_id];
+        expected.sort();
+        assert_eq!(grouped, expected, "a group is every type in it");
+
+        let mut stored = ids_of(&document_listing(&router, "mime=image%2F%2A").await);
+        stored.sort();
+        assert_eq!(
+            stored,
+            vec![diagram_id],
+            "documents can hold a picture, and this is how you find it"
+        );
+        assert_eq!(
+            ids_of(&document_listing(&router, "mime=application%2Fpdf").await).len(),
+            1,
+            "and the invoice is still findable by its own type"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_media_type_that_cannot_match_is_refused_rather_than_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        for (query, collection, expected) in [
+            (
+                "mime=image%2Ftiff",
+                "images",
+                "image/jpeg, image/png, image/webp",
+            ),
+            ("mime=text%2F%2A", "documents", "a group such as image/*"),
+            (
+                "mime=image%2F%2A%2Fx",
+                "images",
+                "image/jpeg, image/png, image/webp",
+            ),
+        ] {
+            let (status, error) = send(
+                &router,
+                authorized("GET", &format!("/api/v1/{collection}?{query}")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+            assert_eq!(error["error"]["code"], "invalid_mime", "{query}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "{query} should name what is accepted, said: {error}"
+            );
+        }
+
+        // A real type that this collection cannot hold is the caller's bug,
+        // and the answer says what the collection does hold.
+        let (status, error) = send(
+            &router,
+            authorized("GET", "/api/v1/images?mime=application%2Fpdf"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "invalid_mime");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("cannot match the images collection"),
+            "said: {message}"
+        );
+        assert!(
+            message.contains("image/jpeg, image/png and image/webp"),
+            "the caller needs to be told what images holds, said: {message}"
+        );
+
+        // The mirror image is fine: a picture stored as a document is real.
+        let (status, _) = send(
+            &router,
+            authorized("GET", "/api/v1/documents?mime=image%2Fjpeg"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

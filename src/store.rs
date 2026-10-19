@@ -115,6 +115,9 @@ pub enum StateFilter {
 pub struct ListQuery {
     pub kind: Kind,
     pub state: StateFilter,
+    /// Stored format keys this listing is limited to, already resolved from
+    /// the caller's media type or group.
+    pub mime: Option<Vec<&'static str>>,
     pub name_contains: Option<String>,
     pub created_after: Option<i64>,
     pub created_before: Option<i64>,
@@ -133,6 +136,7 @@ impl Default for ListQuery {
         Self {
             kind: Kind::Image,
             state: StateFilter::Live,
+            mime: None,
             name_contains: None,
             created_after: None,
             created_before: None,
@@ -170,6 +174,20 @@ fn push_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &ListQuery) {
             builder.push(" AND purged_at IS NOT NULL");
         }
         StateFilter::All => {}
+    }
+
+    if let Some(formats) = &query.mime {
+        // Resolved to keys by the caller, so this stays an equality test: no
+        // LIKE, no interpolated values, and a wildcard group cannot become a
+        // pattern by accident.
+        builder.push(" AND source_format IN (");
+        for (index, format) in formats.iter().enumerate() {
+            if index > 0 {
+                builder.push(", ");
+            }
+            builder.push_bind(*format);
+        }
+        builder.push(")");
     }
 
     if let Some(needle) = query.name_contains.as_deref() {

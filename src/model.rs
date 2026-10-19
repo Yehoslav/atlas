@@ -153,6 +153,31 @@ impl SourceFormat {
         }
     }
 
+    /// Every format Atlas accepts, in one place.
+    ///
+    /// Queries about what an upload *could* be — "which media types may this
+    /// collection contain" — are answered from this list rather than a second
+    /// one written beside it, which is how the two start disagreeing.
+    pub const ALL: [SourceFormat; 6] = [
+        SourceFormat::Jpeg,
+        SourceFormat::Png,
+        SourceFormat::Webp,
+        SourceFormat::Pdf,
+        SourceFormat::Doc,
+        SourceFormat::Docx,
+    ];
+
+    /// The collection a file of this format belongs in by default.
+    ///
+    /// This is the format's habit, not a rule: the documents collection also
+    /// accepts images, because a caller may want a picture stored whole.
+    pub fn kind(self) -> Kind {
+        match self {
+            Self::Jpeg | Self::Png | Self::Webp => Kind::Image,
+            Self::Pdf | Self::Doc | Self::Docx => Kind::Document,
+        }
+    }
+
     pub fn is_image(self) -> bool {
         self.magick_name().is_some()
     }

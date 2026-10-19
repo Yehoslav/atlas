@@ -352,6 +352,38 @@ def check_api(checks: Checks) -> None:
         0,
     )
     checks.ok(
+        "mime, exact type",
+        checks.request("GET", "/api/v1/images?mime=image%2Fpng")[1]["total"],
+        1,
+    )
+    checks.ok(
+        "mime, a bare star survives the wire",
+        checks.request("GET", "/api/v1/images?mime=image%2F%2A")[1]["total"],
+        1,
+    )
+    checks.ok(
+        "mime, a group in documents",
+        checks.request("GET", "/api/v1/documents?mime=image%2F%2A")[1]["total"],
+        1,
+    )
+    checks.ok(
+        "mime, exact in documents",
+        checks.request("GET", "/api/v1/documents?mime=application%2Fpdf")[1]["total"],
+        1,
+    )
+    checks.ok(
+        "mime, an unknown type is refused",
+        checks.request("GET", "/api/v1/images?mime=image%2Ftiff")[0],
+        400,
+    )
+    status, error = checks.request("GET", "/api/v1/images?mime=application%2Fpdf")
+    checks.ok("mime, impossible combination is refused", status, 400)
+    checks.ok("  with the same code", error["error"]["code"], "invalid_mime")
+    checks.true(
+        "  and says what images holds",
+        "image/jpeg, image/png and image/webp" in error["error"]["message"],
+    )
+    checks.ok(
         "bad sort is a 400",
         checks.request("GET", "/api/v1/images?sort=largest")[0],
         400,

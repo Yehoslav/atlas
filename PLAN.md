@@ -178,9 +178,13 @@ collections.
   untouched, with no renditions.
 - `GET /api/v1/{kind}` — authenticated listing of that collection with `limit`,
   `offset`, `total`, `state` (`active`, `deleted`, `purged` or `all`), a `q`
-  filename substring, the `created_after`/`created_before`, `bytes_min`/
+  filename substring, a `mime` filter taking an exact media type or a group
+  such as `image/*`, the `created_after`/`created_before`, `bytes_min`/
   `bytes_max` and `width_min`/`height_min` ranges, `sort` by `created_at`,
-  `bytes`, `width` or `filename`, and `order`.
+  `bytes`, `width` or `filename`, and `order`. A `mime` value that Atlas does
+  not accept, or that the collection could never hold, is `400 invalid_mime`
+  rather than an empty page: a filter that quietly matches nothing is worse
+  than one that says why.
 - `GET /api/v1/{kind}/{id}` — authenticated asset metadata, including its `kind`,
   original facts, available width renditions, and lifecycle state.
 - `POST /api/v1/{kind}/actions` — authenticated bulk `pin`, `unpin`, `delete`,
