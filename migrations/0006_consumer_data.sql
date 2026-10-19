@@ -1,0 +1,13 @@
+-- A consumer's own opaque note about an asset.
+--
+-- Atlas stores this and hands it back untouched. It does not read it, does not
+-- search it, does not validate its shape and does not log it: whatever a
+-- consumer puts here is theirs to interpret, and the only things Atlas does
+-- with the column are enforce a size limit and move the bytes.
+--
+-- The column is named more explicitly than the API field ("data") on purpose.
+-- A migration is what someone reads before touching a column, and the one
+-- thing worth being unambiguous about here is that Atlas does not own it.
+--
+-- NULL means unset, and is how the column stays cheap: listings never carry it.
+ALTER TABLE assets ADD COLUMN consumer_data TEXT;

@@ -14,6 +14,7 @@ pub struct Config {
     pub id_length: usize,
     pub max_image_bytes: u64,
     pub max_document_bytes: u64,
+    pub max_consumer_data_bytes: u64,
     pub max_image_pixels: u64,
     pub max_image_dimension: u32,
     pub variant_widths: Vec<u32>,
@@ -91,6 +92,15 @@ impl Config {
                 )?,
                 "ATLAS_MAX_DOCUMENT_BYTES",
             )?,
+            max_consumer_data_bytes: positive(
+                setting(
+                    &file.max_consumer_data_bytes,
+                    "ATLAS_MAX_CONSUMER_DATA_BYTES",
+                    64 * 1024,
+                    parse_u64,
+                )?,
+                "ATLAS_MAX_CONSUMER_DATA_BYTES",
+            )?,
             max_image_pixels: positive(
                 setting(
                     &file.max_image_pixels,
@@ -148,6 +158,7 @@ struct FileConfig {
     id_length: Option<usize>,
     max_image_bytes: Option<u64>,
     max_document_bytes: Option<u64>,
+    max_consumer_data_bytes: Option<u64>,
     max_image_pixels: Option<u64>,
     max_image_dimension: Option<u32>,
     variant_widths: Option<Vec<u32>>,

@@ -397,6 +397,61 @@ def check_api(checks: Checks) -> None:
         "no token is a 401", checks.request("GET", "/api/v1/images", token=None)[0], 401
     )
 
+    print("\n== a consumer's own data ==", flush=True)
+    # Deliberately awkward: unicode, markup, and something that only looks like
+    # JSON. It has to come back exactly as it went in.
+    opaque = "Прогулки\n<em>с Alder</em> — {\"looks\": \"like json\"}"
+    status, _ = checks.request(
+        "PUT",
+        f"/api/v1/documents/{document_id}/data",
+        {"data": opaque},
+    )
+    checks.ok("stored", status, 200)
+    status, asset = checks.request("GET", f"/api/v1/documents/{document_id}")
+    checks.ok("  comes back verbatim", asset["data"], opaque)
+
+    checks.ok(
+        "  replaceable",
+        checks.request(
+            "PUT", f"/api/v1/documents/{document_id}/data", {"data": "shorter"}
+        )[0],
+        200,
+    )
+    checks.request("PUT", f"/api/v1/documents/{document_id}/data", {"data": None})
+    _, cleared = checks.request("GET", f"/api/v1/documents/{document_id}")
+    checks.true("  and clearable", "data" not in cleared)
+
+    checks.request(
+        "PUT", f"/api/v1/documents/{document_id}/data", {"data": "keep me"}
+    )
+    _, listed = checks.request("GET", "/api/v1/documents")
+    entry = next(
+        (a for a in listed["assets"] if a["id"] == document_id),
+        {},
+    )
+    checks.true("  absent from listings", "data" not in entry)
+    _, searched = checks.request(
+        "GET", "/api/v1/documents?q=keep%20me"
+    )
+    checks.ok("  and never searched", searched["total"], 0)
+
+    checks.ok(
+        "  capped",
+        checks.request(
+            "PUT",
+            f"/api/v1/documents/{document_id}/data",
+            {"data": "x" * 70_000},
+        )[0],
+        400,
+    )
+    checks.ok(
+        "  addressed by collection",
+        checks.request(
+            "PUT", f"/api/v1/images/{document_id}/data", {"data": "wrong"}
+        )[0],
+        404,
+    )
+
     print("\n== formats ==", flush=True)
     status, formats = checks.request("GET", "/api/v1/formats")
     checks.ok(

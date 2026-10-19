@@ -294,6 +294,10 @@ pub struct AssetRecord {
     pub purged_at: Option<i64>,
     /// Set by a consuming application that still uses this asset, so purge skips it.
     pub pinned: bool,
+    /// A consumer's own opaque note. Atlas stores it, hands it back untouched
+    /// and never looks inside; see the migration for why the column is named
+    /// more plainly than the API field.
+    pub consumer_data: Option<String>,
 }
 
 impl AssetRecord {

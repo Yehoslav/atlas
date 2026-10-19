@@ -77,6 +77,12 @@ as an attachment instead of being re-encoded into a picture.
   Returns `204`, or `409` if the asset was already purged.
 - `PUT /api/v1/{kind}/{id}/pin` — authenticated usage registration. Body
   `{"pinned": true|false}`; purge skips pinned assets.
+- `PUT /api/v1/{kind}/{id}/data` — authenticated consumer-owned note. Body
+  `{"data": "..."}`, or `{"data": null}` to clear. Atlas stores it, caps it at
+  `ATLAS_MAX_CONSUMER_DATA_BYTES` (64 KiB) and hands it back untouched: it does
+  not read the value, validate its shape, search it or log it. Returned by
+  `GET /api/v1/{kind}/{id}` and deliberately absent from listings, so a page of
+  assets cannot grow into a page of blobs.
 - `GET /api/v1/trash` — authenticated listing of trashed and purged assets from
   both collections, paged with `limit` (default 200, max 500) and `offset`.
 - `GET /media/{id}/original` — public original delivery.
@@ -414,6 +420,7 @@ Environment variables override the file, which is useful for per-host values:
 | `ATLAS_ID_LENGTH` | `18` | Asset ID length, 12–24 characters |
 | `ATLAS_MAX_IMAGE_BYTES` | 20 MiB | Streaming image-upload limit |
 | `ATLAS_MAX_DOCUMENT_BYTES` | 50 MiB | Streaming document-upload limit |
+| `ATLAS_MAX_CONSUMER_DATA_BYTES` | 64 KiB | Cap on a consumer's opaque `data` |
 | `ATLAS_MAX_IMAGE_PIXELS` | 40,000,000 | Decoded image pixel limit |
 | `ATLAS_MAX_IMAGE_DIMENSION` | 12,000 | Maximum image width or height |
 | `ATLAS_VARIANT_WIDTHS` | `320,640,960,1280` | Fixed maximum-width profiles |

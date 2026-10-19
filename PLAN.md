@@ -132,6 +132,24 @@ still branches exactly where it does today; and deduplication must be keyed on
 every later one — a document first would answer a photo request with an asset
 that has no renditions.
 
+### One opaque field, and the rule that keeps it one
+
+A consumer sometimes needs to record something about an asset that Atlas has no
+business knowing: a provenance note, a licence, where a scan came from. So
+`data` is a column Atlas stores, caps and hands back without looking inside.
+
+The purity of the core lives in the behaviours rather than the schema, which is
+the only place it can live and still be worth anything. The rule that follows:
+
+> If Atlas ever needs to *act* on something a consumer tells it, add a narrow
+> typed signal like `pin` — one fact, one meaning, machine-readable. Never a
+> general field it then has to interpret.
+
+`pin` is the worked example of the first half. `data` is the worked example of
+the second: the escape hatch stays useful precisely while nothing is built on
+top of it. A filter over it, a schema for it, or a listing that sorts by it
+would each be the moment the core started interpreting what it owns nothing of.
+
 ### Typed where mistakes cost something, uniform where mixing is natural
 
 Mutations and rendition requests are typed: `POST /api/v1/images`,
@@ -201,6 +219,9 @@ collections.
 - `DELETE /api/v1/{kind}/{id}` — authenticated move to the trash.
 - `POST /api/v1/{kind}/{id}/restore` — authenticated restore from the trash.
 - `PUT /api/v1/{kind}/{id}/pin` — authenticated usage registration.
+- `PUT /api/v1/{kind}/{id}/data` — authenticated consumer-owned opaque note.
+  Atlas caps it, stores it and returns it verbatim; it never reads, validates,
+  searches or logs the value, and listings omit it.
 - `GET /api/v1/trash` — authenticated listing of trashed and purged assets from
   both collections, paged with `limit` (default 200, max 500) and `offset`, with
   a `total`.

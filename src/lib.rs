@@ -286,6 +286,12 @@ pub fn app(state: AppState) -> Router {
             axum::routing::post(api::restore_asset),
         )
         .route("/api/v1/{kind}/{id}/pin", axum::routing::put(api::set_pin))
+        // A consumer's own opaque note. Typed like the rest: it belongs to an
+        // asset, and an asset belongs to a collection.
+        .route(
+            "/api/v1/{kind}/{id}/data",
+            axum::routing::put(api::set_data),
+        )
         .route(
             "/api/v1/{kind}/actions",
             axum::routing::post(api::bulk_actions),

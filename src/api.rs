@@ -76,6 +76,13 @@ pub(super) struct AssetResponse {
     /// something a field states directly.
     #[serde(skip_serializing_if = "Option::is_none")]
     deduplicated: Option<bool>,
+    /// A consumer's opaque note, exactly as they wrote it.
+    ///
+    /// Left `None` by `From<&StoredAsset>`, which is what listings and
+    /// summaries go through, so a page of fifty assets cannot grow into fifty
+    /// blobs. Only the single-asset read attaches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
     created_at: i64,
     kind: Kind,
     state: AssetState,
@@ -141,6 +148,12 @@ pub(super) struct PinRequest {
     pinned: bool,
 }
 
+/// A consumer's opaque note. `null` clears it.
+#[derive(Deserialize)]
+pub(super) struct DataRequest {
+    data: Option<String>,
+}
+
 /// How many ids one state lookup may carry. A page of photos is the use case;
 /// anything larger is a caller bug or an attempt to make Atlas a database.
 const MAX_STATE_IDS: usize = 500;
@@ -172,6 +185,13 @@ pub(super) struct StateResponse {
 }
 
 impl AssetResponse {
+    /// The single-asset read, which is the only place a consumer's own data is
+    /// worth the bytes on the wire.
+    fn with_data(mut self, data: Option<String>) -> Self {
+        self.data = data;
+        self
+    }
+
     fn deduplicated(mut self) -> Self {
         self.deduplicated = Some(true);
         self
@@ -206,6 +226,7 @@ impl From<&StoredAsset> for AssetResponse {
         Self {
             id: asset.id.to_string(),
             deduplicated: None,
+            data: None,
             created_at: asset.created_at,
             kind: asset.kind.unwrap_or_else(|| asset.source_format.kind()),
             state: asset.state(),
@@ -465,6 +486,7 @@ async fn create_asset(
         deleted_at: None,
         purged_at: None,
         pinned: false,
+        consumer_data: None,
     };
 
     let mut final_dir = state.asset_dir(&record.id);
@@ -569,7 +591,10 @@ pub(super) async fn get_asset(
     authorize(&state, &headers)?;
     let kind = parse_kind(&kind)?;
     let asset = load_asset(&state, &parse_id(&id)?, Some(kind)).await?;
-    Ok(Json(AssetResponse::from(&asset)))
+    // One of only two places a consumer's own data is attached; see the field.
+    Ok(Json(
+        AssetResponse::from(&asset).with_data(asset.asset.consumer_data.clone()),
+    ))
 }
 
 /// Move an asset to the trash instead of destroying it.
@@ -678,6 +703,48 @@ pub(super) async fn set_pin(
     set_pinned_inner(&state, &id, body.pinned).await?;
     let asset = load_asset(&state, &id, Some(kind)).await?;
     Ok(Json(AssetResponse::from(&asset)))
+}
+
+/// Store, replace or clear a consumer's own note about an asset.
+///
+/// Atlas enforces a size limit and nothing else. There is no schema, no
+/// validation and no interpretation of the value anywhere on this path: the
+/// field was documented as opaque, and reading into it is exactly the thing
+/// that would make Atlas a content store.
+pub(super) async fn set_data(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((kind, id)): Path<(String, String)>,
+    Json(body): Json<DataRequest>,
+) -> Result<Json<AssetResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let kind = parse_kind(&kind)?;
+    let id = parse_id(&id)?;
+    if let Some(data) = body.data.as_deref() {
+        if data.len() > state.config.max_consumer_data_bytes as usize {
+            return Err(ApiError::bad_request(
+                "data_too_large",
+                format!(
+                    "data is {} bytes; the limit is {}.",
+                    data.len(),
+                    state.config.max_consumer_data_bytes
+                ),
+            ));
+        }
+    }
+    load_asset(&state, &id, Some(kind)).await?;
+    if !state
+        .store
+        .set_consumer_data(&id, body.data.as_deref())
+        .await
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::not_found());
+    }
+    let asset = load_asset(&state, &id, Some(kind)).await?;
+    Ok(Json(
+        AssetResponse::from(&asset).with_data(asset.asset.consumer_data.clone()),
+    ))
 }
 
 async fn set_pinned_inner(state: &AppState, id: &AssetId, pinned: bool) -> Result<(), ApiError> {
@@ -1936,6 +2003,7 @@ mod tests {
             id_length: 18,
             max_image_bytes: 1024 * 1024,
             max_document_bytes: 1024,
+            max_consumer_data_bytes: 1024,
             max_image_pixels: 40_000_000,
             max_image_dimension: 12_000,
             variant_widths: vec![320, 640],
@@ -1986,6 +2054,17 @@ mod tests {
             .uri(uri)
             .header("authorization", "Bearer prototype-test-token")
             .body(Body::empty())
+            .unwrap()
+    }
+
+    /// An authorized request with a JSON body, for the write endpoints.
+    fn json_request(method: &str, uri: &str, body: &serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer prototype-test-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
             .unwrap()
     }
 
@@ -2780,6 +2859,221 @@ mod tests {
 
     /// A consumer building an upload form should be able to ask rather than
     /// hardcode a list that drifts on the next release.
+    /// A consumer's opaque note comes back exactly as written, and nothing on
+    /// this path looks inside it. The value below is deliberately awkward:
+    /// unicode, newlines, markup, and something that only *looks* like JSON.
+    const OPAQUE: &str = "Прогулки\n<em>с Alder</em> — {\"looks\": \"like json\"}";
+
+    async fn data_test_asset() -> (tempfile::TempDir, Router, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        // Named, so the test can also show that searching the *filename* still
+        // works while searching the note does not.
+        let (status, body) = send(
+            &router,
+            upload_named("application/pdf", b"%PDF-1.7\nnotes", "holiday notes.pdf"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"].as_str().unwrap().to_owned();
+        (directory, router, id)
+    }
+
+    async fn put_data(
+        router: &Router,
+        collection: &str,
+        id: &str,
+        data: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        send(
+            router,
+            json_request("PUT", &format!("/api/v1/{collection}/{id}/data"), &data),
+        )
+        .await
+    }
+
+    /// A call that is only interesting if it is refused.
+    async fn put_data_expecting(
+        router: &Router,
+        collection: &str,
+        id: &str,
+        data: serde_json::Value,
+        status: StatusCode,
+    ) {
+        let (got, body) = put_data(router, collection, id, data).await;
+        assert_eq!(got, status, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_consumers_data_comes_back_exactly_as_written() {
+        let (_directory, router, id) = data_test_asset().await;
+
+        let (status, _) = put_data(
+            &router,
+            "documents",
+            &id,
+            serde_json::json!({ "data": OPAQUE }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/documents/{id}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"], OPAQUE, "byte for byte, not reformatted");
+
+        // Replacing it replaces it; there is no merge.
+        let (status, _) = put_data(
+            &router,
+            "documents",
+            &id,
+            serde_json::json!({ "data": "just this" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/documents/{id}")),
+        )
+        .await;
+        assert_eq!(body["data"], "just this");
+
+        // And null clears it, which makes the field absent rather than empty.
+        let (status, _) = put_data(
+            &router,
+            "documents",
+            &id,
+            serde_json::json!({ "data": null }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/documents/{id}")),
+        )
+        .await;
+        assert!(
+            body.get("data").is_none(),
+            "cleared, not set to an empty string: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_never_carries_a_consumers_data() {
+        let (_directory, router, id) = data_test_asset().await;
+        put_data(
+            &router,
+            "documents",
+            &id,
+            serde_json::json!({ "data": OPAQUE }),
+        )
+        .await;
+
+        let (status, body) = send(&router, authorized("GET", "/api/v1/documents")).await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = body["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id.as_str())
+            .expect("the asset should be in the page");
+        assert!(
+            entry.get("data").is_none(),
+            "a page of assets must not grow into a page of blobs: {entry}"
+        );
+    }
+
+    /// The invariant that makes the field safe to have: Atlas does not read it.
+    #[tokio::test]
+    async fn a_consumers_data_is_never_searched() {
+        let (_directory, router, id) = data_test_asset().await;
+        put_data(
+            &router,
+            "documents",
+            &id,
+            serde_json::json!({ "data": "zzzunmistakablezzz" }),
+        )
+        .await;
+
+        let (_, by_name) = send(&router, authorized("GET", "/api/v1/documents?q=notes")).await;
+        assert_eq!(
+            by_name["total"], 1,
+            "the filename still matches, as it always did"
+        );
+
+        let (_, by_data) = send(
+            &router,
+            authorized("GET", "/api/v1/documents?q=zzzunmistakablezzz"),
+        )
+        .await;
+        assert_eq!(
+            by_data["total"], 0,
+            "Atlas does not index what it does not own: searching it would mean interpreting it"
+        );
+    }
+
+    #[tokio::test]
+    async fn consumers_data_is_capped_and_addressed_like_everything_else() {
+        let (_directory, router, id) = data_test_asset().await;
+
+        // The test config caps data at 1 KiB.
+        let big = "x".repeat(2048);
+        let (status, error) = put_data(
+            &router,
+            "documents",
+            &id,
+            serde_json::json!({ "data": big }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "data_too_large");
+
+        // The note that fit is still the one that is stored: a refused write
+        // changed nothing.
+        let (_, body) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/documents/{id}")),
+        )
+        .await;
+        assert!(body.get("data").is_none());
+
+        put_data_expecting(
+            &router,
+            "images",
+            &id,
+            serde_json::json!({ "data": "wrong collection" }),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        put_data_expecting(
+            &router,
+            "documents",
+            "nosuchid0000000000",
+            serde_json::json!({ "data": "unknown id" }),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        let (status, _) = send(
+            &router,
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/documents/{id}/data"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "data": "no token" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn the_accepted_formats_are_readable_and_true() {
         let directory = tempfile::tempdir().unwrap();

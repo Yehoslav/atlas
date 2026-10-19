@@ -431,7 +431,7 @@ impl Store {
 
         let mut page = QueryBuilder::<Sqlite>::new(
             "SELECT id, source_format, bytes, sha256, width, height, created_at, \
-             original_name, kind, deleted_at, purged_at, pinned FROM assets",
+             original_name, kind, deleted_at, purged_at, pinned, consumer_data FROM assets",
         );
         push_filters(&mut page, &query);
         page.push(format!(" ORDER BY {ordering} LIMIT "));
@@ -553,7 +553,7 @@ impl Store {
     pub async fn get_asset(&self, id: &AssetId) -> Result<Option<StoredAsset>, StoreError> {
         let row = sqlx::query(
             "SELECT id, source_format, bytes, sha256, width, height, created_at,
-                    original_name, kind, deleted_at, purged_at, pinned
+                    original_name, kind, deleted_at, purged_at, pinned, consumer_data
              FROM assets WHERE id = ?",
         )
         .bind(id.as_str())
@@ -606,6 +606,24 @@ impl Store {
         .bind(id.as_str())
         .execute(&self.pool)
         .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Store, replace, or clear a consumer's opaque note.
+    ///
+    /// The value is bound straight through. There is no validation of its shape
+    /// anywhere in this path, because a consumer is entitled to put whatever it
+    /// likes in a field the API documented as opaque.
+    pub async fn set_consumer_data(
+        &self,
+        id: &AssetId,
+        data: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query("UPDATE assets SET consumer_data = ? WHERE id = ?")
+            .bind(data)
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -677,7 +695,7 @@ impl Store {
     ) -> Result<Vec<StoredAsset>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, source_format, bytes, sha256, width, height, created_at,
-                    original_name, kind, deleted_at, purged_at, pinned
+                    original_name, kind, deleted_at, purged_at, pinned, consumer_data
              FROM assets WHERE deleted_at IS NOT NULL
              ORDER BY deleted_at DESC, id ASC
              LIMIT ? OFFSET ?",
@@ -767,6 +785,7 @@ fn asset_from_row(
         deleted_at: row.try_get("deleted_at")?,
         purged_at: row.try_get("purged_at")?,
         pinned: row.try_get::<bool, _>("pinned")?,
+        consumer_data: row.try_get("consumer_data")?,
     }))
 }
 
@@ -852,6 +871,7 @@ mod tests {
             deleted_at: None,
             purged_at: None,
             pinned: false,
+            consumer_data: None,
         }
     }
 
@@ -968,7 +988,8 @@ mod tests {
                 deleted_at INTEGER,
                 purged_at INTEGER,
                 pinned INTEGER NOT NULL DEFAULT 0,
-                note TEXT
+                note TEXT,
+                consumer_data TEXT
             )",
         )
         .execute(&mut *transaction)
@@ -976,9 +997,11 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO assets_new (id, source_format, bytes, sha256, width, height,
-                                     created_at, original_name, kind, deleted_at, purged_at, pinned)
+                                     created_at, original_name, kind, deleted_at, purged_at, pinned,
+                                     consumer_data)
              SELECT id, source_format, bytes, sha256, width, height,
-                    created_at, original_name, kind, deleted_at, purged_at, pinned
+                    created_at, original_name, kind, deleted_at, purged_at, pinned,
+                    consumer_data
              FROM assets",
         )
         .execute(&mut *transaction)
