@@ -42,11 +42,18 @@ class Photo:
     width: int | None
     height: int | None
     uploaded_at: str
+    # When the album deleted this photo; None while it is in the album.
+    deleted_at: str | None
     renditions: tuple[Rendition, ...]
 
     @property
     def is_image(self) -> bool:
         return self.content_type.startswith("image/")
+
+    @property
+    def is_deleted(self) -> bool:
+        """Deleted by this album, as opposed to gone from Atlas behind its back."""
+        return self.deleted_at is not None
 
 
 def connect(database: str | Path) -> sqlite3.Connection:
@@ -98,6 +105,10 @@ def migrate(connection: sqlite3.Connection) -> None:
             "UPDATE photos SET collection ="
             " CASE WHEN content_type LIKE 'image/%' THEN 'images' ELSE 'documents' END"
         )
+    if "deleted_at" not in columns:
+        # Every photo that exists today is in the album; NULL means that, so
+        # there is nothing to backfill.
+        connection.execute("ALTER TABLE photos ADD COLUMN deleted_at TEXT")
 
 
 # --- folders ---------------------------------------------------------------
@@ -145,6 +156,9 @@ def list_photos(
     sql = [
         "SELECT photos.*, folders.name AS folder_name"
         + " FROM photos LEFT JOIN folders ON folders.id = photos.folder_id"
+        # Deleted photos keep their row but leave the album. One clause covers
+        # the index, the folder views and the tag views at once.
+        + " WHERE photos.deleted_at IS NULL"
     ]
     clauses: list[str] = []
     parameters: list[Any] = []
@@ -249,8 +263,42 @@ def update_photo(
 
 
 def delete_photo(connection: sqlite3.Connection, photo_id: int) -> None:
-    connection.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
+    """Take a photo out of the album without forgetting it.
+
+    The row stays, with its description, alt text, tags and folder, because
+    Atlas may be able to bring the bytes back and a restore has no way to
+    reconstruct any of that. Only the album can delete; only the album can undo.
+    """
+    connection.execute(
+        "UPDATE photos SET deleted_at = ? WHERE id = ?", (utcnow(), photo_id)
+    )
     connection.commit()
+
+
+def restore_photo(connection: sqlite3.Connection, asset_id: str) -> bool:
+    """Put a deleted photo back in the album. True if there was one to restore."""
+    cursor = connection.execute(
+        "UPDATE photos SET deleted_at = NULL WHERE asset_id = ? AND deleted_at IS NOT NULL",
+        (asset_id,),
+    )
+    connection.commit()
+    return cursor.rowcount > 0
+
+
+def list_deleted_photos(connection: sqlite3.Connection) -> list[Photo]:
+    """The album's own deleted photos, newest deletion first.
+
+    This is deliberately not Atlas's trash listing. That would list assets
+    uploaded by a CLI or removed outside the album, which the album has no
+    record of and cannot put back into its own pages.
+    """
+    rows = connection.execute(
+        "SELECT photos.*, folders.name AS folder_name"
+        " FROM photos LEFT JOIN folders ON folders.id = photos.folder_id"
+        " WHERE photos.deleted_at IS NOT NULL"
+        " ORDER BY photos.deleted_at DESC, photos.id DESC"
+    )
+    return [_to_photo(connection, row) for row in rows]
 
 
 def normalize_tags(tags: str) -> str:
@@ -291,6 +339,7 @@ def _to_photo(connection: sqlite3.Connection, row: sqlite3.Row) -> Photo:
         width=row["width"],
         height=row["height"],
         uploaded_at=row["uploaded_at"],
+        deleted_at=row["deleted_at"],
         renditions=renditions,
     )
 

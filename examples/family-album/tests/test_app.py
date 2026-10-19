@@ -136,11 +136,23 @@ class FakeAtlas:
         return found
 
     def delete(self, collection: str, asset_id: str) -> None:
+        # Atlas does not destroy anything on request: the asset stays, marked
+        # deleted, until its retention window passes. A fake that popped it out
+        # here would hide every question about what a deleted photo looks like.
         self.deleted.append(asset_id)
-        self.assets.pop(asset_id, None)
+        asset = self.assets.get(asset_id)
+        if asset is not None and asset.collection == collection:
+            self.assets[asset_id] = dataclasses.replace(
+                asset, state="deleted", deleted_at=1_700_000_100
+            )
 
     def restore(self, collection: str, asset_id: str) -> None:
         self.restored.append(asset_id)
+        asset = self.assets.get(asset_id)
+        if asset is not None and asset.collection == collection:
+            self.assets[asset_id] = dataclasses.replace(
+                asset, state="active", deleted_at=None
+            )
 
     def set_pinned(self, collection: str, asset_id: str, pinned: bool) -> Asset:
         self.pins[asset_id] = pinned
@@ -635,13 +647,111 @@ def test_a_trashed_asset_offers_a_restore(client, atlas):
 
 
 def test_trash_page_lists_purged_tombstones(client, atlas):
+    """The album deleted it; Atlas purged it. Both facts are worth showing.
+
+    The album can still name the photo, because it kept the row. Atlas can no
+    longer produce the bytes. Neither service alone could tell this story.
+    """
     upload_png(client)
+    photo_id = _only_photo_id(client, atlas)
     asset_id = next(iter(atlas.assets))
+    assert client.post(f"/photos/{photo_id}/delete").status_code == 302
+
     atlas.assets[asset_id] = dataclasses.replace(atlas.assets[asset_id], state="purged")
 
     body = client.get("/trash").get_data(as_text=True)
     assert asset_id in body
     assert "Purged; the bytes are gone." in body
+    assert "/restore" not in body, "a purged photo offers no way back"
+
+
+def test_a_restored_photo_comes_back_to_the_album(client, atlas):
+    """Deleting then restoring must not quietly lose the photo.
+
+    The album's row carries the description, alt text, tags and folder, and no
+    amount of asking Atlas could rebuild any of them. A restore that leaves the
+    photo out of the album has destroyed them for good.
+    """
+    upload_png(client)
+    photo_id = _only_photo_id(client, atlas)
+    asset_id = next(iter(atlas.assets))
+
+    client.post(f"/photos/{photo_id}", data={"description": "Grandma at 70"})
+    connection = album_db.connect(client.application.config["DATABASE"])
+    try:
+        photo = album_db.get_photo(connection, photo_id)
+        assert photo is not None
+        album_db.delete_photo(connection, photo_id)
+    finally:
+        connection.close()
+
+    index = client.get("/").get_data(as_text=True)
+    assert "Grandma at 70" not in index, "a deleted photo leaves the grid"
+
+    assert client.post(f"/trash/images/{asset_id}/restore").status_code == 302
+
+    index = client.get("/").get_data(as_text=True)
+    assert "Grandma at 70" in index, "and comes back whole when restored"
+
+    connection = album_db.connect(client.application.config["DATABASE"])
+    try:
+        photo = album_db.get_photo(connection, photo_id)
+        assert photo is not None and not photo.is_deleted
+        assert photo.description == "Grandma at 70", "with what only the album knew"
+        assert photo.collection == "images", "and the collection it lives in"
+    finally:
+        connection.close()
+
+
+def test_a_deleted_photo_still_has_a_page_that_explains_itself(client, atlas):
+    upload_png(client)
+    photo_id = _only_photo_id(client, atlas)
+    asset_id = next(iter(atlas.assets))
+    client.post(f"/photos/{photo_id}/delete")
+
+    body = client.get(f"/photos/{photo_id}").get_data(as_text=True)
+    assert body  # not a 404
+    assert "You deleted this photo from the album" in body
+    assert "Restore from the trash" in body, "the way out is on the page itself"
+
+    assert client.post(f"/trash/images/{asset_id}/restore").status_code == 302
+
+
+def test_the_trash_lists_only_what_the_album_deleted(client, atlas):
+    """Atlas's trash also holds assets uploaded elsewhere; they are not ours.
+
+    Restoring one of those could not put it back into the album, because the
+    album never had a row for it. Showing it would be offering an undo that
+    cannot work.
+    """
+    upload_png(client)
+    photo_id = _only_photo_id(client, atlas)
+    client.post(f"/photos/{photo_id}/delete")
+
+    # Something in Atlas's trash that the album has no record of, as if a CLI
+    # had uploaded and removed it.
+    orphan = Asset(
+        id="zzzzzzzzzzzzzzzzzz",
+        kind="image",
+        created_at=1_700_000_000,
+        deduplicated=False,
+        state="deleted",
+        pinned=False,
+        deleted_at=1_700_000_100,
+        purged_at=None,
+        content_type="image/png",
+        bytes=2048,
+        sha256="cafe",
+        width=100,
+        height=80,
+        original_url="/media/zzzzzzzzzzzzzzzzzz/original",
+        renditions=(),
+    )
+    atlas.assets[orphan.id] = orphan
+
+    body = client.get("/trash").get_data(as_text=True)
+    assert orphan.id not in body, "an asset the album never had is not ours to list"
+    assert next(iter(atlas.assets)) != orphan.id
 
 
 def test_atlas_failures_are_reported_not_swallowed(client, atlas):

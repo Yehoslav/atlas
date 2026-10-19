@@ -68,7 +68,9 @@ class UploadResult:
 #: that was deleted is recoverable and a photo that was purged is not, and an
 #: unreachable Atlas says nothing about either.
 ASSET_REASONS = {
-    "deleted": "Deleted in Atlas. The bytes are still in the trash and can be restored.",
+    "deleted": (
+        "Deleted in Atlas. The bytes are still in the trash and can be restored."
+    ),
     "purged": "Purged by Atlas after its retention window. The bytes are gone for good.",
     "missing": (
         "Atlas has no record of this asset: it was never uploaded there, or it "
@@ -78,6 +80,13 @@ ASSET_REASONS = {
         "Atlas could not be reached, so whether it can serve this photo is unknown."
     ),
 }
+
+#: Said when the album itself deleted the photo, which is a different fact from
+#: Atlas having it in the trash: the album knows when, Atlas knows for how long.
+DELETED_BY_ALBUM = (
+    "You deleted this photo from the album on {when}. Atlas still has the bytes, "
+    "so it can be restored with its description and alt text intact."
+)
 
 #: Shown when Atlas stops serving an image between the check below and the
 #: browser's request for it.
@@ -117,6 +126,17 @@ def format_timestamp(value: int | None) -> str:
         return "unknown"
     moment = datetime.fromtimestamp(value, tz=UTC)
     return moment.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def format_day(value: str | None) -> str:
+    """An album-side stamp, which is ISO text rather than Unix seconds."""
+    if not value:
+        return "an earlier date"
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return moment.strftime("%Y-%m-%d")
 
 
 class AlbumImages:
@@ -273,6 +293,8 @@ def create_app(
         "fallback_reason": FALLBACK_REASON,
         "human_bytes": human_bytes,
         "timestamp": format_timestamp,
+        "day": format_day,
+        "deleted_by_album": DELETED_BY_ALBUM,
         "max_upload_bytes": max_upload_bytes,
         "grid_widths": GRID_WIDTHS,
         "thumbnail_width": THUMBNAIL_WIDTH,
@@ -471,24 +493,34 @@ def create_app(
 
     @app.get("/trash")
     def trash() -> ResponseReturnValue:
-        try:
-            entries, error = client.trash(), None
-        except AtlasError as failure:
-            entries, error = [], failure.message
-        return render_template("trash.html", entries=entries, atlas_error=error)
+        connection = get_db()
+        entries = album_db.list_deleted_photos(connection)
+        # One batched question to Atlas about the album's own deleted photos:
+        # the bytes may still be restorable, already purged, or gone entirely.
+        # The two services hold different parts of this, and the page shows
+        # both rather than pretending either one is the whole truth.
+        checks = check_assets(photo.asset_id for photo in entries)
+        return render_template("trash.html", entries=entries, checks=checks)
 
     @app.post("/trash/<collection>/<asset_id>/restore")
     def restore(collection: str, asset_id: str) -> ResponseReturnValue:
         if collection not in ("images", "documents"):
             abort(404)
         try:
-            # The collection is part of Atlas's route, and the trash listing is
-            # where the album learned which one this asset is in.
+            # The collection comes from the album's own row, which recorded it
+            # at upload: guessing it from the content type would send a picture
+            # stored as a document to the images route, where it is not found.
             client.restore(collection, asset_id)
         except AtlasError as error:
             flash(f"Atlas refused to restore that asset: {error.message}", "error")
         else:
-            flash("Restored. Its public URLs serve the original bytes again.", "ok")
+            if album_db.restore_photo(get_db(), asset_id):
+                flash(
+                    "Restored. It is back in the album with its description intact.",
+                    "ok",
+                )
+            else:
+                flash("Restored in Atlas. The album has no record of it.", "warn")
         return redirect(url_for("trash"))
 
     @app.post("/folders")

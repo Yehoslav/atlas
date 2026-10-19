@@ -146,7 +146,7 @@ broken image, and when it cannot show one it says which of five things happened.
 | State | What the page shows |
 | --- | --- |
 | `active` | The image |
-| `deleted` | "Deleted in Atlas. The bytes are still in the trash and can be restored", with a Restore button on the photo page |
+| `deleted` | "Deleted in Atlas. The bytes are still in the trash and can be restored", with a Restore button on the photo page — or, if the album is the one that deleted it, "You deleted this photo from the album on *date*", because that half of the story only the album knows |
 | `purged` | "Purged by Atlas after its retention window. The bytes are gone for good" |
 | `404` | "Atlas has no record of this asset" |
 | Atlas down | "Atlas could not be reached, so whether it can serve this photo is unknown" |
@@ -163,7 +163,7 @@ broken image, and when it cannot show one it says which of five things happened.
 | `POST /photos/<id>/pin` | Toggle Atlas's purge pin by hand |
 | `POST /photos/<id>/attach` | Add this photo to a post and pin the asset |
 | `GET /posts` | Posts, publishing, and the photos in a post |
-| `GET /trash` | Atlas's trashed and purged assets (first page) |
+| `GET /trash` | The photos this album deleted, each with what Atlas still has |
 | `POST /trash/<collection>/<asset_id>/restore` | Restore one |
 
 ## Deleting, end to end
@@ -174,13 +174,25 @@ broken image, and when it cannot show one it says which of five things happened.
 2. `DELETE /api/v1/images/{id}` moves the bytes into Atlas's trash. Atlas stamps
    the delete *before* the files move, so the public URLs start serving a
    placeholder immediately.
-3. The album drops its own row. Published posts now show a placeholder rather
-   than a broken image.
-4. `POST /trash/<collection>/{id}/restore` brings the original bytes back at the
-   same URLs. The album knows the collection because it recorded it at upload.
+3. The album stamps `photos.deleted_at` and **keeps the row**. It has to: the
+   description, alt text, tags and folder exist only here, and no amount of
+   asking Atlas could rebuild them. A photo leaves the grid and the folder and
+   tag views, and its own page keeps working, saying the album deleted it and
+   when.
+4. `POST /trash/<collection>/{id}/restore` clears that stamp and tells Atlas to
+   put the bytes back at the same URLs. The collection comes from the album's
+   own row, recorded at upload — guessing it from the content type would send a
+   picture stored as a document to the images route, where it is not found.
 5. If nobody restores it, Atlas purges it after `ATLAS_TRASH_RETENTION_DAYS` and
-   keeps a tombstone. The album's row says the asset was purged; that is the
-   point of `GET /api/v1/images/{id}` reporting `state`.
+   keeps a tombstone. The album's row survives and can now say *the bytes are
+   gone for good*, which is a fact only Atlas has.
+
+The two services hold different halves of this and the pages show both rather
+than pretending either is the whole truth: the album knows *when you deleted
+it*, Atlas knows *whether the bytes still exist*. That is the point of an
+example — the album's trash page lists its own deletions, not everything in
+Atlas's trash, because an asset uploaded by a command line was never in the
+album and could not be put back into it.
 
 ## Tests
 

@@ -28,7 +28,14 @@ CREATE TABLE IF NOT EXISTS photos (
     bytes        INTEGER NOT NULL,
     width        INTEGER,
     height       INTEGER,
-    uploaded_at  TEXT    NOT NULL
+    uploaded_at  TEXT    NOT NULL,
+    -- When the album deleted this photo, or NULL while it is in the album.
+    --
+    -- Deleted photos keep their row. Atlas keeps the bytes for a while and can
+    -- restore them, and a restore cannot rebuild a description, alt text or
+    -- folder — so throwing the row away at delete time is throwing away
+    -- something only the album knows, for good.
+    deleted_at   TEXT
 );
 
 -- The widths Atlas actually generated for this photo, copied from the upload

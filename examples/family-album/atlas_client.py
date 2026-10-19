@@ -428,6 +428,13 @@ class AtlasClient:
         return _parse_asset(response.json(), self.media_base_url)
 
     def trash(self) -> list[TrashEntry]:
+        """Everything in Atlas's trash, across both collections.
+
+        The album does not use this: it lists its own deletions instead, because
+        an asset deleted by a command line was never in the album and
+        restoring it could not put it back into the album's pages. A dashboard
+        for the whole instance is what needs this, and it is the next example.
+        """
         response = self._send("GET", "/api/v1/trash", headers=self._headers())
         self._raise_for_status(response)
         return [
@@ -516,8 +523,6 @@ class AtlasLike(Protocol):
     def set_pinned(self, collection: str, asset_id: str, pinned: bool) -> Asset: ...
 
     def states(self, asset_ids: list[str]) -> dict[str, AssetState]: ...
-
-    def trash(self) -> list[TrashEntry]: ...
 
     def original_url(self, asset_id: str) -> str: ...
 

@@ -24,7 +24,12 @@
         {# Say why, and offer the way out where one exists. #}
         <div class="missing missing-large" data-state="{{ check.status }}">
           <strong>No image to show</strong>
-          <span>{{ check.reason }}</span>
+          {# The album and Atlas each know a different half of this. #}
+          {% if photo.is_deleted %}
+            <span>{{ deleted_by_album.format(when=day(photo.deleted_at)) }}</span>
+          {% else %}
+            <span>{{ check.reason }}</span>
+          {% endif %}
           {% if check.status == 'deleted' %}
             <form method="post" action="{{ url_for('restore', collection=photo.collection, asset_id=photo.asset_id) }}">
               <button type="submit">Restore from the trash</button>
