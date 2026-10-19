@@ -1,0 +1,25 @@
+[package]
+name = "cms-admin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "An admin dashboard for Atlas, written as an ordinary API consumer"
+license = "GPL-3.0-only"
+
+# Deliberately not a member of the service's workspace, and deliberately not
+# depending on `atlas`. Everything here goes over HTTP, which is the point of
+# the example: it is how we test the API from the outside.
+[workspace]
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+futures-util = "0.3"
+minijinja = { version = "2", features = ["loader"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.6", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"

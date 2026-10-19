@@ -41,10 +41,15 @@ impl Kind {
     }
 
     /// Parse a URL segment. Anything else is not a collection.
+    ///
+    /// The stored key is accepted as well as the slug. A caller that read
+    /// `kind` out of a response and put it straight into a route gets the
+    /// collection it meant instead of a 404 that reads like a missing asset,
+    /// which is the confusing way to be wrong.
     pub fn from_slug(value: &str) -> Option<Self> {
         match value {
-            "images" => Some(Self::Image),
-            "documents" => Some(Self::Document),
+            "images" | "image" => Some(Self::Image),
+            "documents" | "document" => Some(Self::Document),
             _ => None,
         }
     }

@@ -119,6 +119,11 @@ pub(super) struct RenditionResponse {
 #[derive(Serialize)]
 pub(super) struct TrashEntryResponse {
     id: String,
+    /// Which collection this entry lives in, so a caller listing the whole
+    /// trash can address its restore route instead of guessing from the media
+    /// type. The documents collection accepts pictures, so a picture's format
+    /// does not say where it is.
+    kind: Kind,
     state: AssetState,
     created_at: i64,
     deleted_at: Option<i64>,
@@ -252,6 +257,7 @@ impl From<&StoredAsset> for TrashEntryResponse {
         let asset = &value.asset;
         Self {
             id: asset.id.to_string(),
+            kind: asset.kind.unwrap_or_else(|| asset.source_format.kind()),
             state: asset.state(),
             created_at: asset.created_at,
             deleted_at: asset.deleted_at,
@@ -2859,6 +2865,60 @@ mod tests {
 
     /// A consumer building an upload form should be able to ask rather than
     /// hardcode a list that drifts on the next release.
+    /// A picture stored as a document sits in the documents collection while
+    /// its media type says "image", so a caller listing the whole trash cannot
+    /// address its restore route from the format alone.
+    #[tokio::test]
+    async fn a_trash_entry_says_which_collection_it_lives_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let image = write_test_image(&directory.path().join("diagram.png"), "60x40");
+        let (status, asset) = send(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/documents")
+                .header("authorization", "Bearer prototype-test-token")
+                .header("content-type", "image/png")
+                .body(Body::from(image))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = asset["id"].as_str().unwrap().to_owned();
+        assert_eq!(asset["kind"], "document");
+
+        place_in_trash(&router, "documents", &id).await;
+
+        let (status, body) = send(&router, authorized("GET", "/api/v1/trash")).await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = body["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id.as_str())
+            .expect("the asset should be in the trash listing");
+        assert_eq!(
+            entry["kind"], "document",
+            "its format says image; where it lives is documents"
+        );
+        assert_eq!(entry["content_type"], "image/png");
+
+        // And that is enough to address the restore route.
+        let (status, _) = send(
+            &router,
+            authorized(
+                "POST",
+                &format!("/api/v1/{}/{id}/restore", entry["kind"].as_str().unwrap()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
     /// A consumer's opaque note comes back exactly as written, and nothing on
     /// this path looks inside it. The value below is deliberately awkward:
     /// unicode, newlines, markup, and something that only *looks* like JSON.
