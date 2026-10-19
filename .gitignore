@@ -2,5 +2,9 @@
 /data/
 .env
 
+# An example consumer written in Rust builds into its own directory, and
+# `/target/` above is anchored to the root.
+/examples/*/target/
+
 __pycache__/
 *.py[cod]
