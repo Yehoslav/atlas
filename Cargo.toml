@@ -9,6 +9,7 @@ readme = "README.md"
 
 [dependencies]
 axum = { version = "0.8", features = ["json"] }
+dotenvy = "0.15"
 futures-util = "0.3"
 getrandom = "0.3"
 hex = "0.4"

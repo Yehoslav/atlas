@@ -15,6 +15,7 @@ license = "GPL-3.0-only"
 axum = { version = "0.8", features = ["multipart"] }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+dotenvy = "0.15"
 getrandom = "0.3"
 minijinja = { version = "2", features = ["loader"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

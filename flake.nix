@@ -37,6 +37,7 @@
               # so `nix develop` is the whole story.
               python3
               python3Packages.flask
+              python3Packages.python-dotenv
               python3Packages.requests
               python3Packages.pytest
               python3Packages.ruff

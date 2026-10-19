@@ -98,6 +98,18 @@ export ATLAS_MEDIA_URL='http://127.0.0.1:3000' # where the browser reaches /medi
 python app.py
 ```
 
+Or put those in a file, so they do not have to be exported every time:
+
+```sh
+cp .env.example .env
+$EDITOR .env
+python app.py
+```
+
+The album reads `.env` from beside this module, or from the path in
+`ALBUM_ENV_FILE`. Its values only fill in what the environment does not
+already provide, so an exported variable still wins.
+
 Open <http://127.0.0.1:5000>.
 
 ### Where the token lives

@@ -307,3 +307,27 @@ def test_only_supported_content_types_are_named():
     assert content_type_for("report.pdf") == "application/pdf"
     assert content_type_for("raw.cr2") is None
     assert content_type_for("script.sh") is None
+
+
+def test_a_local_env_file_fills_in_what_the_environment_does_not_have(
+    tmp_path, monkeypatch
+):
+    """The settings should not have to be exported by hand every time."""
+    from app import create_app
+    from atlas_client import AtlasClient
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "ATLAS_API_TOKEN=from-the-file\nATLAS_API_URL=http://127.0.0.1:3999\n"
+    )
+    monkeypatch.setenv("ALBUM_ENV_FILE", str(env_file))
+    monkeypatch.delenv("ATLAS_API_TOKEN", raising=False)
+    monkeypatch.delenv("ATLAS_API_URL", raising=False)
+
+    app = create_app(database=tmp_path / "album.sqlite3")
+    assert app.test_client().get("/").status_code == 200
+    assert AtlasClient.from_env().api_url == "http://127.0.0.1:3999"
+
+    # And a real environment variable still wins over the file.
+    monkeypatch.setenv("ATLAS_API_URL", "http://127.0.0.1:3888")
+    assert AtlasClient.from_env().api_url == "http://127.0.0.1:3888"

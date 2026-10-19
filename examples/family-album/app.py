@@ -21,6 +21,7 @@ from typing import Any
 import album_db
 import atlas_client
 from atlas_client import AtlasClient, AtlasError, AtlasLike, content_type_for
+from dotenv import load_dotenv
 from flask import (
     Flask,
     abort,
@@ -215,10 +216,27 @@ class AlbumImages:
         return self.rendition_url(photo, widest), rendition.width, rendition.height
 
 
+def _load_local_env() -> None:
+    """Read a local `.env` file, if there is one.
+
+    `ALBUM_ENV_FILE` names the file explicitly; otherwise the one beside this
+    module is used. Its values only fill in what the environment does not
+    already provide, so an exported variable still wins.
+    """
+    explicit = os.environ.get("ALBUM_ENV_FILE")
+    if explicit:
+        load_dotenv(explicit, override=False)
+    else:
+        load_dotenv(override=False)
+
+
 def create_app(
     atlas: AtlasLike | None = None,
     database: str | Path | None = None,
 ) -> Flask:
+    # A local `.env` file, if there is one, before anything reads the
+    # environment.
+    _load_local_env()
     app = Flask(__name__)
     # Narrowed once, here, rather than as `AtlasClient | None` in every closure
     # below: by the time anything below runs, there is a client.

@@ -13,6 +13,11 @@ use crate::web::{AppState, router};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // A local `.env` file, if there is one, before anything reads the
+    // environment. Its values only fill in what the environment does not
+    // already provide.
+    Config::load_local_env()?;
+
     let config = Config::from_env()?;
     let atlas = Atlas::new(&config.atlas_url, &config.atlas_token)?;
     let auth = Auth::new(config.admin_password, config.cookie_secure);

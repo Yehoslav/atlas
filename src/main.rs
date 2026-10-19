@@ -9,6 +9,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("atlas=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // A local `.env` file, if there is one, before anything reads the
+    // environment. Its values only fill in what the environment does not
+    // already provide.
+    Config::load_local_env()?;
+
     let config = Config::from_env()?;
     let address = config.listen_addr.clone();
     let state = AppState::new(config).await?;

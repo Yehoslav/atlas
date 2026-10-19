@@ -25,6 +25,33 @@ pub struct Config {
 }
 
 impl Config {
+    /// Load a local `.env` file, if there is one.
+    ///
+    /// The file is a convenience for development: its values fill in what the
+    /// environment does not already provide, so a real environment variable
+    /// always wins. A missing file is not an error — most deployments set
+    /// their variables some other way — but a malformed one is reported rather
+    /// than silently half-read.
+    ///
+    /// The path is `ATLAS_ENV_FILE` when set, and `.env` in the working
+    /// directory otherwise.
+    pub fn load_local_env() -> Result<(), String> {
+        let path = match env::var("ATLAS_ENV_FILE") {
+            Ok(path) => PathBuf::from(path),
+            Err(env::VarError::NotPresent) => PathBuf::from(".env"),
+            Err(error) => return Err(format!("cannot read ATLAS_ENV_FILE: {error}")),
+        };
+        if !path.is_file() {
+            return Ok(());
+        }
+        // `from_path` keeps the value already in the environment and only fills
+        // in what is missing, which is the precedence this wants: a real
+        // environment variable wins over the file, and the file wins over the
+        // defaults.
+        dotenvy::from_path(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))
+    }
+
     pub fn from_env() -> Result<Self, String> {
         // The API token is deliberately excluded: secrets stay in the environment
         // and never live in a file that could be committed.
@@ -268,6 +295,72 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use super::Config;
+
+    /// A local `.env` file supplies values, but never overrules the
+    /// environment: an operator who exports a variable means it.
+    #[test]
+    fn a_local_env_file_supplies_values_without_overriding_the_environment() {
+        let _guard = env_lock();
+        base_env();
+        remove_var("ATLAS_LISTEN_ADDR");
+        remove_var("ATLAS_ID_LENGTH");
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".env");
+        std::fs::write(
+            &path,
+            "ATLAS_LISTEN_ADDR=127.0.0.1:9999\nATLAS_ID_LENGTH=20\n",
+        )
+        .unwrap();
+        set_var("ATLAS_ENV_FILE", &path.display().to_string());
+
+        Config::load_local_env().unwrap();
+        assert_eq!(
+            std::env::var("ATLAS_LISTEN_ADDR").unwrap(),
+            "127.0.0.1:9999",
+            "the file fills in what the environment does not"
+        );
+        assert_eq!(std::env::var("ATLAS_ID_LENGTH").unwrap(), "20");
+
+        // Now the environment has an opinion.
+        set_var("ATLAS_LISTEN_ADDR", "127.0.0.1:8888");
+        Config::load_local_env().unwrap();
+        assert_eq!(
+            std::env::var("ATLAS_LISTEN_ADDR").unwrap(),
+            "127.0.0.1:8888",
+            "the environment wins over the file"
+        );
+
+        remove_var("ATLAS_ENV_FILE");
+        remove_var("ATLAS_LISTEN_ADDR");
+        remove_var("ATLAS_ID_LENGTH");
+    }
+
+    #[test]
+    fn a_missing_env_file_is_not_an_error() {
+        let _guard = env_lock();
+        base_env();
+        set_var("ATLAS_ENV_FILE", "/nonexistent/atlas/.env");
+        assert!(Config::load_local_env().is_ok());
+        remove_var("ATLAS_ENV_FILE");
+    }
+
+    #[test]
+    fn a_malformed_env_file_is_reported_rather_than_half_read() {
+        let _guard = env_lock();
+        base_env();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".env");
+        std::fs::write(&path, "this line has no equals sign\n").unwrap();
+        set_var("ATLAS_ENV_FILE", &path.display().to_string());
+
+        let error = Config::load_local_env().unwrap_err();
+        assert!(
+            error.contains(".env"),
+            "the message should name the file: {error}"
+        );
+        remove_var("ATLAS_ENV_FILE");
+    }
 
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

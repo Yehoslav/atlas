@@ -398,12 +398,25 @@ an asset: only the consuming site's own content database can answer that.
 
 ## Configuration
 
-Atlas reads settings from, in increasing order of precedence: built-in
-defaults, an optional TOML file, then environment variables. Set
-`ATLAS_CONFIG` to the file's path; without it the file is skipped.
+Atlas reads its settings from four places. In increasing order of precedence:
+
+1. built-in defaults
+2. an optional TOML file, named by `ATLAS_CONFIG`
+3. a local `.env` file
+4. environment variables
+
+A `.env` file is a convenience for development: copy `.env.example` to
+`.env` and the settings stop having to be exported by hand. Its values only
+fill in what the environment does not already provide, so a real environment
+variable always wins over the file. Atlas looks for `.env` in the working
+directory, or at the path in `ATLAS_ENV_FILE`; a missing file is not an error
+and a malformed one is reported rather than half-read.
 
 Non-secret deployment shape belongs in the TOML file, which is safe to commit
-and share across sites:
+and share across sites. Secrets belong in the environment or in a `.env`
+file, both of which are gitignored — never in the TOML, which is why
+`ATLAS_API_TOKEN` is not a file setting and a config file that tries to set it
+will be refused.
 
 ```toml
 # atlas.toml
@@ -426,15 +439,14 @@ image_processing_timeout_secs = 120
 trash_retention_days = 30
 ```
 
-Unknown keys are rejected so typos surface immediately. Secrets stay in the
-environment: `ATLAS_API_TOKEN` is deliberately not a file setting, and a config
-file that tries to set it will be refused.
+Unknown keys are rejected so typos surface immediately.
 
 Environment variables override the file, which is useful for per-host values:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ATLAS_CONFIG` | unset | Path to a TOML configuration file |
+| `ATLAS_ENV_FILE` | unset | Path to a `.env` file; defaults to `.env` in the working directory |
 | `ATLAS_API_TOKEN` | Required | Bearer token for uploads and metadata lookup |
 | `ATLAS_LISTEN_ADDR` | `127.0.0.1:3000` | Bind address |
 | `ATLAS_DATA_DIR` | `./data` | Private persistent state directory; keep it outside the public web root |

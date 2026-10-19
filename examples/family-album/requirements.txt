@@ -2,5 +2,8 @@
 Flask>=3.0,<4
 requests>=2.31,<3
 
+# Reads a local .env file, so the settings do not have to be exported by hand.
+python-dotenv>=1.0,<2
+
 # Only needed to run the example's own tests:
 #   pip install -r requirements.txt pytest

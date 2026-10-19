@@ -30,6 +30,18 @@ export ADMIN_LISTEN='127.0.0.1:5001'
 cargo run --manifest-path examples/cms-admin/Cargo.toml
 ```
 
+Or put those in a file, so they do not have to be exported every time:
+
+```sh
+cp examples/cms-admin/.env.example examples/cms-admin/.env
+$EDITOR examples/cms-admin/.env
+cargo run --manifest-path examples/cms-admin/Cargo.toml
+```
+
+The dashboard looks for `.env` in the working directory and in its own
+directory, or at the path in `ADMIN_ENV_FILE`. Its values only fill in what
+the environment does not already provide, so an exported variable still wins.
+
 `ADMIN_COOKIE_SECURE=true` adds the `Secure` cookie attribute when HTTPS is
 terminated by a reverse proxy. The default is suitable for local HTTP
 development; bind to loopback and put a real deployment behind its TLS proxy.
