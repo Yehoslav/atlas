@@ -1,19 +1,124 @@
 # Atlas
 
 Atlas is an API-first media service for small sites. It stores media files,
-generates a limited set of image renditions, and delivers public assets. Each
-site runs its own Atlas instance alongside its application; the application
-keeps its own structured content and database.
+generates a few fixed image renditions, and delivers public assets over HTTP.
+Each site runs its own Atlas instance next to its own application; the
+application keeps its own content and its own database.
 
-The prototype supports authenticated backend/CLI uploads and public reads. It
-is designed for occasional administrator uploads and mostly blog-style media,
-not as a complete CMS. Image uploads must be web-ready JPEG, PNG, WebP, AVIF,
-JPEG XL or HEIC; camera RAW formats are rejected. PDF and Word documents are
-stored and served without conversion.
+*This project was written with the help of large language models. The design,
+the code and the review are the author's.*
 
-The image formats Atlas accepts are exactly the ones it produces, so anything
-it serves can be uploaded again — the file you just downloaded is not a dead
-end. `GET /api/v1/formats` is the authority on this list.
+## Why Atlas exists
+
+For a site built from the ground up, the media part is the same every time: an
+upload endpoint that validates and limits the file, a handful of image sizes, a
+way to find out whether last month's file is still there, and a trash that does
+not break the pages already pointing at it. Off-the-shelf CMSs covered that
+ground, but for the scope of these projects — usually student NGOs — they were
+either more than the budget or more than the appetite. So the part that was
+genuinely common got written down once, and the part that differs — content,
+structure, meaning — stayed with each site.
+
+## Why a service and not a library
+
+A library would have to be compiled into the consuming application, which ties
+every project to one language's ecosystem and one release cadence. Atlas is
+reached over HTTP, so the consuming application can be written in anything: the
+two examples in this repository are one Python and one Rust, and neither knows
+anything about the other beyond the API. The cost is a process to run, a token
+to manage and a database to back up; the gain is that the media limits, storage
+rules and lifecycle are shared rather than reimplemented per project.
+
+## How it is deployed
+
+One Atlas instance per site, on the same host as the site, with its data
+directory on local persistent storage. The API needs a bearer token, which
+stays on the server or in a CLI and never reaches browser code; the media URLs
+under `/media/` are public and served by a reverse proxy in front of both
+processes. Metadata lives in SQLite next to the files, because the two are
+useless separately.
+
+## What it deliberately does not do, and why
+
+| Not in Atlas | Why |
+| --- | --- |
+| No browser UI inside Atlas | The API token is permanent, and a browser-facing upload needs a grant flow. An operator interface belongs to the consuming site's own application — `examples/cms-admin/` is one, written as an ordinary consumer. |
+| No camera RAW | RAW decoders are the least reliable corner of ImageMagick, and a half-decoded RAW is a permanently broken original. Convert first. |
+| No upscaling; fixed width profiles | Resizing on demand is a CPU denial-of-service and an unbounded storage multiplier. Fixed profiles are predictable, cacheable and enumerable. |
+| No arbitrary transforms, no crop, no art direction | Every crop depends on the consuming site's layout, which Atlas does not know. Consumers supply their own `sizes` and `srcset`. |
+| No content search; no meaningful tags | Atlas knows the bytes, not what they mean. Captions, alt text and post relationships belong to the consumer. |
+| No nested folders | A media service with a folder tree becomes a document management system. Flat opaque labels stop every project rebuilding label CRUD; the consumer keeps the hierarchy. |
+| Deletion is a lifecycle, not an erasure | A published page must not break because someone deleted a file. Bytes move to a trash directory, are purged after a retention window, and a tombstone remains. |
+| No video, no document rendering, no OCR | Different products. |
+| No object storage, no multi-tenancy, no job queues | One site, one host, occasional administrator uploads. |
+| No animations yet | The rendition model is one frame per width. A multi-frame kind needs a multi-frame model. |
+
+## Try it
+
+```sh
+nix develop
+export ATLAS_API_TOKEN='a-long-random-secret'
+cargo run
+```
+
+Or put the settings in a file, so they do not have to be exported every time:
+
+```sh
+cp .env.example .env
+$EDITOR .env
+cargo run
+```
+
+In another shell:
+
+```sh
+curl -X POST \
+  -H "Authorization: Bearer $ATLAS_API_TOKEN" \
+  -H 'Content-Type: image/png' \
+  --data-binary @photo.png \
+  http://127.0.0.1:3000/api/v1/images
+```
+
+The response carries the asset id and the rendition URLs; `GET /media/{id}/w640`
+serves the picture. The full set of formats Atlas accepts is in
+`GET /api/v1/formats`, and it is exactly the set Atlas produces, so anything it
+serves can be uploaded again — the file you have just downloaded is not a dead
+end.
+
+## How it is put together
+
+- **Typed routes.** Every route that reads, changes or renders an asset names
+  its collection in the path, `images` or `documents`. A mistake is a `404`
+  rather than a silent no-op. Only the two mixed-set endpoints, `state` and
+  `trash`, are untyped, because they exist precisely to span collections.
+- **Kind and format are different things.** The *kind* is what an asset is for:
+  images get renditions, documents do not. The *format* is its media type. The
+  documents collection accepts images too, so a diagram can be stored whole and
+  served as an attachment instead of being re-encoded into a picture.
+- **Content-addressed originals.** Identical bytes are the same asset. An upload
+  whose original matches a live asset returns that asset, costs a hash rather
+  than a conversion, and makes a retry after a timeout idempotent.
+- **Immutable public URLs.** Replacing bytes means uploading a new asset id, so
+  a URL that is in a page cannot change meaning underneath it.
+- **Deletion is a lifecycle.** Bytes move to a trash directory, are purged after
+  a retention window, and leave a tombstone. A consumer can pin an asset it
+  still uses, and that pin is the only hint Atlas ever gets about consumer
+  content.
+- **The token is the only coupling.** Public media reads need no token; every
+  write needs one.
+
+## Project layout
+
+| Path | What is in it |
+| --- | --- |
+| `src/` | The service: `api.rs` (routes and responses), `store.rs` (SQLite), `media.rs` (ImageMagick), `model.rs`, `config.rs`, `ident.rs` (asset ids), `filename.rs` (upload names), `lib.rs` (wiring). |
+| `migrations/` | Additive SQL migrations, applied at startup. `migrations/README.md` explains the SQLite constraints that shape them. |
+| `examples/family-album/` | A Flask consumer with its own database: the integration contract from the site side. |
+| `examples/cms-admin/` | A Rust consumer with no database at all: the same API seen from an operator's side. |
+| `scripts/smoke.py` | End-to-end checks against the real binary and the real examples. |
+| `assets/` | The placeholder served for retired assets. |
+| `PLAN.md` | The design record: the decisions, and the reasoning behind them. |
+| `TODO.md` | What is open, and what has already been settled. |
 
 ## Implemented prototype API
 
@@ -31,7 +136,8 @@ as an attachment instead of being re-encoded into a picture.
 
 - `GET /healthz` — local process health.
 - `POST /api/v1/images` — authenticated image upload. The body is the file
-  itself; `Content-Type` must be `image/jpeg`, `image/png`, or `image/webp`, and
+  itself; `Content-Type` must be `image/jpeg`, `image/png`, `image/webp`,
+  `image/avif`, `image/jxl` or `image/heic`, and
   the optional `X-Original-Filename` header names it. Streams to disk, generates
   the configured renditions, and returns an asset ID, original metadata, and
   rendition URLs.
@@ -105,8 +211,9 @@ The default rendition widths are 320, 640, 960, and 1280 pixels. They preserve
 the original aspect ratio and are not upscaled. Configure a different fixed
 set with `ATLAS_VARIANT_WIDTHS=320,640,1280`; arbitrary sizes are not generated
 on public requests. Consuming sites can fetch `/api/v1/images/{id}/srcset` and
-set their own `sizes` value. Atlas does not provide search, and never converts
-or re-encodes on a read.
+set their own `sizes` value. Atlas does not index media *content* — it filters
+on filenames, media types and lifecycle state, and leaves meaning to the
+consumer — and it never converts or re-encodes on a read.
 
 ## How a rendition URL resolves
 
@@ -303,6 +410,15 @@ Run locally:
 ```sh
 export ATLAS_API_TOKEN='replace-with-a-long-random-secret'
 export ATLAS_DATA_DIR="$PWD/data"
+cargo run
+```
+
+Or put those in a file instead, so they do not have to be exported every
+time:
+
+```sh
+cp .env.example .env
+$EDITOR .env
 cargo run
 ```
 
@@ -543,7 +659,23 @@ clear it.
 A restore drill that has not fetched an actual file has not tested the thing
 that matters.
 
+## Status
+
+Atlas is a prototype, and it says so in its API. The HTTP contract is pre-1.0
+and may change in ways that break a consumer; the schema only ever moves
+forward, additively, but the routes and the responses are not frozen.
+
+The design record is [`PLAN.md`](PLAN.md), which holds the decisions and the
+reasoning behind them, and [`TODO.md`](TODO.md), which holds what is still open
+and what has already been settled. Both are worth reading before changing
+anything structural.
+
 ## License
 
 Atlas is licensed under the GNU General Public License, version 3. See
 [`LICENSE`](LICENSE).
+
+The example consumers are part of this repository and carry the same licence.
+The vendored front-end assets keep their own: HTMX is Zero-Clause BSD and the
+Catppuccin palette is MIT, and both licence files sit beside the files
+themselves.
