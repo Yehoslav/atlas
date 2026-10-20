@@ -296,7 +296,13 @@ pub struct FormatsResponse {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AcceptedFormats {
+    /// One media type per accepted format: the canonical spelling.
     pub formats: Vec<String>,
+    /// Every media type Atlas accepts, which is more than one for a format
+    /// with alternative spellings. Absent from an older Atlas, which is why
+    /// it defaults to nothing rather than failing the whole listing.
+    #[serde(default)]
+    pub media_types: Vec<String>,
     pub groups: Vec<String>,
     pub generates_renditions: bool,
 }

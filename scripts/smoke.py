@@ -482,10 +482,27 @@ def check_api(checks: Checks) -> None:
         401,
     )
     checks.ok("formats listing", status, 200)
+    # The format list holds one media type per format, so counting it counts
+    # formats: HEIF has two spellings and is one format.
     advertised = formats["images"]["formats"]
     checks.ok(
         "  advertises what Atlas produces",
         sorted(advertised),
+        sorted(
+            [
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+                "image/avif",
+                "image/jxl",
+                "image/heic",
+            ]
+        ),
+    )
+    # The media type list holds every spelling a caller may declare.
+    checks.ok(
+        "  advertises every spelling",
+        sorted(formats["images"]["media_types"]),
         sorted(
             [
                 "image/jpeg",
@@ -502,8 +519,11 @@ def check_api(checks: Checks) -> None:
     checks.ok(
         "  images get renditions", formats["images"]["generates_renditions"], True
     )
+    checks.ok("  documents take every format", len(formats["documents"]["formats"]), 9)
     checks.ok(
-        "  documents take everything", len(formats["documents"]["formats"]), 10
+        "  documents take every spelling",
+        len(formats["documents"]["media_types"]),
+        10,
     )
     checks.ok(
         "  documents get none", formats["documents"]["generates_renditions"], False
@@ -555,6 +575,16 @@ def check_api(checks: Checks) -> None:
             {"Content-Type": "image/heif-sequence"},
         )[0],
         415,
+    )
+    # The two spellings are one format, so they are one filter: a consumer
+    # that lists one spelling offers one option and still finds everything.
+    by_canonical = checks.request("GET", "/api/v1/images?mime=image%2Fheic")[1]
+    by_spelling = checks.request("GET", "/api/v1/images?mime=image%2Fheif")[1]
+    checks.true("the canonical spelling finds the heic", by_canonical["total"] >= 1)
+    checks.ok(
+        "both spellings filter the same assets",
+        by_spelling["total"],
+        by_canonical["total"],
     )
 
     print("\n== bulk actions ==", flush=True)

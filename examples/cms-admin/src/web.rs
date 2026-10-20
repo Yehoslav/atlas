@@ -669,6 +669,7 @@ mod tests {
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
+    use axum::routing::get;
     use tower::ServiceExt;
 
     use crate::atlas::Atlas;
@@ -688,6 +689,185 @@ mod tests {
         )
         .unwrap();
         router(state, root.join("static"))
+    }
+
+    /// A stand-in for Atlas that answers the reads the library page makes.
+    ///
+    /// The formats are the ones the real endpoint returns: one media type per
+    /// format, and every spelling a caller may declare beside them. HEIF has
+    /// two spellings, so the two lists differ in length.
+    async fn fake_atlas() -> String {
+        let formats = serde_json::json!({
+            "images": {
+                "formats": [
+                    "image/jpeg",
+                    "image/png",
+                    "image/webp",
+                    "image/avif",
+                    "image/jxl",
+                    "image/heic"
+                ],
+                "media_types": [
+                    "image/jpeg",
+                    "image/png",
+                    "image/webp",
+                    "image/avif",
+                    "image/jxl",
+                    "image/heic",
+                    "image/heif"
+                ],
+                "groups": ["image/*"],
+                "generates_renditions": true
+            },
+            "documents": {
+                "formats": [
+                    "image/jpeg",
+                    "image/png",
+                    "image/webp",
+                    "image/avif",
+                    "image/jxl",
+                    "image/heic",
+                    "application/pdf",
+                    "application/msword",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                ],
+                "media_types": [
+                    "image/jpeg",
+                    "image/png",
+                    "image/webp",
+                    "image/avif",
+                    "image/jxl",
+                    "image/heic",
+                    "image/heif",
+                    "application/pdf",
+                    "application/msword",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                ],
+                "groups": ["application/*", "image/*"],
+                "generates_renditions": false
+            }
+        });
+        let empty_list = serde_json::json!({"assets": [], "total": 0, "limit": 50, "offset": 0});
+        let images_list = empty_list.clone();
+        let documents_list = empty_list.clone();
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/formats",
+                get(move || {
+                    let formats = formats.clone();
+                    async move { axum::Json(formats) }
+                }),
+            )
+            .route(
+                "/api/v1/summary",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "images": {"count": 0, "bytes": 0},
+                        "documents": {"count": 0, "bytes": 0},
+                        "total": {"count": 0, "bytes": 0}
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/images",
+                get(move || {
+                    let empty_list = images_list.clone();
+                    async move { axum::Json(empty_list) }
+                }),
+            )
+            .route(
+                "/api/v1/documents",
+                get(move || {
+                    let empty_list = documents_list.clone();
+                    async move { axum::Json(empty_list) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    /// The dashboard against a stand-in Atlas, and the cookie that opens it.
+    async fn test_app_with_fake_atlas() -> (axum::Router, axum::http::HeaderValue) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let atlas = Atlas::new(&fake_atlas().await, "test-token").unwrap();
+        let auth = Auth::new("test-password".to_owned(), false);
+        let login = auth.login("test-password").unwrap();
+        let state = AppState::new(
+            atlas,
+            auth,
+            "http://127.0.0.1:1".to_owned(),
+            root.join("templates"),
+        )
+        .unwrap();
+        (router(state, root.join("static")), login.cookie)
+    }
+
+    async fn library_page(uri: &str) -> String {
+        let (app, cookie) = test_app_with_fake_atlas().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    /// The library counts formats, not the spellings a format may have.
+    ///
+    /// HEIF answers to two media types, so a list of media types holds seven
+    /// entries for six formats. The page said "Atlas accepts 7 image formats"
+    /// and offered `image/heic` and `image/heif` as two filters that return
+    /// the same assets.
+    #[tokio::test]
+    async fn the_library_counts_formats_and_offers_one_filter_per_format() {
+        let html = library_page("/library").await;
+        assert!(
+            html.contains("Atlas accepts 6 image formats"),
+            "the page counts formats: {html}"
+        );
+        assert!(
+            !html.contains(&escaped("image/heif")),
+            "the filter offers a spelling of a format it already offers: {html}"
+        );
+        assert_eq!(
+            html.matches("<option value=\"image").count(),
+            6,
+            "one filter per image format: {html}"
+        );
+    }
+
+    /// The documents collection takes every format, and the filter says so:
+    /// six image formats and three document formats.
+    #[tokio::test]
+    async fn the_documents_filter_offers_every_format_the_collection_takes() {
+        let html = library_page("/library?kind=documents").await;
+        assert_eq!(
+            html.matches("<option value=\"image").count(),
+            6,
+            "six image formats: {html}"
+        );
+        assert_eq!(
+            html.matches("<option value=\"application").count(),
+            3,
+            "three document formats: {html}"
+        );
+    }
+
+    /// The template engine escapes the slash in an attribute value, so
+    /// `image/png` reaches the page as `image&#x2f;png`.
+    fn escaped(media_type: &str) -> String {
+        media_type.replace('/', "&#x2f;")
     }
 
     #[test]

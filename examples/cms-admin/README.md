@@ -59,7 +59,10 @@ site does with an asset.
 - `GET /api/v1/images` and `/documents`: search, media-type filters, lifecycle
   filters, sorting and paging.
 - `GET /api/v1/formats`: the upload form takes its allowlist from Atlas rather
-  than hardcoding an independently drifting list.
+  than hardcoding an independently drifting list. The media-type filter takes
+  one option per format from `formats`, not one per spelling from
+  `media_types`: HEIF answers to two media types, and offering both would
+  offer two filters that return the same assets.
 - The raw-body upload endpoints, with per-file outcomes and browser upload
   progress. The dashboard picks the `Content-Type` from the file's name rather
   than from what the browser says about it: a file manager decides a picked
