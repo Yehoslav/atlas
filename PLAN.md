@@ -263,7 +263,8 @@ uploads, or arbitrary URL transformations.
   overages return clear errors.
 - Invoke ImageMagick with argument lists, generated temporary paths, explicit
   formats, and per-process memory/map/disk/thread/time limits. Startup verifies
-  read/write support for JPEG, PNG, WebP, AVIF, and JXL.
+  read/write support for JPEG, PNG, WebP, AVIF, and JXL, and that LCMS is built
+  in.
 - Bound uploads to two concurrent requests, image conversions to one at a time,
   each ImageMagick invocation to 45 seconds, and all processing for one image
   to 120 seconds. No persistent job queue is needed for occasional uploads.

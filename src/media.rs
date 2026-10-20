@@ -155,6 +155,29 @@ impl ImageProcessor {
         Ok(())
     }
 
+    /// Without LCMS, `-profile` is a warning on stderr, which is discarded,
+    /// and every wide-gamut photo would come out washed out without a word.
+    pub async fn verify_colour_management(&self) -> Result<(), MediaError> {
+        let mut command = Command::new(&self.executable);
+        command
+            .args(["-list", "configure"])
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let output = timeout(self.timeout, command.output())
+            .await
+            .map_err(|_| MediaError::TimedOut)?
+            .map_err(MediaError::ProcessUnavailable)?;
+        if !output.status.success() {
+            return Err(MediaError::ProcessFailed);
+        }
+        if !has_delegate(&String::from_utf8_lossy(&output.stdout), "lcms") {
+            return Err(MediaError::Invalid(
+                "ImageMagick must be built with LCMS to convert colour profiles.".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn generate(
         &self,
         input_path: &Path,
@@ -435,9 +458,18 @@ fn parse_dimensions(bytes: &[u8]) -> Result<ImageDimensions, MediaError> {
     })
 }
 
+/// Whether `magick -list configure` names `wanted` among the delegates.
+fn has_delegate(configure: &str, wanted: &str) -> bool {
+    configure
+        .lines()
+        .filter_map(|line| line.strip_prefix("DELEGATES"))
+        .flat_map(str::split_whitespace)
+        .any(|delegate| delegate == wanted)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_dimensions, validate_signature};
+    use super::{has_delegate, parse_dimensions, validate_signature};
     use crate::model::SourceFormat;
 
     #[test]
@@ -457,6 +489,18 @@ mod tests {
         assert_eq!(dimensions.width, 640);
         assert_eq!(dimensions.height, 480);
         assert!(dimensions.opaque);
+    }
+
+    #[test]
+    fn lcms_is_found_only_on_the_delegates_line() {
+        let configure = "NAME           ImageMagick\n\
+                         DELEGATES      bzlib heic jpeg lcms png webp zlib\n\
+                         FEATURES       Cipher DPC HDRI\n";
+        assert!(has_delegate(configure, "lcms"));
+        assert!(!has_delegate(
+            "DELEGATES      bzlib heic jpeg png webp zlib\nLIBS           -llcms2\n",
+            "lcms"
+        ));
     }
 
     /// The two bytes that start a JPEG XL, from the two encoders that exist.

@@ -115,8 +115,9 @@ Placed at `examples/family-album/`.
       their meaning: WebKit's Display P3 sample photos came out pixel for
       pixel identical to their P3 values, 11–16% less saturated than an ICC
       conversion. Renditions now go through `-profile` with a compact sRGB
-      profile embedded in the binary. A test uploads a pixel tagged with
-      `tests/fixtures/DisplayP3-v4.icc`.
+      profile embedded in the binary, and startup refuses an ImageMagick
+      without LCMS, where `-profile` is only a warning nobody reads. A test
+      uploads a pixel tagged with `tests/fixtures/DisplayP3-v4.icc`.
 
 ### For the CMS admin dashboard example
 

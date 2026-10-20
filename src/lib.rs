@@ -61,6 +61,7 @@ impl AppState {
             config.magick_timeout,
         );
         image_processor.verify_formats().await?;
+        image_processor.verify_colour_management().await?;
 
         let state = Self {
             config: Arc::new(config),
