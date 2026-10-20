@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Every step runs inside the flake's dev shell, so CI gets the same pinned
+    # Rust, ImageMagick and Python that `nix develop` gives a contributor.
+    shell: nix develop --command bash -eo pipefail {0}
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+
+      - name: Service
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test
+
+      - name: CMS Admin example
+        run: |
+          cargo fmt --check --manifest-path examples/cms-admin/Cargo.toml
+          cargo clippy --manifest-path examples/cms-admin/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo test --manifest-path examples/cms-admin/Cargo.toml
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+
+      - name: Family Album example
+        run: |
+          cd examples/family-album
+          python -m pytest tests -q
+          ruff check .
+          ruff format --check .
+          ty check
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+
+      - name: Build
+        run: |
+          cargo build
+          cargo build --manifest-path examples/cms-admin/Cargo.toml
+
+      - name: End-to-end check
+        # smoke.py exits 0 when it skips a check, and nobody reads the summary
+        # line of a green run, so a skip has to fail the job here.
+        run: |
+          python scripts/smoke.py | tee smoke.log
+          if grep -q '^SKIP' smoke.log; then
+            echo "::error::smoke.py skipped a check, see the SKIP lines above"
+            exit 1
+          fi
