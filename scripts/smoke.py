@@ -802,6 +802,12 @@ def check_dashboard(checks: Checks, binary: Path, atlas_port: int, port: int) ->
         environment = dict(os.environ)
         environment.update(
             ATLAS_API_URL=f"http://127.0.0.1:{atlas_port}",
+            # The dashboard reads a local `.env` for what the environment does
+            # not provide, and a developer's own file points at their own
+            # Atlas. The environment wins, so the media base is named here and
+            # the check below is about the smoke run rather than about
+            # whatever happens to be on this machine.
+            ATLAS_MEDIA_URL=f"http://127.0.0.1:{atlas_port}",
             ATLAS_API_TOKEN=TOKEN,
             ADMIN_PASSWORD="dashboard-smoke-password",
             ADMIN_LISTEN=f"127.0.0.1:{port}",
