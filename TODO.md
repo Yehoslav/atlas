@@ -109,12 +109,14 @@ Placed at `examples/family-album/`.
 
 ### Needs a real file, not a test
 
-- [ ] **Verify wide-gamut renditions.** Renditions ask for sRGB before `-strip`,
-      so a Display P3 phone photo should be converted rather than relabelled.
-      Unverified: this ImageMagick build ships no ICC profiles, so there is no
-      P3 fixture to test against, and a CMYK experiment came back byte-identical.
-      Needs one real iPhone photo. If the flag turns out to only tag, the
-      mechanism is `-profile <sRGB target>` with profiles available.
+- [x] **Verify wide-gamut renditions.** The flag only tagged. ImageMagick
+      reports a Display P3 photo as sRGB already, so `-colorspace sRGB` left
+      its numbers alone and `-strip` threw away the profile that gave them
+      their meaning: WebKit's Display P3 sample photos came out pixel for
+      pixel identical to their P3 values, 11–16% less saturated than an ICC
+      conversion. Renditions now go through `-profile` with a compact sRGB
+      profile embedded in the binary. A test uploads a pixel tagged with
+      `tests/fixtures/DisplayP3-v4.icc`.
 
 ### For the CMS admin dashboard example
 

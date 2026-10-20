@@ -13,6 +13,10 @@ const IMAGE_MAGICK_MEMORY_LIMIT: &str = "256MiB";
 const IMAGE_MAGICK_MAP_LIMIT: &str = "512MiB";
 const IMAGE_MAGICK_DISK_LIMIT: &str = "512MiB";
 
+/// The profile every rendition is converted to: the compact sRGB v4 profile
+/// from Compact ICC Profiles, released under CC0.
+pub(crate) const SRGB_PROFILE: &[u8] = include_bytes!("../assets/sRGB-v4.icc");
+
 #[derive(Debug)]
 pub enum MediaError {
     Invalid(String),
@@ -46,6 +50,7 @@ impl From<std::io::Error> for MediaError {
 #[derive(Clone)]
 pub struct ImageProcessor {
     executable: String,
+    srgb_profile: PathBuf,
     max_pixels: u64,
     max_dimension: u32,
     timeout: Duration,
@@ -59,9 +64,16 @@ pub struct ImageDimensions {
 }
 
 impl ImageProcessor {
-    pub fn new(executable: String, max_pixels: u64, max_dimension: u32, timeout: Duration) -> Self {
+    pub fn new(
+        executable: String,
+        srgb_profile: PathBuf,
+        max_pixels: u64,
+        max_dimension: u32,
+        timeout: Duration,
+    ) -> Self {
         Self {
             executable,
+            srgb_profile,
             max_pixels,
             max_dimension,
             timeout,
@@ -199,8 +211,13 @@ impl ImageProcessor {
                 // phone is usually Display P3, and `-strip` below drops the
                 // profile that says so: without converting first, the P3
                 // values would be relabelled as sRGB and the rendition would
-                // look washed out. An untagged or already-sRGB source is
-                // unaffected, so this is safe to do unconditionally.
+                // look washed out. ImageMagick already calls such a photo
+                // sRGB, so `-colorspace` alone does nothing to it; only
+                // `-profile` converts through the embedded profile. An
+                // untagged source is only labelled, its pixels untouched, and
+                // `-colorspace` still turns untagged CMYK into RGB.
+                "-profile".to_owned(),
+                format!("ICC:{}", self.srgb_profile.display()),
                 "-colorspace".to_owned(),
                 "sRGB".to_owned(),
                 "-resize".to_owned(),
