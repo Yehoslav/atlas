@@ -415,6 +415,11 @@ that it is built with LCMS, which converts a photo's colour profile to sRGB, and
 refuses to start without them. The API still accepts only its explicit input
 allowlist.
 
+The dev shell makes the same codec check as it opens, and CI runs it as a step
+of its own (`scripts/check-magick-codecs.sh`), so a Nixpkgs bump that dropped
+libheif is a named failure rather than a server that will not start or a phone
+photograph that will not upload.
+
 Run locally:
 
 ```sh

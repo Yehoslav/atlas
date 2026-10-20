@@ -50,7 +50,10 @@ You need:
 The ImageMagick requirement is the one that surprises people: a default
 install on some systems lacks JPEG XL or HEIC, and Atlas will not start. If
 `magick -list format` does not list them, your ImageMagick needs a different
-build.
+build. `scripts/check-magick-codecs.sh` asks the same question the startup
+check asks, and names the codec that is missing; the dev shell runs it as it
+opens, so `nix develop` refuses to enter a shell that cannot build the media
+Atlas needs.
 
 ## Running it
 
