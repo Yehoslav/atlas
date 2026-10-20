@@ -87,26 +87,42 @@ pub enum SourceFormat {
 }
 
 impl SourceFormat {
+    /// The format a media type names, if Atlas accepts that media type.
     pub fn parse_content_type(content_type: &str) -> Option<Self> {
-        match content_type
-            .split(';')
-            .next()?
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "image/jpeg" => Some(Self::Jpeg),
-            "image/png" => Some(Self::Png),
-            "image/webp" => Some(Self::Webp),
-            "image/avif" => Some(Self::Avif),
-            "image/jxl" => Some(Self::Jxl),
-            "image/heic" => Some(Self::Heic),
-            "application/pdf" => Some(Self::Pdf),
-            "application/msword" => Some(Self::Doc),
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
-                Some(Self::Docx)
+        let wanted = content_type.split(';').next()?.trim().to_ascii_lowercase();
+        SourceFormat::ALL.into_iter().find(|format| {
+            format
+                .accepted_content_types()
+                .iter()
+                .any(|accepted| *accepted == wanted)
+        })
+    }
+
+    /// Every media type this format may be declared as.
+    ///
+    /// Most formats have exactly one spelling, but HEIF has two and the
+    /// desktop decides which one a browser sends: freedesktop.org makes
+    /// `image/heif` the canonical type for a `.heic` file and keeps
+    /// `image/heic` as an alias of it, so a browser, a file manager and a
+    /// command line all disagree about the string to put on the wire.
+    ///
+    /// Declaring either is the same request. The bytes still decide what the
+    /// file is — `crate::media::validate_signature` requires an HEVC brand —
+    /// so this widens what may be *declared*, never what may be *decoded*: an
+    /// AV1-in-HEIF file is refused whatever it calls itself.
+    pub fn accepted_content_types(self) -> &'static [&'static str] {
+        match self {
+            Self::Jpeg => &["image/jpeg"],
+            Self::Png => &["image/png"],
+            Self::Webp => &["image/webp"],
+            Self::Avif => &["image/avif"],
+            Self::Jxl => &["image/jxl"],
+            Self::Heic => &["image/heic", "image/heif"],
+            Self::Pdf => &["application/pdf"],
+            Self::Doc => &["application/msword"],
+            Self::Docx => {
+                &["application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
             }
-            _ => None,
         }
     }
 
@@ -153,18 +169,13 @@ impl SourceFormat {
         }
     }
 
+    /// The media type this format is stored and served as.
+    ///
+    /// The first accepted spelling is the canonical one, so a file uploaded
+    /// as `image/heif` is stored as `image/heic`: the media type a caller
+    /// reads back does not depend on which spelling it happened to send.
     pub fn mime_type(self) -> &'static str {
-        match self {
-            Self::Jpeg => "image/jpeg",
-            Self::Png => "image/png",
-            Self::Webp => "image/webp",
-            Self::Avif => "image/avif",
-            Self::Jxl => "image/jxl",
-            Self::Heic => "image/heic",
-            Self::Pdf => "application/pdf",
-            Self::Doc => "application/msword",
-            Self::Docx => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        }
+        self.accepted_content_types()[0]
     }
 
     pub fn magick_name(self) -> Option<&'static str> {
@@ -354,4 +365,84 @@ pub struct RenditionRecord {
 pub struct StoredAsset {
     pub asset: AssetRecord,
     pub renditions: Vec<RenditionRecord>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceFormat;
+
+    /// HEIF has two spellings and the desktop picks which one goes on the
+    /// wire: freedesktop.org makes `image/heif` canonical and keeps
+    /// `image/heic` as its alias.
+    #[test]
+    fn both_spellings_of_heif_name_the_same_format() {
+        assert_eq!(
+            SourceFormat::parse_content_type("image/heic"),
+            Some(SourceFormat::Heic)
+        );
+        assert_eq!(
+            SourceFormat::parse_content_type("image/heif"),
+            Some(SourceFormat::Heic)
+        );
+        assert_eq!(
+            SourceFormat::parse_content_type("IMAGE/HEIF"),
+            Some(SourceFormat::Heic)
+        );
+    }
+
+    /// The canonical spelling is what gets stored and served, whichever one
+    /// the caller happened to send.
+    #[test]
+    fn the_stored_media_type_is_the_canonical_one() {
+        assert_eq!(SourceFormat::Heic.mime_type(), "image/heic");
+        assert_eq!(
+            SourceFormat::Heic.accepted_content_types(),
+            ["image/heic", "image/heif"]
+        );
+    }
+
+    /// An image sequence is a grid of pictures, not a picture.
+    #[test]
+    fn an_image_sequence_is_not_accepted() {
+        assert_eq!(
+            SourceFormat::parse_content_type("image/heic-sequence"),
+            None
+        );
+        assert_eq!(
+            SourceFormat::parse_content_type("image/heif-sequence"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_content_type_outside_the_allowlist_names_no_format() {
+        for content_type in [
+            "image/tiff",
+            "image/heif-sequence",
+            "application/octet-stream",
+            "text/plain",
+            "",
+        ] {
+            assert_eq!(
+                SourceFormat::parse_content_type(content_type),
+                None,
+                "{content_type} is not a format Atlas accepts"
+            );
+        }
+    }
+
+    /// The allowlist and the formats that back it cannot disagree: every
+    /// accepted media type names a format, and every format is reachable.
+    #[test]
+    fn every_accepted_media_type_names_a_format() {
+        for format in SourceFormat::ALL {
+            for content_type in format.accepted_content_types() {
+                assert_eq!(
+                    SourceFormat::parse_content_type(content_type),
+                    Some(format),
+                    "{content_type} should name {format:?}"
+                );
+            }
+        }
+    }
 }

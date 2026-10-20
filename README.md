@@ -142,6 +142,13 @@ as an attachment instead of being re-encoded into a picture.
   the optional `X-Original-Filename` header names it. Streams to disk, generates
   the configured renditions, and returns an asset ID, original metadata, and
   rendition URLs.
+  A HEIC photograph may also be declared as `image/heif`: freedesktop.org
+  makes `image/heif` the canonical type for a `.heic` file and keeps
+  `image/heic` as its alias, so a browser, a file manager and a command line
+  disagree about which spelling to send. Either is accepted, the bytes decide
+  what the file is, and the asset is stored and served as `image/heic`
+  whichever spelling it arrived under. `image/heic-sequence` is not a picture
+  and is not accepted.
 - `POST /api/v1/documents` — the same upload for `documents`. `Content-Type` may
   be any allowlisted format, images included. The file is stored and served
   untouched, with no renditions.

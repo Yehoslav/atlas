@@ -60,6 +60,14 @@ site does with an asset.
   filters, sorting and paging.
 - `GET /api/v1/formats`: the upload form takes its allowlist from Atlas rather
   than hardcoding an independently drifting list.
+- The raw-body upload endpoints, with per-file outcomes and browser upload
+  progress. The dashboard picks the `Content-Type` from the file's name rather
+  than from what the browser says about it: a file manager decides a picked
+  file's type from the desktop's MIME database, where a `.heic` photograph is
+  `image/heif` and not the `image/heic` Atlas spells, and where a file with no
+  known extension arrives as `application/octet-stream`. The name is the one
+  thing the dashboard and Atlas agree on. Atlas still checks the bytes against
+  the declaration, so a name that lies is refused rather than believed.
 - `POST /api/v1/{kind}/actions`: bulk pin/unpin/delete/restore. The UI reports a
   rejected batch as rejected; it does not claim a partial success.
 - `GET /api/v1/summary`: the sidebar totals.
@@ -69,8 +77,6 @@ site does with an asset.
 - `GET /api/v1/images/{id}/srcset`: the detail view copies the srcset Atlas
   computed.
 - `PUT /api/v1/{kind}/{id}/pin`: the only usage signal Atlas acts on.
-- The raw-body upload endpoints, with per-file outcomes and browser upload
-  progress.
 
 Atlas cannot answer "what uses this asset?" A CMS must consult its own content
 database for that. This dashboard is stateless, so it does not pretend

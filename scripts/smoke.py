@@ -255,6 +255,27 @@ def png_bytes(width: int = 1400, height: int = 900) -> bytes:
     )
 
 
+def image_bytes(magick_format: str, width: int = 120, height: int = 90) -> bytes:
+    """Real bytes in a real format, generated so the checks need no fixtures.
+
+    ImageMagick makes these, the same way Atlas would read them back.
+    """
+    generated = subprocess.run(
+        ["magick", "-size", f"{width}x{height}", "xc:red", f"{magick_format}:-"],
+        capture_output=True,
+        check=True,
+    )
+    return generated.stdout
+
+
+def heic_bytes(width: int = 120, height: int = 90) -> bytes:
+    return image_bytes("HEIC", width, height)
+
+
+def avif_bytes(width: int = 120, height: int = 90) -> bytes:
+    return image_bytes("AVIF", width, height)
+
+
 PDF = b"%PDF-1.4\n% atlas smoke test\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
 IMAGE_HEADERS = {"Content-Type": "image/png", "X-Original-Filename": "big.png"}
 
@@ -473,6 +494,7 @@ def check_api(checks: Checks) -> None:
                 "image/avif",
                 "image/jxl",
                 "image/heic",
+                "image/heif",
             ]
         ),
     )
@@ -480,7 +502,9 @@ def check_api(checks: Checks) -> None:
     checks.ok(
         "  images get renditions", formats["images"]["generates_renditions"], True
     )
-    checks.ok("  documents take everything", len(formats["documents"]["formats"]), 9)
+    checks.ok(
+        "  documents take everything", len(formats["documents"]["formats"]), 10
+    )
     checks.ok(
         "  documents get none", formats["documents"]["generates_renditions"], False
     )
@@ -496,6 +520,41 @@ def check_api(checks: Checks) -> None:
         "srcset on a document",
         checks.request("GET", f"/api/v1/images/{document_id}/srcset")[0],
         404,
+    )
+
+    print("\n== heif, in the spelling the desktop sends ==", flush=True)
+    # HEIF has two spellings and the desktop decides which one a browser
+    # sends: freedesktop.org makes `image/heif` canonical and keeps
+    # `image/heic` as its alias. A file manager that answered `image/heif`
+    # used to be told the format was not accepted.
+    #
+    # This runs after the sections that count assets, because it adds one.
+    status, heic = checks.request(
+        "POST",
+        "/api/v1/images",
+        heic_bytes(),
+        {"Content-Type": "image/heif", "X-Original-Filename": "wedding.heic"},
+    )
+    checks.ok("heic uploaded as image/heif", status, 201)
+    checks.ok("  kind", heic["kind"], "image")
+    checks.ok("  stored canonically", heic["original"]["content_type"], "image/heic")
+    checks.true("  it got renditions", len(heic["renditions"]) > 0)
+    checks.ok(
+        "the heif spelling does not admit an av1 file",
+        checks.request(
+            "POST", "/api/v1/images", avif_bytes(), {"Content-Type": "image/heif"}
+        )[0],
+        415,
+    )
+    checks.ok(
+        "an image sequence is not a picture",
+        checks.request(
+            "POST",
+            "/api/v1/images",
+            heic_bytes(),
+            {"Content-Type": "image/heif-sequence"},
+        )[0],
+        415,
     )
 
     print("\n== bulk actions ==", flush=True)

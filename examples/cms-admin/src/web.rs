@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
@@ -329,8 +329,8 @@ async fn upload(
             continue;
         }
         let filename = field.file_name().unwrap_or("upload").to_owned();
-        let content_type = field
-            .content_type()
+        let content_type = content_type_for(&filename)
+            .or_else(|| field.content_type())
             .unwrap_or("application/octet-stream")
             .to_owned();
         let default_kind = if content_type.starts_with("image/") {
@@ -595,6 +595,41 @@ fn is_kind(value: &str) -> bool {
     matches!(value, "images" | "documents")
 }
 
+/// The media type to send Atlas for a file, by its name.
+///
+/// The browser's own answer is not trusted. A file manager decides the type
+/// of a picked file from the desktop's MIME database, where `.heic` is
+/// `image/heif` and not the `image/heic` Atlas spells, and where a file with
+/// no known extension arrives as `application/octet-stream`. The name is the
+/// one thing the dashboard and Atlas agree on.
+///
+/// The list is Atlas's own allowlist, spelled out here because the dashboard
+/// has to pick a `Content-Type` before it can ask; `GET /api/v1/formats` is
+/// the authority on what Atlas accepts today.
+///
+/// `.heif` is deliberately absent. HEIF is a container family whose payload
+/// may be AV1 or HEVC, so which one it is has to be read out of the file
+/// rather than guessed from its extension. A `.heif` file falls back to the
+/// browser's type, and Atlas decides from the bytes.
+fn content_type_for(filename: &str) -> Option<&'static str> {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "jxl" => "image/jxl",
+        "heic" => "image/heic",
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        _ => return None,
+    })
+}
+
 fn public_media_url(base: &str, path: &str) -> String {
     format!("{}{path}", base.trim_end_matches('/'))
 }
@@ -639,7 +674,7 @@ mod tests {
     use crate::atlas::Atlas;
     use crate::auth::Auth;
 
-    use super::{AppState, human_bytes, router, safe_next};
+    use super::{AppState, content_type_for, human_bytes, router, safe_next};
 
     async fn test_app() -> axum::Router {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -671,6 +706,39 @@ mod tests {
             safe_next(Some("/library\r\nSet-Cookie: evil=1")),
             "/library"
         );
+    }
+
+    /// The media type comes from the name, not from the browser.
+    ///
+    /// A file manager answers `image/heif` for a `.heic` file on a desktop
+    /// whose MIME database makes that the canonical type, and Atlas was told
+    /// the format was not accepted.
+    #[test]
+    fn the_media_type_comes_from_the_name() {
+        assert_eq!(content_type_for("atb_gala.heic"), Some("image/heic"));
+        assert_eq!(content_type_for("ATB_GALA.HEIC"), Some("image/heic"));
+        assert_eq!(content_type_for("holiday.JPG"), Some("image/jpeg"));
+        assert_eq!(content_type_for("holiday.jpeg"), Some("image/jpeg"));
+        assert_eq!(content_type_for("shot.png"), Some("image/png"));
+        assert_eq!(content_type_for("shot.webp"), Some("image/webp"));
+        assert_eq!(content_type_for("shot.avif"), Some("image/avif"));
+        assert_eq!(content_type_for("shot.jxl"), Some("image/jxl"));
+        assert_eq!(content_type_for("invoice.pdf"), Some("application/pdf"));
+        assert_eq!(content_type_for("invoice.doc"), Some("application/msword"));
+        assert_eq!(
+            content_type_for("invoice.docx"),
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
+    }
+
+    /// An unknown name is left to the browser, and `.heif` with it: the
+    /// container family is decided from the bytes, not the extension.
+    #[test]
+    fn an_unknown_name_is_left_to_the_browser() {
+        assert_eq!(content_type_for("clip.mp4"), None);
+        assert_eq!(content_type_for("photo.heif"), None);
+        assert_eq!(content_type_for("noextension"), None);
+        assert_eq!(content_type_for(""), None);
     }
 
     #[tokio::test]

@@ -385,3 +385,11 @@ do with media, and only a consumer with its own content database can answer.
   sniffed, because AVIF and HEIC are both ISO base media files starting with
   an `ftyp` box; the whole brand list is searched, since a file may declare
   `mif1` and list `heic` among its compatible brands.
+- A format may have more than one accepted media type. HEIF has two spellings
+  and the desktop picks the one that goes on the wire: freedesktop.org makes
+  `image/heif` the canonical type for a `.heic` file and keeps `image/heic` as
+  its alias, so a browser and a file manager send what their MIME database
+  says. Atlas accepts either and stores the canonical one. The bytes are what
+  decide the format, so the second spelling widens what may be declared and
+  not what may be decoded: an AV1-in-HEIF file is refused either way, and
+  `image/heic-sequence` is not a picture and is refused too.
