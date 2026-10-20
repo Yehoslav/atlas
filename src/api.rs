@@ -2549,6 +2549,78 @@ mod tests {
         );
     }
 
+    /// The colour of the first pixel of a PNG, as `[r, g, b]`.
+    fn first_pixel(path: &std::path::Path) -> [i32; 3] {
+        let output = Command::new("magick")
+            .arg(format!("PNG:{}", path.display()))
+            .args(["-format", "%[pixel:p{0,0}]", "info:"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let pixel = String::from_utf8(output.stdout).unwrap();
+        let channels: Vec<i32> = pixel
+            .trim()
+            .trim_start_matches("srgb(")
+            .trim_end_matches(')')
+            .split(',')
+            .map(|channel| channel.parse().unwrap())
+            .collect();
+        channels.try_into().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_display_p3_photo_is_converted_to_srgb_rather_than_relabelled() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
+        let p3 = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/DisplayP3-v4.icc"
+        );
+
+        // The same numbers twice: once meaning Display P3, once meaning sRGB.
+        let mut stored = Vec::new();
+        for (name, profile) in [("p3.png", Some(p3)), ("untagged.png", None)] {
+            let path = directory.path().join(name);
+            let mut command = Command::new("magick");
+            command.args(["-size", "40x30", "xc:rgb(200,100,50)"]);
+            if let Some(profile) = profile {
+                command.args(["-profile", &format!("ICC:{profile}")]);
+            }
+            let generated = command
+                .arg(format!("PNG:{}", path.display()))
+                .output()
+                .unwrap();
+            assert!(generated.status.success(), "could not generate {name}");
+
+            let (status, body) = send(
+                &router,
+                upload_request("image/png", std::fs::read(&path).unwrap()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            let id = body["id"].as_str().unwrap();
+            stored.push(first_pixel(
+                &data_dir.join("assets").join(id).join("w40.png"),
+            ));
+        }
+
+        // P3 rgb(200,100,50) in sRGB, from the published primaries. Relabelling
+        // instead of converting keeps the numbers and loses the saturation.
+        let [converted, untagged] = stored.try_into().unwrap();
+        for (channel, wanted) in converted.into_iter().zip([214, 92, 30]) {
+            assert!(
+                (channel - wanted).abs() <= 2,
+                "{converted:?} is not the sRGB of P3 rgb(200,100,50)"
+            );
+        }
+        assert_eq!(
+            untagged,
+            [200, 100, 50],
+            "an untagged photo keeps its pixels"
+        );
+    }
+
     #[tokio::test]
     async fn a_request_between_profiles_gets_the_nearest_width_at_or_below() {
         let directory = tempfile::tempdir().unwrap();

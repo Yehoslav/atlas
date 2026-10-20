@@ -51,6 +51,12 @@ media files and media metadata only.
   stored rendition on read. Public rendition URLs negotiate among
   pre-generated representations from `Accept`; they do not perform image work
   on reads and send `Vary: Accept`.
+- Renditions are converted to sRGB through the source's embedded ICC profile
+  before metadata is stripped, so a Display P3 phone photo keeps its colours
+  instead of being relabelled. The target is a compact sRGB profile embedded in
+  the binary and written to the data directory at startup; an untagged source
+  is labelled with it and its pixels are left as they are. `-colorspace sRGB`
+  alone does not do this, because ImageMagick already calls a P3 photo sRGB.
 - Asset URLs are immutable. Replacing bytes means uploading a new asset ID.
 - Identical bytes are the same asset. An upload whose original matches a live
   asset returns that asset with `200` instead of `201`, costs a hash rather than
@@ -257,7 +263,8 @@ uploads, or arbitrary URL transformations.
   overages return clear errors.
 - Invoke ImageMagick with argument lists, generated temporary paths, explicit
   formats, and per-process memory/map/disk/thread/time limits. Startup verifies
-  read/write support for JPEG, PNG, WebP, AVIF, and JXL.
+  read/write support for JPEG, PNG, WebP, AVIF, and JXL, and that LCMS is built
+  in.
 - Bound uploads to two concurrent requests, image conversions to one at a time,
   each ImageMagick invocation to 45 seconds, and all processing for one image
   to 120 seconds. No persistent job queue is needed for occasional uploads.
@@ -374,13 +381,6 @@ do with media, and only a consumer with its own content database can answer.
   `-strip` and so carry neither today. Worth researching whether ImageMagick's
   coder can be persuaded with a define, or whether that means a `cjxl`
   delegate.
-- Wide-gamut colour handling. Renditions ask for sRGB before `-strip`, which
-  leaves an untagged or already-sRGB source untouched. Whether that performs a
-  true ICC transform for a Display P3 phone photo is **unverified**: this
-  ImageMagick build ships no ICC profiles (`-list profile` is unsupported and
-  no `.icc` is present), and no Display P3 file was available to test with.
-  Confirm with a real photo before relying on it; the mechanism, if the flag
-  is only tagging, is `-profile <sRGB target>` with profiles available.
 - JPEG XL, AVIF and HEIC signatures are brand-checked rather than merely
   sniffed, because AVIF and HEIC are both ISO base media files starting with
   an `ftyp` box; the whole brand list is searched, since a file may declare

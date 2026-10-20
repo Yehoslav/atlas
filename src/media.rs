@@ -13,6 +13,10 @@ const IMAGE_MAGICK_MEMORY_LIMIT: &str = "256MiB";
 const IMAGE_MAGICK_MAP_LIMIT: &str = "512MiB";
 const IMAGE_MAGICK_DISK_LIMIT: &str = "512MiB";
 
+/// The profile every rendition is converted to: the compact sRGB v4 profile
+/// from Compact ICC Profiles, released under CC0.
+pub(crate) const SRGB_PROFILE: &[u8] = include_bytes!("../assets/sRGB-v4.icc");
+
 #[derive(Debug)]
 pub enum MediaError {
     Invalid(String),
@@ -46,6 +50,7 @@ impl From<std::io::Error> for MediaError {
 #[derive(Clone)]
 pub struct ImageProcessor {
     executable: String,
+    srgb_profile: PathBuf,
     max_pixels: u64,
     max_dimension: u32,
     timeout: Duration,
@@ -59,9 +64,16 @@ pub struct ImageDimensions {
 }
 
 impl ImageProcessor {
-    pub fn new(executable: String, max_pixels: u64, max_dimension: u32, timeout: Duration) -> Self {
+    pub fn new(
+        executable: String,
+        srgb_profile: PathBuf,
+        max_pixels: u64,
+        max_dimension: u32,
+        timeout: Duration,
+    ) -> Self {
         Self {
             executable,
+            srgb_profile,
             max_pixels,
             max_dimension,
             timeout,
@@ -143,6 +155,29 @@ impl ImageProcessor {
         Ok(())
     }
 
+    /// Without LCMS, `-profile` is a warning on stderr, which is discarded,
+    /// and every wide-gamut photo would come out washed out without a word.
+    pub async fn verify_colour_management(&self) -> Result<(), MediaError> {
+        let mut command = Command::new(&self.executable);
+        command
+            .args(["-list", "configure"])
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let output = timeout(self.timeout, command.output())
+            .await
+            .map_err(|_| MediaError::TimedOut)?
+            .map_err(MediaError::ProcessUnavailable)?;
+        if !output.status.success() {
+            return Err(MediaError::ProcessFailed);
+        }
+        if !has_delegate(&String::from_utf8_lossy(&output.stdout), "lcms") {
+            return Err(MediaError::Invalid(
+                "ImageMagick must be built with LCMS to convert colour profiles.".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn generate(
         &self,
         input_path: &Path,
@@ -199,8 +234,13 @@ impl ImageProcessor {
                 // phone is usually Display P3, and `-strip` below drops the
                 // profile that says so: without converting first, the P3
                 // values would be relabelled as sRGB and the rendition would
-                // look washed out. An untagged or already-sRGB source is
-                // unaffected, so this is safe to do unconditionally.
+                // look washed out. ImageMagick already calls such a photo
+                // sRGB, so `-colorspace` alone does nothing to it; only
+                // `-profile` converts through the embedded profile. An
+                // untagged source is only labelled, its pixels untouched, and
+                // `-colorspace` still turns untagged CMYK into RGB.
+                "-profile".to_owned(),
+                format!("ICC:{}", self.srgb_profile.display()),
                 "-colorspace".to_owned(),
                 "sRGB".to_owned(),
                 "-resize".to_owned(),
@@ -418,9 +458,18 @@ fn parse_dimensions(bytes: &[u8]) -> Result<ImageDimensions, MediaError> {
     })
 }
 
+/// Whether `magick -list configure` names `wanted` among the delegates.
+fn has_delegate(configure: &str, wanted: &str) -> bool {
+    configure
+        .lines()
+        .filter_map(|line| line.strip_prefix("DELEGATES"))
+        .flat_map(str::split_whitespace)
+        .any(|delegate| delegate == wanted)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_dimensions, validate_signature};
+    use super::{has_delegate, parse_dimensions, validate_signature};
     use crate::model::SourceFormat;
 
     #[test]
@@ -440,6 +489,18 @@ mod tests {
         assert_eq!(dimensions.width, 640);
         assert_eq!(dimensions.height, 480);
         assert!(dimensions.opaque);
+    }
+
+    #[test]
+    fn lcms_is_found_only_on_the_delegates_line() {
+        let configure = "NAME           ImageMagick\n\
+                         DELEGATES      bzlib heic jpeg lcms png webp zlib\n\
+                         FEATURES       Cipher DPC HDRI\n";
+        assert!(has_delegate(configure, "lcms"));
+        assert!(!has_delegate(
+            "DELEGATES      bzlib heic jpeg png webp zlib\nLIBS           -llcms2\n",
+            "lcms"
+        ));
     }
 
     /// The two bytes that start a JPEG XL, from the two encoders that exist.

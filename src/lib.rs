@@ -50,13 +50,18 @@ impl AppState {
 
         let store = Store::connect(&config.data_dir.join("atlas.sqlite3")).await?;
         recover_incomplete_storage(&config.data_dir, &store).await?;
+        // `-profile` takes a file, so the embedded profile is written out.
+        let srgb_profile = config.data_dir.join("sRGB.icc");
+        tokio::fs::write(&srgb_profile, media::SRGB_PROFILE).await?;
         let image_processor = ImageProcessor::new(
             config.magick_bin.clone(),
+            srgb_profile,
             config.max_image_pixels,
             config.max_image_dimension,
             config.magick_timeout,
         );
         image_processor.verify_formats().await?;
+        image_processor.verify_colour_management().await?;
 
         let state = Self {
             config: Arc::new(config),

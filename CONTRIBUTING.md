@@ -44,7 +44,7 @@ You need:
 | --- | --- | --- |
 | Rust | 1.85 or newer | Edition 2024. `rustup component add rustfmt clippy` |
 | A C compiler | any current | `cc`, `gcc` or `clang`. SQLite is compiled from source by `sqlx`, so no system SQLite is needed |
-| ImageMagick | 7 | The `magick` command. Must read *and* write JPEG, PNG, WebP, AVIF, JPEG XL and HEIC — Atlas checks at startup and refuses to start without them. `magick -list format` shows what is there |
+| ImageMagick | 7 | The `magick` command. Must read *and* write JPEG, PNG, WebP, AVIF, JPEG XL and HEIC — Atlas checks at startup and refuses to start without them. `magick -list format` shows what is there. It must also be built with LCMS, which `magick -list configure` names on its `DELEGATES` line |
 | Python | 3.11 or newer | For the smoke script and the examples. The Family Album itself works on 3.9 |
 
 The ImageMagick requirement is the one that surprises people: a default

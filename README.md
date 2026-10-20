@@ -116,7 +116,8 @@ end.
 | `examples/family-album/` | A Flask consumer with its own database: the integration contract from the site side. |
 | `examples/cms-admin/` | A Rust consumer with no database at all: the same API seen from an operator's side. |
 | `scripts/smoke.py` | End-to-end checks against the real binary and the real examples. |
-| `assets/` | The placeholder served for retired assets. |
+| `assets/` | The placeholder served for retired assets, and the sRGB profile every rendition is converted to. |
+| `tests/fixtures/` | A Display P3 profile, for the test that renditions convert colours rather than relabel them. |
 | `PLAN.md` | The design record: the decisions, and the reasoning behind them. |
 | `TODO.md` | What is open, and what has already been settled. |
 
@@ -403,6 +404,7 @@ nix develop
 The shell provides Rust, Cargo, rustfmt, Clippy, rust-analyzer, SQLite,
 ImageMagick, and build tools. `flake.lock` pins Nixpkgs. On startup, Atlas checks
 that ImageMagick can read/write JPEG, PNG, WebP, AVIF, JPEG XL and HEIC, and
+that it is built with LCMS, which converts a photo's colour profile to sRGB, and
 refuses to start without them. The API still accepts only its explicit input
 allowlist.
 
@@ -597,8 +599,9 @@ additive-migration policy Atlas follows.
 Production targets ordinary Linux hosts, not specifically NixOS. Use a dedicated
 private persistent data directory with mode `0700`; Atlas rejects an existing
 non-empty data directory that is accessible by group/other users. Install
-SQLite runtime libraries and ImageMagick with the required codecs. Check codec
-support with `magick -list format`. Run Atlas behind the site's HTTPS reverse
+SQLite runtime libraries and ImageMagick with the required codecs and LCMS. Check
+codec support with `magick -list format`, and LCMS on the `DELEGATES` line of
+`magick -list configure`. Run Atlas behind the site's HTTPS reverse
 proxy, routing `/media/` publicly and keeping the token-protected API on the
 server side. Proxy path matching must be case-preserving.
 
@@ -679,4 +682,7 @@ Atlas is licensed under the GNU General Public License, version 3. See
 The example consumers are part of this repository and carry the same licence.
 The vendored front-end assets keep their own: HTMX is Zero-Clause BSD and the
 Catppuccin palette is MIT, and both licence files sit beside the files
-themselves.
+themselves. The two ICC profiles, `assets/sRGB-v4.icc` and
+`tests/fixtures/DisplayP3-v4.icc`, are from
+[Compact ICC Profiles](https://github.com/saucecontrol/Compact-ICC-Profiles)
+and are released under CC0.
