@@ -131,15 +131,7 @@ impl ImageProcessor {
         if !output.status.success() {
             return Err(MediaError::ProcessFailed);
         }
-        let available: Vec<_> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                let mut columns = line.split_whitespace();
-                let name = columns.next()?.trim_end_matches('*');
-                let mode = columns.next()?;
-                (mode.contains('r') && mode.contains('w')).then_some(name.to_ascii_uppercase())
-            })
-            .collect();
+        let available = read_write_formats(&String::from_utf8_lossy(&output.stdout));
 
         // Every format that is written out must also be readable back, and
         // now that uploads may be in AVIF, JXL or HEIC, they must be readable
@@ -356,6 +348,50 @@ impl ImageProcessor {
     }
 }
 
+/// The formats ImageMagick can both read and write, from `magick -list format`.
+///
+/// The listing has more than one shape. A build without loadable modules
+/// prints the name, the mode and the description:
+///
+/// ```text
+///      JPEG* rw-   Joint Photographic Experts Group JFIF format
+/// ```
+///
+/// A build with them prints the module the format lives in as well, which is
+/// how Debian and Ubuntu ship ImageMagick:
+///
+/// ```text
+///      JPEG  JPEG      rw-   Joint Photographic Experts Group JFIF format
+/// ```
+///
+/// The mode is therefore found by what it looks like rather than by where it
+/// sits: three letters, the first for reading, the second for writing and the
+/// third for holding more than one image. Module names are upper case, so one
+/// of them can never be mistaken for a mode.
+fn read_write_formats(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            let name = columns.next()?.trim_end_matches('*');
+            let mode = columns.find(|column| is_format_mode(column))?;
+            (mode.contains('r') && mode.contains('w')).then(|| name.to_ascii_uppercase())
+        })
+        .collect()
+}
+
+/// Whether a column is ImageMagick's mode column.
+///
+/// `rw+` reads and writes and holds a sequence, `r--` only reads, `-w-` only
+/// writes, and `---` neither.
+fn is_format_mode(column: &str) -> bool {
+    let mut letters = column.chars();
+    matches!(letters.next(), Some('r' | '-'))
+        && matches!(letters.next(), Some('w' | '-'))
+        && matches!(letters.next(), Some('+' | '-'))
+        && letters.next().is_none()
+}
+
 pub fn validate_signature(format: SourceFormat, prefix: &[u8]) -> bool {
     match format {
         SourceFormat::Jpeg => prefix.starts_with(&[0xff, 0xd8, 0xff]),
@@ -469,8 +505,59 @@ fn has_delegate(configure: &str, wanted: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_delegate, parse_dimensions, validate_signature};
+    use super::{has_delegate, parse_dimensions, read_write_formats, validate_signature};
     use crate::model::SourceFormat;
+
+    /// The listing a build without loadable modules prints.
+    const STATIC_BUILD_LISTING: &str = "   Format  Mode  Description\n\
+        -------------------------------------------------------------------------------\n\
+        \x20    3FR  r--   Hasselblad CFV/H3D39II Raw Format (0.22.1-Release)\n\
+        \x20   AVIF* HEIC      rw+   AV1 Image File Format\n\
+        \x20   HEIC* HEIC      rw+   High Efficiency Image Format\n\
+        \x20    JXL* rw+   JPEG XL (ISO/IEC 18181) (libjxl 0.12.0)\n\
+        \x20   JPEG* rw-   Joint Photographic Experts Group JFIF format\n\
+        \x20    PNG* rw-   Portable Network Graphics (libpng 1.6.58)\n\
+        \x20   WEBP* rw+   WebP Image Format (libwebp 1.6.0 [0210])\n";
+
+    /// The listing a build with loadable modules prints, which is how Debian
+    /// and Ubuntu ship ImageMagick: the module the format lives in sits
+    /// between the name and the mode.
+    const MODULE_BUILD_LISTING: &str = " Format  Module    Mode  Description\n\
+        -------------------------------------------------------------------------------\n\
+        \x20    3FR  DNG       r--   Hasselblad CFV/H3D39II Raw Format (0.22.1-Release)\n\
+        \x20   AVIF  HEIC      rw+   AV1 Image File Format\n\
+        \x20   HEIC  HEIC      rw+   High Efficiency Image Format\n\
+        \x20    JXL  JXL       rw+   JPEG XL (ISO/IEC 18181) (libjxl 0.12.0)\n\
+        \x20   JPEG  JPEG      rw-   Joint Photographic Experts Group JFIF format\n\
+        \x20    PNG  PNG       rw-   Portable Network Graphics (libpng 1.6.58)\n\
+        \x20   WEBP  WEBP      rw+   WebP Image Format (libwebp 1.6.0 [0210])\n";
+
+    /// The mode column is found by its shape, not by its position: a module
+    /// build puts the module's name where a static build puts the mode, and
+    /// reading that column as the mode finds nothing that reads and writes.
+    #[test]
+    fn the_codec_listing_is_read_the_same_way_in_both_shapes() {
+        for listing in [STATIC_BUILD_LISTING, MODULE_BUILD_LISTING] {
+            let available = read_write_formats(listing);
+            for required in ["AVIF", "HEIC", "JXL", "JPEG", "PNG", "WEBP"] {
+                assert!(
+                    available.iter().any(|format| format == required),
+                    "{required} is missing from {available:?}"
+                );
+            }
+            // A format that only reads is not a format Atlas can write a
+            // rendition in.
+            assert!(!available.iter().any(|format| format == "3FR"));
+        }
+    }
+
+    /// The header of the listing is not a format, and neither is a line
+    /// without a mode.
+    #[test]
+    fn a_listing_without_modes_yields_no_formats() {
+        assert!(read_write_formats("   Format  Mode  Description\n").is_empty());
+        assert!(read_write_formats("").is_empty());
+    }
 
     #[test]
     fn signature_allowlist_rejects_raw_image_bytes() {

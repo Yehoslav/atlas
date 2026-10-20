@@ -28,7 +28,14 @@ jobs:
         # failure says which codec is gone: a nixpkgs bump that dropped
         # libheif would otherwise show up as a phone photograph that will not
         # upload.
-        run: bash scripts/check-magick-codecs.sh
+        #
+        # The second script asks the same check the same question of both
+        # shapes ImageMagick prints its listing in, so the check cannot read
+        # the module column as the mode and call every codec missing on a
+        # host that has them all.
+        run: |
+          bash scripts/check-magick-codecs.sh
+          bash scripts/test-codec-check.sh
 
       - name: Service
         run: |

@@ -22,9 +22,19 @@ for codec in $codecs; do
     # A format is listed as its name, a `*` when ImageMagick handles it
     # natively, and a mode of three letters: read, write, and whether it
     # holds more than one image.
+    #
+    # The mode is found by what it looks like rather than by where it sits.
+    # A build without loadable modules prints the name, the mode and the
+    # description; a build with them prints the module the format lives in
+    # between the name and the mode, which is how Debian and Ubuntu ship
+    # ImageMagick. The mode is lower case and the module names are upper
+    # case, so a module name can never be mistaken for a mode.
     if ! awk -v want="$codec" '
-        { name = $1; mode = $2 }
-        name == want || name == want "*" {
+        $1 == want || $1 == want "*" {
+            mode = ""
+            for (i = 2; i <= NF; i++) {
+                if ($i ~ /^[rw-][rw-][+-]$/) { mode = $i; break }
+            }
             if (mode ~ /r/ && mode ~ /w/) { found = 1 }
         }
         END { exit found ? 0 : 1 }

@@ -425,7 +425,10 @@ allowlist.
 The dev shell makes the same codec check as it opens, and CI runs it as a step
 of its own (`scripts/check-magick-codecs.sh`), so a Nixpkgs bump that dropped
 libheif is a named failure rather than a server that will not start or a phone
-photograph that will not upload.
+photograph that will not upload. The check reads ImageMagick's codec listing
+in both of the shapes it is printed in — with and without loadable modules,
+which is how Debian and Ubuntu ship it — so a host that has every codec is not
+told it has none.
 
 Run locally:
 

@@ -331,7 +331,8 @@ do with media, and only a consumer with its own content database can answer.
   it — both the canonical one and every alternative spelling.
 - Every format ImageMagick writes a rendition in is also readable at startup,
   so a build missing a delegate refuses to start rather than failing on
-  somebody's first upload.
+  somebody's first upload. The codec listing is read the same way in both of
+  the shapes ImageMagick prints it, with and without loadable modules.
 - ImageMagick failures/timeouts and database failures do not publish partial
   assets; startup cleanup handles unindexed directories left by a crash.
 - Auto-format negotiation honors `Accept` quality values, emits `Vary: Accept`,
