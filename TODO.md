@@ -127,6 +127,18 @@ Placed at `examples/family-album/`.
       image stored as a document, where the content type alone would point at
       the wrong collection.
 
+### HEIC image sequences
+
+- [ ] **Refuse the HEVC sequence brands.** The byte check accepts the brands
+      `hevc`, `hevx`, `hevm` and `hevs`, and IANA maps exactly those four to
+      `image/heic-sequence` — the media type Atlas already refuses at the
+      door. A sequence is a grid of pictures, not a picture, and Atlas keeps
+      one original and generates renditions from one frame of it. Drop those
+      four brands, keep `heic`, `heix`, `heim` and `heis`, add a test that a
+      sequence-branded file is refused, and say in the README and the plan
+      that a sequence is a `415` now. It turns a `201` into a `415`, so it
+      wants a decision of its own rather than riding along with a fix.
+
 ## Things that got through, and why
 
 Worth keeping because each shipped green and each was found by hand:

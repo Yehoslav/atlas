@@ -309,12 +309,12 @@ async fn upload_into(
         .filter(|format| kind.accepts(*format))
         .ok_or_else(|| {
             ApiError::unsupported(match kind {
-                Kind::Image => {
-                    "The images collection accepts image/jpeg, image/png, image/webp, \
-                     image/avif, image/jxl and image/heic. GET /api/v1/formats lists them."
-                }
+                Kind::Image => format!(
+                    "The images collection accepts {}. GET /api/v1/formats lists them.",
+                    list_sentence(&accepted_media_types(&accepted_formats(kind)))
+                ),
                 Kind::Document => {
-                    "This file type is not accepted. GET /api/v1/formats lists what is."
+                    "This file type is not accepted. GET /api/v1/formats lists what is.".to_owned()
                 }
             })
         })?;
@@ -960,8 +960,38 @@ fn invalid_mime() -> ApiError {
     )
 }
 
-/// The media types of a set of formats, in the order they were given.
-fn mime_list(formats: &[SourceFormat]) -> Vec<&'static str> {
+/// A list of things, the way a sentence reads it: "a, b, c and d".
+fn list_sentence(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        _ => {
+            let (last, rest) = items.split_last().expect("the list is not empty");
+            format!("{} and {last}", rest.join(", "))
+        }
+    }
+}
+
+/// Every media type a set of formats may be declared as.
+///
+/// Every accepted spelling is listed, not just the canonical one: this is
+/// where a caller reads what it may put in a `Content-Type`, so a spelling
+/// Atlas accepts but does not advertise would be a spelling it rejects for
+/// no stated reason.
+fn accepted_media_types(formats: &[SourceFormat]) -> Vec<&'static str> {
+    formats
+        .iter()
+        .flat_map(|format| format.accepted_content_types().iter().copied())
+        .collect()
+}
+
+/// The canonical media type of each format: one entry per format.
+///
+/// This is the list of *formats*, spelled as the media type each one is
+/// stored and served as. A format with more than one accepted spelling
+/// appears once here, so counting this list counts formats; the spellings
+/// themselves are in `accepted_media_types`.
+fn canonical_media_types(formats: &[SourceFormat]) -> Vec<&'static str> {
     formats.iter().map(|format| format.mime_type()).collect()
 }
 
@@ -1072,21 +1102,35 @@ pub(super) struct CollectionSummary {
     bytes: i64,
 }
 
+/// The formats a collection accepts, in the order they are advertised.
+///
+/// One list, asked for in two places: the endpoint that tells a consumer what
+/// it may send, and the error that tells one what it may not.
+fn accepted_formats(kind: Kind) -> Vec<SourceFormat> {
+    SourceFormat::ALL
+        .into_iter()
+        .filter(|format| kind.accepts(*format))
+        .collect()
+}
+
 /// What each collection accepts.
 ///
 /// Derived from the same enum the upload path validates against, so this cannot
 /// describe a list Atlas will then reject: a consumer building an upload form
 /// reads it instead of hardcoding types that drift on the next release.
+///
+/// The two lists answer two different questions, and a consumer that reads
+/// one as the other gets a wrong answer rather than an error: `formats` holds
+/// one media type per format, so counting it counts formats, while
+/// `media_types` holds every spelling a caller may declare, so a format with
+/// two names appears twice in it and once in `formats`.
 pub(super) async fn list_formats(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<FormatsResponse>, ApiError> {
     authorize(&state, &headers)?;
     let for_kind = |kind: Kind| -> AcceptedFormats {
-        let formats = SourceFormat::ALL
-            .into_iter()
-            .filter(|format| kind.accepts(*format))
-            .collect::<Vec<_>>();
+        let formats = accepted_formats(kind);
         // The groups a `mime` filter may name for this collection: the type
         // prefixes that actually appear among the formats above.
         let mut groups = formats
@@ -1097,7 +1141,8 @@ pub(super) async fn list_formats(
         groups.sort();
         groups.dedup();
         AcceptedFormats {
-            formats: mime_list(&formats),
+            formats: canonical_media_types(&formats),
+            media_types: accepted_media_types(&formats),
             groups,
             generates_renditions: kind.generates_renditions(),
         }
@@ -1110,7 +1155,12 @@ pub(super) async fn list_formats(
 
 #[derive(Serialize)]
 pub(super) struct AcceptedFormats {
+    /// One media type per accepted format: the canonical spelling, the one
+    /// the asset is stored and served as.
     formats: Vec<&'static str>,
+    /// Every media type a caller may declare, which is more than one for a
+    /// format with alternative spellings.
+    media_types: Vec<&'static str>,
     groups: Vec<String>,
     generates_renditions: bool,
 }
@@ -2935,6 +2985,83 @@ mod tests {
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
+    /// The other spelling of HEIF.
+    ///
+    /// freedesktop.org makes `image/heif` the canonical type for a `.heic`
+    /// file and keeps `image/heic` as its alias, so which one a browser sends
+    /// is the desktop's decision. A file manager that answers `image/heif` for
+    /// a HEIC photograph used to be told the format was not accepted.
+    #[tokio::test]
+    async fn heic_may_be_declared_as_image_heif() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.variant_widths = vec![320];
+        let router = app(AppState::new(config).await.unwrap());
+
+        let heic = write_test_image_as(&directory.path().join("photo.heic"), "120x90", "HEIC");
+        let (status, asset) = send(&router, upload_named("image/heif", &heic, "photo.heic")).await;
+        assert_eq!(status, StatusCode::CREATED, "declared as image/heif");
+        assert_eq!(asset["kind"], "image");
+        assert_eq!(
+            asset["original"]["content_type"], "image/heic",
+            "stored under the canonical spelling whatever it was declared as"
+        );
+        assert_eq!(asset["original"]["width"], 120);
+        assert_eq!(asset["original"]["height"], 90);
+        assert!(
+            !asset["renditions"].as_array().unwrap().is_empty(),
+            "image/heif is an image, so it gets renditions"
+        );
+    }
+
+    /// The alias opens a declaration, not a door.
+    ///
+    /// `image/heif` names a container family whose payload may be AV1, and
+    /// Atlas decodes HEVC. An AV1 file wearing the other spelling is still
+    /// refused, because the bytes are what decide.
+    #[tokio::test]
+    async fn the_heif_spelling_does_not_admit_an_av1_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let avif = write_test_image_as(&directory.path().join("real.avif"), "60x40", "AVIF");
+        let (status, error) =
+            send(&router, upload_named("image/heif", &avif, "disguised.heif")).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("do not match the declared media type"),
+            "said: {error}"
+        );
+    }
+
+    /// The image sequences are not pictures.
+    ///
+    /// `image/heic-sequence` is a grid of images in one container, not one
+    /// image, and ImageMagick would silently keep only the first frame. It is
+    /// not in the allowlist and adding it would buy nothing.
+    #[tokio::test]
+    async fn an_image_sequence_is_not_an_image() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let heic = write_test_image_as(&directory.path().join("photo.heic"), "60x40", "HEIC");
+        for content_type in ["image/heic-sequence", "image/heif-sequence"] {
+            let (status, _) = send(&router, upload_named(content_type, &heic, "photo")).await;
+            assert_eq!(
+                status,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{content_type} is not a picture Atlas can hold"
+            );
+        }
+    }
+
     /// A consumer building an upload form should be able to ask rather than
     /// hardcode a list that drifts on the next release.
     /// A picture stored as a document sits in the documents collection while
@@ -3215,6 +3342,8 @@ mod tests {
 
         let (status, body) = send(&router, authorized("GET", "/api/v1/formats")).await;
         assert_eq!(status, StatusCode::OK);
+        // The format list holds one media type per format: HEIF has two
+        // spellings, and a consumer counting this list counts formats.
         let images = body["images"]["formats"].as_array().unwrap();
         assert_eq!(
             images,
@@ -3227,12 +3356,33 @@ mod tests {
                 json!("image/heic"),
             ]
         );
+        // The media type list holds every spelling a caller may declare.
+        let spellings = body["images"]["media_types"].as_array().unwrap();
+        assert_eq!(
+            spellings,
+            &vec![
+                json!("image/jpeg"),
+                json!("image/png"),
+                json!("image/webp"),
+                json!("image/avif"),
+                json!("image/jxl"),
+                json!("image/heic"),
+                json!("image/heif"),
+            ]
+        );
         assert_eq!(body["images"]["groups"], json!(["image/*"]));
         assert_eq!(body["images"]["generates_renditions"], json!(true));
 
         // Documents take everything, which is the point of the collection.
         let documents = body["documents"]["formats"].as_array().unwrap();
         assert_eq!(documents.len(), SourceFormat::ALL.len());
+        assert_eq!(
+            body["documents"]["media_types"].as_array().unwrap().len(),
+            SourceFormat::ALL
+                .iter()
+                .map(|format| format.accepted_content_types().len())
+                .sum::<usize>()
+        );
         assert_eq!(
             body["documents"]["groups"],
             json!(["application/*", "image/*"])
@@ -3241,14 +3391,20 @@ mod tests {
 
         // Nothing listed may be refused by the endpoint that validates it, so
         // each advertised type is offered bytes that really are that type.
-        for content_type in images {
+        // The spellings are walked, not the formats: `image/heif` is a
+        // spelling Atlas accepts, so it has to be proven accepted too.
+        // The sizes differ because two spellings of one format are the same
+        // bytes, and identical bytes are one asset: the second upload would
+        // be deduplicated and answer 200 rather than 201.
+        for (index, content_type) in spellings.iter().enumerate() {
             let content_type = content_type.as_str().unwrap();
             let format = SourceFormat::parse_content_type(content_type).unwrap();
+            let side = 20 + index;
             let bytes = write_test_image_as(
                 &directory
                     .path()
-                    .join(format!("probe.{}", format.extension())),
-                "20x20",
+                    .join(format!("probe{index}.{}", format.extension())),
+                &format!("{side}x{side}"),
                 format.magick_name().unwrap(),
             );
             let (status, error) = send(&router, upload_named(content_type, &bytes, "probe")).await;
@@ -3270,6 +3426,66 @@ mod tests {
         )
         .await;
         assert_eq!(anonymous.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The two lists answer two questions, and a consumer that reads one as
+    /// the other gets a wrong answer rather than an error.
+    ///
+    /// Counting the format list counts formats; counting the media type list
+    /// counts spellings, and HEIF has two. Every format appears once in the
+    /// first list and every spelling of it in the second.
+    #[tokio::test]
+    async fn the_format_list_counts_formats_and_the_media_type_list_counts_spellings() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let (status, body) = send(&router, authorized("GET", "/api/v1/formats")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        for collection in ["images", "documents"] {
+            let formats = body[collection]["formats"].as_array().unwrap();
+            let media_types = body[collection]["media_types"].as_array().unwrap();
+
+            // One entry per format, and no format listed twice.
+            let mut unique = formats.clone();
+            unique.sort_by(|a, b| a.as_str().unwrap().cmp(b.as_str().unwrap()));
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                formats.len(),
+                "{collection} lists a format twice"
+            );
+
+            // Every canonical type is also an accepted type.
+            for format in formats {
+                assert!(
+                    media_types.contains(format),
+                    "{collection} lists {format} but does not accept it"
+                );
+            }
+
+            // The spellings are the formats' own, so the two lists cannot
+            // drift apart: the media type list is the format list with the
+            // alternative spellings put back in.
+            let expected: Vec<&str> = formats
+                .iter()
+                .map(|format| format.as_str().unwrap())
+                .flat_map(|canonical| {
+                    SourceFormat::parse_content_type(canonical)
+                        .unwrap()
+                        .accepted_content_types()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            let listed: Vec<&str> = media_types
+                .iter()
+                .map(|media_type| media_type.as_str().unwrap())
+                .collect();
+            assert_eq!(listed, expected, "{collection} lists other spellings");
+        }
     }
 
     #[tokio::test]
@@ -3336,6 +3552,20 @@ mod tests {
             1,
             "and the invoice is still findable by its own type"
         );
+
+        // Either spelling of HEIF finds the same picture.
+        let heic = write_test_image_as(&directory.path().join("wedding.heic"), "70x50", "HEIC");
+        let (status, value) =
+            send(&router, upload_named("image/heif", &heic, "wedding.heic")).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let heic_id = value["id"].as_str().unwrap().to_owned();
+        for query in ["mime=image%2Fheif", "mime=image%2Fheic"] {
+            assert_eq!(
+                ids_of(&listing(&router, query).await),
+                vec![heic_id.clone()],
+                "{query} finds the HEIC picture"
+            );
+        }
     }
 
     #[tokio::test]

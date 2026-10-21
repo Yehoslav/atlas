@@ -219,6 +219,8 @@ collections.
 - `GET /api/v1/summary` — authenticated counts and stored bytes, trash included.
 - `GET /api/v1/formats` — authenticated accepted media types per collection,
   the `mime` groups they answer to, and whether renditions are generated.
+  One media type per format in `formats`, every accepted spelling in
+  `media_types`.
 - `POST /api/v1/assets/state` — authenticated batch state for up to 500 ids the
   caller supplies, across collections. Not a listing, and Atlas learns nothing
   from the ids.
@@ -324,12 +326,13 @@ do with media, and only a consumer with its own content database can answer.
   an AVIF renamed `.heic` is refused, and a bare JPEG XL codestream and a
   container JPEG XL are both recognised.
 - Every format the renditions are written in is also accepted on upload, so a
-  rendition fetched from Atlas can be uploaded again, and every format
+  rendition fetched from Atlas can be uploaded again, and every media type
   `GET /api/v1/formats` advertises is accepted by the endpoint that validates
-  it.
+  it — both the canonical one and every alternative spelling.
 - Every format ImageMagick writes a rendition in is also readable at startup,
   so a build missing a delegate refuses to start rather than failing on
-  somebody's first upload.
+  somebody's first upload. The codec listing is read the same way in both of
+  the shapes ImageMagick prints it, with and without loadable modules.
 - ImageMagick failures/timeouts and database failures do not publish partial
   assets; startup cleanup handles unindexed directories left by a crash.
 - Auto-format negotiation honors `Accept` quality values, emits `Vary: Accept`,
@@ -385,3 +388,18 @@ do with media, and only a consumer with its own content database can answer.
   sniffed, because AVIF and HEIC are both ISO base media files starting with
   an `ftyp` box; the whole brand list is searched, since a file may declare
   `mif1` and list `heic` among its compatible brands.
+- A format may have more than one accepted media type. HEIF has two spellings
+  and the desktop picks the one that goes on the wire: freedesktop.org makes
+  `image/heif` the canonical type for a `.heic` file and keeps `image/heic` as
+  its alias, so a browser and a file manager send what their MIME database
+  says. Atlas accepts either and stores the canonical one. The bytes are what
+  decide the format, so the second spelling widens what may be declared and
+  not what may be decoded: an AV1-in-HEIF file is refused either way, and
+  `image/heic-sequence` is not a picture and is refused too.
+- A list of media types and a list of formats are different lists, and
+  `GET /api/v1/formats` publishes both. `formats` holds one media type per
+  format, so counting it counts formats; `media_types` holds every spelling
+  that may be declared. One list cannot answer both questions: a consumer
+  that counted spellings called six image formats seven, and a consumer that
+  offered a filter per spelling offered two filters for one format that
+  returned the same assets.

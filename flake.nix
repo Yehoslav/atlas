@@ -43,6 +43,19 @@
               python3Packages.ruff
               python3Packages.ty
             ];
+
+            # The pinned ImageMagick has to carry the codecs Atlas needs. A
+            # nixpkgs bump that dropped libheif would otherwise show up as a
+            # server that refuses to start, or as a phone photograph that
+            # cannot be uploaded, long after the cause. Say it here, where
+            # the reason can still be read.
+            #
+            # The check is the same one Atlas makes at startup
+            # (`ImageProcessor::verify_formats`); it lives in a script so
+            # that the dev shell and CI make it the same way.
+            shellHook = ''
+              ${builtins.readFile ./scripts/check-magick-codecs.sh}
+            '';
           };
         });
     };

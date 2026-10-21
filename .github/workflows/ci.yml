@@ -22,6 +22,21 @@ jobs:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
 
+      - name: ImageMagick codecs
+        # The dev shell refuses to start without these, which would fail every
+        # job below with the same message. Name them here instead, so the
+        # failure says which codec is gone: a nixpkgs bump that dropped
+        # libheif would otherwise show up as a phone photograph that will not
+        # upload.
+        #
+        # The second script asks the same check the same question of both
+        # shapes ImageMagick prints its listing in, so the check cannot read
+        # the module column as the mode and call every codec missing on a
+        # host that has them all.
+        run: |
+          bash scripts/check-magick-codecs.sh
+          bash scripts/test-codec-check.sh
+
       - name: Service
         run: |
           cargo fmt --check

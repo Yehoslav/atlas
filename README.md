@@ -142,6 +142,13 @@ as an attachment instead of being re-encoded into a picture.
   the optional `X-Original-Filename` header names it. Streams to disk, generates
   the configured renditions, and returns an asset ID, original metadata, and
   rendition URLs.
+  A HEIC photograph may also be declared as `image/heif`: freedesktop.org
+  makes `image/heif` the canonical type for a `.heic` file and keeps
+  `image/heic` as its alias, so a browser, a file manager and a command line
+  disagree about which spelling to send. Either is accepted, the bytes decide
+  what the file is, and the asset is stored and served as `image/heic`
+  whichever spelling it arrived under. `image/heic-sequence` is not a picture
+  and is not accepted.
 - `POST /api/v1/documents` — the same upload for `documents`. `Content-Type` may
   be any allowlisted format, images included. The file is stored and served
   untouched, with no renditions.
@@ -172,11 +179,18 @@ as an attachment instead of being re-encoded into a picture.
   rejects the whole batch with `400` and changes nothing.
 - `GET /api/v1/summary` — authenticated counts and stored bytes for the whole
   instance, including the trash. A cheap dashboard number, not a listing.
-- `GET /api/v1/formats` — authenticated list of the media types each collection
-  accepts, the `mime` groups they answer to, and whether they get renditions.
-  Derived from the same table the upload path validates against, so it cannot
+- `GET /api/v1/formats` — authenticated list of what each collection accepts,
+  the `mime` groups they answer to, and whether they get renditions. Derived
+  from the same table the upload path validates against, so it cannot
   advertise something Atlas would then refuse. A consumer building an upload
   form should read this rather than hardcode a list that drifts.
+  It answers two questions with two lists, because one list cannot answer both:
+  `formats` holds one media type per format — the canonical spelling, the one
+  the asset is stored and served as — so counting it counts formats, and
+  `media_types` holds every spelling a caller may put in a `Content-Type`,
+  which is more than one for a format with alternative names. A consumer
+  offering a filter should offer one option per format, from `formats`; a
+  consumer validating a type somebody else declared should read `media_types`.
 - `POST /api/v1/assets/state` — authenticated batch state lookup for ids the
   caller already has, across both collections. Not a listing.
 - `DELETE /api/v1/{kind}/{id}` — authenticated move to the trash. Returns `204`.
@@ -407,6 +421,14 @@ that ImageMagick can read/write JPEG, PNG, WebP, AVIF, JPEG XL and HEIC, and
 that it is built with LCMS, which converts a photo's colour profile to sRGB, and
 refuses to start without them. The API still accepts only its explicit input
 allowlist.
+
+The dev shell makes the same codec check as it opens, and CI runs it as a step
+of its own (`scripts/check-magick-codecs.sh`), so a Nixpkgs bump that dropped
+libheif is a named failure rather than a server that will not start or a phone
+photograph that will not upload. The check reads ImageMagick's codec listing
+in both of the shapes it is printed in — with and without loadable modules,
+which is how Debian and Ubuntu ship it — so a host that has every codec is not
+told it has none.
 
 Run locally:
 

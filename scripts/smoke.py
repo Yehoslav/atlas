@@ -255,6 +255,27 @@ def png_bytes(width: int = 1400, height: int = 900) -> bytes:
     )
 
 
+def image_bytes(magick_format: str, width: int = 120, height: int = 90) -> bytes:
+    """Real bytes in a real format, generated so the checks need no fixtures.
+
+    ImageMagick makes these, the same way Atlas would read them back.
+    """
+    generated = subprocess.run(
+        ["magick", "-size", f"{width}x{height}", "xc:red", f"{magick_format}:-"],
+        capture_output=True,
+        check=True,
+    )
+    return generated.stdout
+
+
+def heic_bytes(width: int = 120, height: int = 90) -> bytes:
+    return image_bytes("HEIC", width, height)
+
+
+def avif_bytes(width: int = 120, height: int = 90) -> bytes:
+    return image_bytes("AVIF", width, height)
+
+
 PDF = b"%PDF-1.4\n% atlas smoke test\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
 IMAGE_HEADERS = {"Content-Type": "image/png", "X-Original-Filename": "big.png"}
 
@@ -461,6 +482,8 @@ def check_api(checks: Checks) -> None:
         401,
     )
     checks.ok("formats listing", status, 200)
+    # The format list holds one media type per format, so counting it counts
+    # formats: HEIF has two spellings and is one format.
     advertised = formats["images"]["formats"]
     checks.ok(
         "  advertises what Atlas produces",
@@ -476,11 +499,32 @@ def check_api(checks: Checks) -> None:
             ]
         ),
     )
+    # The media type list holds every spelling a caller may declare.
+    checks.ok(
+        "  advertises every spelling",
+        sorted(formats["images"]["media_types"]),
+        sorted(
+            [
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+                "image/avif",
+                "image/jxl",
+                "image/heic",
+                "image/heif",
+            ]
+        ),
+    )
     checks.ok("  image group", formats["images"]["groups"], ["image/*"])
     checks.ok(
         "  images get renditions", formats["images"]["generates_renditions"], True
     )
-    checks.ok("  documents take everything", len(formats["documents"]["formats"]), 9)
+    checks.ok("  documents take every format", len(formats["documents"]["formats"]), 9)
+    checks.ok(
+        "  documents take every spelling",
+        len(formats["documents"]["media_types"]),
+        10,
+    )
     checks.ok(
         "  documents get none", formats["documents"]["generates_renditions"], False
     )
@@ -496,6 +540,51 @@ def check_api(checks: Checks) -> None:
         "srcset on a document",
         checks.request("GET", f"/api/v1/images/{document_id}/srcset")[0],
         404,
+    )
+
+    print("\n== heif, in the spelling the desktop sends ==", flush=True)
+    # HEIF has two spellings and the desktop decides which one a browser
+    # sends: freedesktop.org makes `image/heif` canonical and keeps
+    # `image/heic` as its alias. A file manager that answered `image/heif`
+    # used to be told the format was not accepted.
+    #
+    # This runs after the sections that count assets, because it adds one.
+    status, heic = checks.request(
+        "POST",
+        "/api/v1/images",
+        heic_bytes(),
+        {"Content-Type": "image/heif", "X-Original-Filename": "wedding.heic"},
+    )
+    checks.ok("heic uploaded as image/heif", status, 201)
+    checks.ok("  kind", heic["kind"], "image")
+    checks.ok("  stored canonically", heic["original"]["content_type"], "image/heic")
+    checks.true("  it got renditions", len(heic["renditions"]) > 0)
+    checks.ok(
+        "the heif spelling does not admit an av1 file",
+        checks.request(
+            "POST", "/api/v1/images", avif_bytes(), {"Content-Type": "image/heif"}
+        )[0],
+        415,
+    )
+    checks.ok(
+        "an image sequence is not a picture",
+        checks.request(
+            "POST",
+            "/api/v1/images",
+            heic_bytes(),
+            {"Content-Type": "image/heif-sequence"},
+        )[0],
+        415,
+    )
+    # The two spellings are one format, so they are one filter: a consumer
+    # that lists one spelling offers one option and still finds everything.
+    by_canonical = checks.request("GET", "/api/v1/images?mime=image%2Fheic")[1]
+    by_spelling = checks.request("GET", "/api/v1/images?mime=image%2Fheif")[1]
+    checks.true("the canonical spelling finds the heic", by_canonical["total"] >= 1)
+    checks.ok(
+        "both spellings filter the same assets",
+        by_spelling["total"],
+        by_canonical["total"],
     )
 
     print("\n== bulk actions ==", flush=True)
@@ -743,6 +832,12 @@ def check_dashboard(checks: Checks, binary: Path, atlas_port: int, port: int) ->
         environment = dict(os.environ)
         environment.update(
             ATLAS_API_URL=f"http://127.0.0.1:{atlas_port}",
+            # The dashboard reads a local `.env` for what the environment does
+            # not provide, and a developer's own file points at their own
+            # Atlas. The environment wins, so the media base is named here and
+            # the check below is about the smoke run rather than about
+            # whatever happens to be on this machine.
+            ATLAS_MEDIA_URL=f"http://127.0.0.1:{atlas_port}",
             ATLAS_API_TOKEN=TOKEN,
             ADMIN_PASSWORD="dashboard-smoke-password",
             ADMIN_LISTEN=f"127.0.0.1:{port}",
