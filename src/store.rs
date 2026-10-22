@@ -480,6 +480,41 @@ impl Store {
             .collect())
     }
 
+    /// Live images in id order, after `after`, for walking the whole
+    /// collection a page at a time. Also how many live images follow the
+    /// page, so a caller can tell how far along it is.
+    pub async fn live_images_after(
+        &self,
+        after: Option<&AssetId>,
+        limit: i64,
+    ) -> Result<(Vec<AssetId>, i64), StoreError> {
+        let after = after.map(AssetId::as_str).unwrap_or("");
+        let rows = sqlx::query(
+            "SELECT id FROM assets
+             WHERE kind = 'image' AND deleted_at IS NULL AND id > ?
+             ORDER BY id ASC LIMIT ?",
+        )
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let ids: Vec<AssetId> = rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<String, _>("id").ok())
+            .filter_map(|id| AssetId::parse(&id).ok())
+            .collect();
+
+        let last = ids.last().map(AssetId::as_str).unwrap_or(after);
+        let remaining: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM assets WHERE kind = 'image' AND deleted_at IS NULL AND id > ?",
+        )
+        .bind(last)
+        .fetch_one(&self.pool)
+        .await?
+        .try_get(0)?;
+        Ok((ids, remaining))
+    }
+
     /// SQLite extended result codes for a primary-key or unique constraint failure.
     fn is_unique_violation(error: &sqlx::Error) -> bool {
         match error {
@@ -1424,5 +1459,28 @@ mod tests {
                 .is_empty()
         );
         assert!(store.foreign_key_violations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_images_are_walked_in_pages_with_a_count_of_what_is_left() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, first) = store_with_asset(directory.path()).await;
+        let mut ids = vec![first];
+        for _ in 0..2 {
+            let id = AssetId::generate(DEFAULT_LENGTH).unwrap();
+            store.insert_asset(&record(&id), &[]).await.unwrap();
+            ids.push(id);
+        }
+        let trashed = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        store.insert_asset(&record(&trashed), &[]).await.unwrap();
+        store.mark_deleted(&trashed, 1_700_000_100).await.unwrap();
+        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+        let (page, remaining) = store.live_images_after(None, 2).await.unwrap();
+        assert_eq!(page, ids[..2]);
+        assert_eq!(remaining, 1);
+        let (page, remaining) = store.live_images_after(Some(&ids[1]), 2).await.unwrap();
+        assert_eq!(page, ids[2..]);
+        assert_eq!(remaining, 0);
     }
 }

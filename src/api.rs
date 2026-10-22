@@ -1939,6 +1939,115 @@ fn optional_json<T: serde::de::DeserializeOwned + Default>(body: &[u8]) -> Resul
         })
 }
 
+/// How many images one re-render call re-encodes, by default and at most.
+///
+/// Each one is a full conversion, so a page is kept small enough that a
+/// request finishes well inside a proxy's timeout; a caller walks the whole
+/// collection by passing `next` back as `after`.
+const DEFAULT_RE_RENDER_LIMIT: i64 = 10;
+const MAX_RE_RENDER_LIMIT: i64 = 100;
+
+/// Re-encode every live image, a page at a time.
+///
+/// An encoder change is not one asset, it is every asset: a newer
+/// ImageMagick, a newer libjxl, a corrected flag. Each image is re-encoded on
+/// its own, taking the conversion slot for that image only, so an upload
+/// waits for one conversion rather than for the whole collection. A page
+/// answers with how many it re-encoded, which ones failed and why, and how
+/// many are left after it; there is no job queue, so the caller drives the
+/// walk and sees the progress.
+pub(super) async fn re_render_images(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ReRenderResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let request: ReRenderRequest = optional_json(&body)?;
+    let limit = request
+        .limit
+        .unwrap_or(DEFAULT_RE_RENDER_LIMIT)
+        .clamp(1, MAX_RE_RENDER_LIMIT);
+    let after = request
+        .after
+        .as_deref()
+        .map(|value| {
+            AssetId::parse(value).map_err(|_| {
+                ApiError::bad_request("invalid_cursor", "after must be an asset id from next.")
+            })
+        })
+        .transpose()?;
+
+    let (ids, remaining) = state
+        .store
+        .live_images_after(after.as_ref(), limit)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let mut re_encoded = Vec::with_capacity(ids.len());
+    let mut failures = Vec::new();
+    for id in &ids {
+        match re_encode(&state, id).await {
+            Ok(refreshed) => {
+                tracing::info!(asset = %id, generation = refreshed.generation, "re-encoded an image");
+                re_encoded.push(ReEncodedImage {
+                    id: id.to_string(),
+                    generation: refreshed.generation,
+                });
+            }
+            Err(error) => {
+                tracing::error!(asset = %id, error = error.detail(), "could not re-encode an image");
+                failures.push(ActionResult {
+                    id: id.to_string(),
+                    status: "error",
+                    error: Some(error.detail().to_owned()),
+                });
+            }
+        }
+    }
+    tracing::info!(
+        count = re_encoded.len(),
+        failed = failures.len(),
+        remaining,
+        "re-render page done"
+    );
+
+    Ok(Json(ReRenderResponse {
+        count: re_encoded.len(),
+        re_encoded,
+        failures,
+        next: (remaining > 0)
+            .then(|| ids.last().map(AssetId::to_string))
+            .flatten(),
+        remaining,
+    }))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReRenderRequest {
+    limit: Option<i64>,
+    /// The `next` of the previous page; absent to start from the beginning.
+    after: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(super) struct ReEncodedImage {
+    id: String,
+    generation: u32,
+}
+
+#[derive(Serialize)]
+pub(super) struct ReRenderResponse {
+    /// How many images this page re-encoded.
+    count: usize,
+    re_encoded: Vec<ReEncodedImage>,
+    failures: Vec<ActionResult>,
+    /// Where the next page starts; `null` once the walk is done.
+    next: Option<String>,
+    /// Live images after this page, not yet visited by this walk.
+    remaining: i64,
+}
+
 /// The widths a configuration implies, and the width each one produces.
 ///
 /// A profile is a maximum, so a photo narrower than the profile is stored at
@@ -5310,6 +5419,98 @@ mod tests {
             &scratch,
         )
         .await;
+    }
+
+    /// Every live image, re-encoded a page at a time, with the progress in
+    /// each answer.
+    #[tokio::test]
+    async fn re_render_walks_every_live_image_a_page_at_a_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let router = app(state.clone());
+
+        let mut live = Vec::new();
+        for size in ["400x300", "500x300"] {
+            let image = write_test_image(&directory.path().join(format!("{size}.png")), size);
+            live.push(upload_image(&router, &image).await);
+        }
+        let trashed = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("trashed.png"), "600x300"),
+        )
+        .await;
+        place_in_trash(&router, "images", &trashed).await;
+        upload_document(&router, b"%PDF-1.7\nnot an image").await;
+        live.sort();
+
+        let (status, page) = send(
+            &router,
+            json_request("POST", "/api/v1/images/re-render", &json!({"limit": 1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["count"], 1);
+        assert_eq!(
+            page["re_encoded"],
+            json!([{"id": live[0], "generation": 2}])
+        );
+        assert_eq!(page["failures"], json!([]));
+        assert_eq!(page["remaining"], 1);
+        assert_eq!(page["next"], live[0].as_str());
+
+        let (status, page) = send(
+            &router,
+            json_request(
+                "POST",
+                "/api/v1/images/re-render",
+                &json!({"limit": 1, "after": live[0]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["count"], 1);
+        assert_eq!(page["re_encoded"][0]["id"], live[1].as_str());
+        assert_eq!(page["remaining"], 0);
+        assert!(page["next"].is_null(), "the walk is done");
+
+        for id in &live {
+            let (_, asset) = send(&router, authorized("GET", &asset_uri("images", id))).await;
+            assert_eq!(asset["generation"], 2, "{id}");
+        }
+        let (_, asset) = send(&router, authorized("GET", &asset_uri("images", &trashed))).await;
+        assert_eq!(asset["generation"], 1, "the trash is not re-encoded");
+
+        // An empty body starts from the beginning with the default page.
+        let (status, page) = send(&router, authorized("POST", "/api/v1/images/re-render")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["count"], 2);
+
+        let (status, error) = send(
+            &router,
+            json_request(
+                "POST",
+                "/api/v1/images/re-render",
+                &json!({"after": "../x"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "invalid_cursor");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/images/re-render")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// A caller can ask for a rendition format by name.
