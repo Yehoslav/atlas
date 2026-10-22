@@ -418,18 +418,37 @@ impl Store {
             return Ok(None);
         }
 
-        sqlx::query(
-            "INSERT INTO superseded_renditions
-                (asset_id, generation, max_width, width, height, format, bytes, sha256, file_name)
-             SELECT asset_id, ?, max_width, width, height, format, bytes, sha256,
-                    COALESCE(file_name, 'w' || width || '.' ||
-                        CASE format WHEN 'jpeg' THEN 'jpg' ELSE format END)
+        // Read through `to_rendition`, so a row without a file name gets the
+        // same legacy name every reader resolves it to.
+        let current: Vec<RenditionRecord> = sqlx::query(
+            "SELECT asset_id, max_width, width, height, format, bytes, sha256, file_name
              FROM renditions WHERE asset_id = ?",
         )
-        .bind(i64::from(generation))
         .bind(asset_id.as_str())
-        .execute(&mut *transaction)
-        .await?;
+        .fetch_all(&mut *transaction)
+        .await?
+        .into_iter()
+        .filter_map(to_rendition)
+        .map(|(_, rendition)| rendition)
+        .collect();
+        for rendition in &current {
+            sqlx::query(
+                "INSERT INTO superseded_renditions
+                    (asset_id, generation, max_width, width, height, format, bytes, sha256, file_name)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(asset_id.as_str())
+            .bind(i64::from(generation))
+            .bind(i64::from(rendition.max_width))
+            .bind(i64::from(rendition.width))
+            .bind(i64::from(rendition.height))
+            .bind(rendition.format.key())
+            .bind(i64::try_from(rendition.bytes).unwrap_or(i64::MAX))
+            .bind(&rendition.sha256)
+            .bind(&rendition.file_name)
+            .execute(&mut *transaction)
+            .await?;
+        }
         sqlx::query("DELETE FROM renditions WHERE asset_id = ?")
             .bind(asset_id.as_str())
             .execute(&mut *transaction)
@@ -1373,6 +1392,17 @@ mod tests {
         assert_eq!(
             stored.renditions[0].file_name, "w320.jpg",
             "a row the backfill missed keeps the legacy name instead of vanishing"
+        );
+
+        store
+            .supersede_renditions(&id, 1, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.superseded_renditions(&id, 1).await.unwrap()[0].file_name,
+            "w320.jpg",
+            "a superseded row keeps the name it was served under"
         );
     }
 
