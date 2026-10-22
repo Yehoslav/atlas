@@ -576,6 +576,48 @@ def check_api(checks: Checks) -> None:
         404,
     )
 
+    print("\n== re-encoding as a new generation ==", flush=True)
+    # An encoding that turned out to be bad used to be permanent. A re-encode
+    # writes the next generation beside the old one: the URL that names the
+    # old one keeps its bytes, and the asset id does not change.
+    checks.ok(
+        "the URLs name a generation",
+        refreshed["srcset"]["src"],
+        f"/media/{image_id}/w1280?g=1",
+    )
+    old_url = f"/media/{image_id}/w320?g=1"
+    before = checks.request("GET", old_url, raw=True, token=None)[1]
+    status, re_encoded = checks.request(
+        "POST", f"/api/v1/images/{image_id}/renditions", {"re_encode": True}
+    )
+    checks.ok("re-encoded", status, 200)
+    checks.ok("  the same asset", re_encoded["id"], image_id)
+    checks.ok("  the next generation", re_encoded["generation"], 2)
+    checks.true("  the srcset names it", "?g=2 " in re_encoded["srcset"]["srcset"])
+    status, after = checks.request("GET", old_url, raw=True, token=None)
+    checks.ok("  the old URL still serves", status, 200)
+    checks.ok("  with the same bytes", after == before, True)
+
+    def cache_control(path: str) -> str | None:
+        with urllib.request.urlopen(checks.base_url + path, timeout=60) as response:
+            return response.headers.get("Cache-Control")
+
+    checks.ok(
+        "  a generation URL is immutable",
+        cache_control(f"/media/{image_id}/w320?g=2"),
+        "public, max-age=31536000, immutable",
+    )
+    checks.ok(
+        "  the bare URL follows the current one",
+        cache_control(f"/media/{image_id}/w320"),
+        "public, max-age=3600",
+    )
+    status, walk = checks.request("POST", "/api/v1/images/re-render", {"limit": 100})
+    checks.ok("re-render walks every live image", status, 200)
+    checks.true("  and re-encoded them", walk["count"] >= 1)
+    checks.ok("  without failures", walk["failures"], [])
+    checks.ok("  to the end", walk["next"], None)
+
     print("\n== heif, in the spelling the desktop sends ==", flush=True)
     # HEIF has two spellings and the desktop decides which one a browser
     # sends: freedesktop.org makes `image/heif` canonical and keeps
