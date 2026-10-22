@@ -268,6 +268,17 @@ impl RenditionFormat {
         }
     }
 
+    /// The ImageMagick coder that writes this format.
+    pub fn magick_name(self) -> &'static str {
+        match self {
+            Self::Jpeg => "JPEG",
+            Self::Png => "PNG",
+            Self::Webp => "WEBP",
+            Self::Avif => "AVIF",
+            Self::Jxl => "JXL",
+        }
+    }
+
     pub fn mime_type(self) -> &'static str {
         match self {
             Self::Jpeg => "image/jpeg",
@@ -278,7 +289,12 @@ impl RenditionFormat {
         }
     }
 
-    pub fn from_database(value: &str) -> Option<Self> {
+    /// The format a key names.
+    ///
+    /// The same key names a format in the database and in a caller's query
+    /// string, so one lookup answers both: `webp` is the WebP rendition
+    /// wherever it is asked for.
+    pub fn from_key(value: &str) -> Option<Self> {
         match value {
             "jpeg" => Some(Self::Jpeg),
             "png" => Some(Self::Png),
@@ -287,6 +303,11 @@ impl RenditionFormat {
             "jxl" => Some(Self::Jxl),
             _ => None,
         }
+    }
+
+    /// Parse a rendition format stored in the database.
+    pub fn from_database(value: &str) -> Option<Self> {
+        Self::from_key(value)
     }
 }
 

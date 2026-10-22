@@ -1,0 +1,46 @@
+[Unit]
+Description=Atlas media service
+Documentation=https://github.com/Yehoslav/atlas#deploying-atlas
+After=network.target
+
+[Service]
+Type=simple
+User=atlas
+Group=atlas
+
+# The token and the deployment's settings live in a file, not in the unit and
+# not on the command line: a command line is visible to every process on the
+# host. The file is read once, at start.
+EnvironmentFile=/etc/atlas/atlas.env
+
+# The data directory, with its owner and its mode. `StateDirectory` creates
+# it as the service account owns it and makes it private, which is what Atlas
+# insists on: it refuses to start against a non-empty directory that other
+# users can reach. Nothing else has to create it, and nothing else has to
+# remember to make it private.
+StateDirectory=atlas
+StateDirectoryMode=0700
+
+ExecStart=/usr/local/bin/atlas
+
+# Atlas runs in the foreground and shuts down on SIGTERM, so systemd is
+# talking to the process itself and not to a wrapper.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+# The service writes its own directory and nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/atlas
+
+[Install]
+WantedBy=multi-user.target

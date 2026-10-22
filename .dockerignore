@@ -1,0 +1,11 @@
+# Keep the build context small: the compiled service and the local data
+# directory are large, and neither belongs in an image.
+target/
+data/
+.git/
+.github/
+.jj/
+examples/
+scripts/__pycache__/
+*.py[cod]
+.env

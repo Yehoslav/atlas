@@ -170,6 +170,132 @@ impl ImageProcessor {
         Ok(())
     }
 
+    /// The settings every rendition is written with, up to the point where
+    /// the image has been resized.
+    ///
+    /// The fidelity test builds its reference from this same list, on
+    /// purpose: the reference has to be the image the encoder was given, or
+    /// the measurement covers the resampling instead of the encoding.
+    fn base_args(&self, input: &str, width: u32) -> Vec<String> {
+        vec![
+            input.to_owned(),
+            "-auto-orient".to_owned(),
+            // Convert to sRGB before anything is stripped. A photo from a
+            // phone is usually Display P3, and `-strip` below drops the
+            // profile that says so: without converting first, the P3
+            // values would be relabelled as sRGB and the rendition would
+            // look washed out. ImageMagick already calls such a photo
+            // sRGB, so `-colorspace` alone does nothing to it; only
+            // `-profile` converts through the embedded profile. An
+            // untagged source is only labelled, its pixels untouched, and
+            // `-colorspace` still turns untagged CMYK into RGB.
+            "-profile".to_owned(),
+            format!("ICC:{}", self.srgb_profile.display()),
+            "-colorspace".to_owned(),
+            "sRGB".to_owned(),
+            "-resize".to_owned(),
+            format!("{width}x>"),
+            "-strip".to_owned(),
+        ]
+    }
+
+    /// Where the renditions of one width are written, and what they are
+    /// called.
+    ///
+    /// The order is the order they are written in: JPEG XL first, then AVIF,
+    /// then WebP, then the conventional fallback.
+    fn output_paths(
+        staging_dir: &Path,
+        width: u32,
+        fallback: RenditionFormat,
+    ) -> Vec<(RenditionFormat, PathBuf, String)> {
+        let named = |format: RenditionFormat| {
+            let extension = format.extension();
+            (
+                format,
+                staging_dir.join(format!("w{width}.{extension}")),
+                format!("w{width}.{extension}"),
+            )
+        };
+        vec![
+            named(RenditionFormat::Jxl),
+            named(RenditionFormat::Avif),
+            named(RenditionFormat::Webp),
+            named(fallback),
+        ]
+    }
+
+    /// The ImageMagick arguments that write the renditions of one width.
+    ///
+    /// Split out of [`Self::generate`] so that what the encoders are *told*
+    /// can be looked at, not only what comes out. The order of the writes is
+    /// part of that: a quality setting applies to every write after it, and
+    /// ImageMagick's JPEG XL coder turns one into a libjxl distance.
+    fn rendition_args(
+        &self,
+        input: &str,
+        width: u32,
+        outputs: &[(RenditionFormat, PathBuf, String)],
+    ) -> Vec<String> {
+        let path = |index: usize| outputs[index].1.display().to_string();
+        let mut args = self.base_args(input, width);
+
+        // JPEG XL is written first, and with no quality setting in force.
+        //
+        // ImageMagick's JPEG XL coder does not take a quality: it turns one
+        // into a libjxl *distance*, where a larger distance means more loss,
+        // and libjxl's own default is a distance of 1.0. A quality left over
+        // from an earlier write therefore decides the distance without saying
+        // so — `-quality 55`, which the AVIF write below needs, lands in much
+        // the same place as `-quality 85`, well past visually lossless. The
+        // rendition comes out a third smaller and measurably worse, and
+        // nothing in the response says that anything was lost. Writing this
+        // format before any quality is set lets libjxl choose.
+        args.extend([
+            "-define".to_owned(),
+            "jxl:effort=3".to_owned(),
+            "-write".to_owned(),
+            format!("{}:{}", RenditionFormat::Jxl.magick_name(), path(0)),
+        ]);
+
+        args.extend([
+            "-quality".to_owned(),
+            "80".to_owned(),
+            "-define".to_owned(),
+            "webp:method=4".to_owned(),
+            "-write".to_owned(),
+            format!("{}:{}", RenditionFormat::Webp.magick_name(), path(2)),
+            "-quality".to_owned(),
+            "55".to_owned(),
+            "-define".to_owned(),
+            "heic:speed=8".to_owned(),
+            "-write".to_owned(),
+            format!("{}:{}", RenditionFormat::Avif.magick_name(), path(1)),
+        ]);
+
+        match outputs[3].0 {
+            RenditionFormat::Jpeg => {
+                args.extend([
+                    "-quality".to_owned(),
+                    "85".to_owned(),
+                    "-write".to_owned(),
+                    format!("{}:{}", RenditionFormat::Jpeg.magick_name(), path(3)),
+                ]);
+            }
+            RenditionFormat::Png => {
+                args.extend([
+                    "-define".to_owned(),
+                    "png:compression-level=8".to_owned(),
+                    "-write".to_owned(),
+                    format!("{}:{}", RenditionFormat::Png.magick_name(), path(3)),
+                ]);
+            }
+            _ => unreachable!("fallback format is JPEG or PNG"),
+        }
+        args.push("null:".to_owned());
+        args
+    }
+
     pub async fn generate(
         &self,
         input_path: &Path,
@@ -196,88 +322,8 @@ impl ImageProcessor {
                 + u64::from(dimensions.width) / 2)
                 / u64::from(dimensions.width)) as u32;
 
-            let mut outputs: Vec<(RenditionFormat, PathBuf, String)> = vec![
-                (
-                    RenditionFormat::Jxl,
-                    staging_dir.join(format!("w{width}.jxl")),
-                    format!("w{width}.jxl"),
-                ),
-                (
-                    RenditionFormat::Avif,
-                    staging_dir.join(format!("w{width}.avif")),
-                    format!("w{width}.avif"),
-                ),
-                (
-                    RenditionFormat::Webp,
-                    staging_dir.join(format!("w{width}.webp")),
-                    format!("w{width}.webp"),
-                ),
-                (
-                    fallback,
-                    staging_dir.join(format!("w{width}.{}", fallback.extension())),
-                    format!("w{width}.{}", fallback.extension()),
-                ),
-            ];
-
-            let mut args = vec![
-                input.clone(),
-                "-auto-orient".to_owned(),
-                // Convert to sRGB before anything is stripped. A photo from a
-                // phone is usually Display P3, and `-strip` below drops the
-                // profile that says so: without converting first, the P3
-                // values would be relabelled as sRGB and the rendition would
-                // look washed out. ImageMagick already calls such a photo
-                // sRGB, so `-colorspace` alone does nothing to it; only
-                // `-profile` converts through the embedded profile. An
-                // untagged source is only labelled, its pixels untouched, and
-                // `-colorspace` still turns untagged CMYK into RGB.
-                "-profile".to_owned(),
-                format!("ICC:{}", self.srgb_profile.display()),
-                "-colorspace".to_owned(),
-                "sRGB".to_owned(),
-                "-resize".to_owned(),
-                format!("{width}x>"),
-                "-strip".to_owned(),
-                "-quality".to_owned(),
-                "80".to_owned(),
-                "-define".to_owned(),
-                "webp:method=4".to_owned(),
-                "-write".to_owned(),
-                format!("WEBP:{}", outputs[2].1.display()),
-                "-quality".to_owned(),
-                "55".to_owned(),
-                "-define".to_owned(),
-                "heic:speed=8".to_owned(),
-                "-write".to_owned(),
-                format!("AVIF:{}", outputs[1].1.display()),
-                "-define".to_owned(),
-                "jxl:effort=3".to_owned(),
-                "-define".to_owned(),
-                "jxl:distance=1.5".to_owned(),
-                "-write".to_owned(),
-                format!("JXL:{}", outputs[0].1.display()),
-            ];
-
-            match fallback {
-                RenditionFormat::Jpeg => {
-                    args.extend([
-                        "-quality".to_owned(),
-                        "85".to_owned(),
-                        "-write".to_owned(),
-                        format!("JPEG:{}", outputs[3].1.display()),
-                    ]);
-                }
-                RenditionFormat::Png => {
-                    args.extend([
-                        "-define".to_owned(),
-                        "png:compression-level=8".to_owned(),
-                        "-write".to_owned(),
-                        format!("PNG:{}", outputs[3].1.display()),
-                    ]);
-                }
-                _ => unreachable!("fallback format is JPEG or PNG"),
-            }
-            args.push("null:".to_owned());
+            let mut outputs = Self::output_paths(staging_dir, width, fallback);
+            let args = self.rendition_args(&input, width, &outputs);
 
             self.run(args, staging_dir).await?;
 
@@ -505,8 +551,13 @@ fn has_delegate(configure: &str, wanted: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_delegate, parse_dimensions, read_write_formats, validate_signature};
-    use crate::model::SourceFormat;
+    use super::{
+        ImageProcessor, SRGB_PROFILE, has_delegate, parse_dimensions, read_write_formats,
+        validate_signature,
+    };
+    use crate::model::{RenditionFormat, SourceFormat};
+    use std::path::Path;
+    use std::time::Duration;
 
     /// The listing a build without loadable modules prints.
     const STATIC_BUILD_LISTING: &str = "   Format  Mode  Description\n\
@@ -669,5 +720,230 @@ mod tests {
                 "{format:?}"
             );
         }
+    }
+
+    /// The image the fidelity test converts.
+    ///
+    /// A synthetic photograph — smooth gradients, a soft-edged shape, a dark
+    /// band and a patch of fine texture — committed rather than generated, so
+    /// that the numbers stay comparable between runs and between machines.
+    /// It is a JPEG, like most of what a camera produces, so the test also
+    /// covers the conventional fallback rather than the lossless one.
+    const REFERENCE_IMAGE: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/reference.jpg");
+
+    /// The width the fidelity test converts at. One is enough: the encoders
+    /// behave the same way at every size, and a second width would only double
+    /// the time the test takes.
+    const FIDELITY_WIDTH: u32 = 320;
+
+    /// How close a rendition has to stay to the source, per format.
+    ///
+    /// These are floors, not exact values, so an encoder that legitimately
+    /// does better does not break the build. They are calibrated against the
+    /// ImageMagick the development shell pins, which measures about 39.7 dB
+    /// for JPEG XL, 39.6 for AVIF, 40.2 for WebP and 40.9 for the JPEG
+    /// fallback on the fixture below, and every floor sits a decibel or two
+    /// under that. A floor is a floor: a build whose encoders measure lower
+    /// than this has genuinely got worse, and the number to raise is here.
+    const FIDELITY_FLOORS: &[(&str, f64)] = &[
+        ("jxl", 38.0),
+        ("avif", 36.0),
+        ("webp", 37.0),
+        ("jpeg", 37.0),
+    ];
+
+    /// A rendition has to be a faithful copy of the source.
+    ///
+    /// Every other test in this file checks that a rendition *exists*, that it
+    /// has the right width, that it has the right signature. None of them
+    /// notice that the encoder settings changed and the pictures quietly got
+    /// worse: a flag that costs seven decibels passes every other check in the
+    /// suite. This one measures the distance between the rendition and the
+    /// image the encoder was given, and refuses to let it grow.
+    #[tokio::test]
+    async fn renditions_stay_close_to_the_source() {
+        require_image_magick();
+
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().join("sRGB.icc");
+        std::fs::write(&profile, SRGB_PROFILE).unwrap();
+        let processor = ImageProcessor::new(
+            "magick".to_owned(),
+            profile,
+            40_000_000,
+            12_000,
+            Duration::from_secs(45),
+        );
+
+        let source = directory.path().join("source.jpg");
+        std::fs::copy(REFERENCE_IMAGE, &source).unwrap();
+
+        let dimensions = processor
+            .inspect(&source, SourceFormat::Jpeg, directory.path())
+            .await
+            .expect("the reference image should be readable");
+        let renditions = processor
+            .generate(
+                &source,
+                SourceFormat::Jpeg,
+                dimensions,
+                &[FIDELITY_WIDTH],
+                directory.path(),
+            )
+            .await
+            .expect("the reference image should convert");
+
+        // A JPEG source gets the conventional JPEG fallback as well as the
+        // three modern formats.
+        assert_eq!(renditions.len(), 4, "every format should be written");
+
+        for rendition in &renditions {
+            let key = rendition.format.key();
+            let floor = FIDELITY_FLOORS
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, floor)| *floor)
+                .unwrap_or_else(|| panic!("no fidelity floor for {key}"));
+
+            // What the rendition would be if the encoder lost nothing: the
+            // same image, resized the same way, written losslessly. It is
+            // written with `-write` rather than as a second bare file name,
+            // because a file name after the input is another *input* to
+            // ImageMagick, not the output.
+            let reference = directory.path().join(format!("reference-{key}.png"));
+            let mut args =
+                processor.base_args(&format!("JPEG:{}", source.display()), rendition.width);
+            args.push("-write".to_owned());
+            args.push(format!("PNG:{}", reference.display()));
+            args.push("null:".to_owned());
+            processor
+                .run(args, directory.path())
+                .await
+                .expect("the reference should render");
+
+            let expected = decode_to_rgb(
+                &processor,
+                &format!("PNG:{}", reference.display()),
+                directory.path(),
+            )
+            .await;
+            let actual = decode_to_rgb(
+                &processor,
+                &format!(
+                    "{}:{}",
+                    rendition.format.magick_name(),
+                    directory.path().join(&rendition.file_name).display()
+                ),
+                directory.path(),
+            )
+            .await;
+
+            let measured = peak_signal_to_noise_ratio(&expected, &actual);
+            assert!(
+                measured >= floor,
+                "the {key} rendition is {measured:.2} dB from the source, \
+                 below the {floor:.1} dB floor"
+            );
+        }
+    }
+
+    /// The raw 8-bit RGB pixels of an image, so two of them can be compared.
+    async fn decode_to_rgb(processor: &ImageProcessor, input: &str, staging: &Path) -> Vec<u8> {
+        processor
+            .run(
+                [
+                    input.to_owned(),
+                    "-depth".to_owned(),
+                    "8".to_owned(),
+                    "rgb:-".to_owned(),
+                ],
+                staging,
+            )
+            .await
+            .expect("ImageMagick should decode the image it wrote")
+            .stdout
+    }
+
+    /// The peak signal-to-noise ratio of two images, in decibels.
+    ///
+    /// The peak is 255, because the images are compared as 8-bit RGB, which
+    /// is what every format Atlas writes carries.
+    fn peak_signal_to_noise_ratio(expected: &[u8], actual: &[u8]) -> f64 {
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "the two images are not the same size"
+        );
+        let mut squared = 0f64;
+        for (left, right) in expected.iter().zip(actual) {
+            let difference = f64::from(*left) - f64::from(*right);
+            squared += difference * difference;
+        }
+        if squared == 0.0 {
+            return f64::INFINITY;
+        }
+        let mean = squared / expected.len() as f64;
+        10.0 * (255.0f64 * 255.0 / mean).log10()
+    }
+
+    /// The JPEG XL rendition is written before any quality or distance is set.
+    ///
+    /// A quality setting applies to every write after it, and ImageMagick's
+    /// JPEG XL coder turns one into a libjxl *distance* rather than a
+    /// quality. So a quality left in force by an earlier write decides how
+    /// lossy the JPEG XL rendition is, without anything in the response
+    /// saying so. The fidelity test above cannot see this on its own: the
+    /// distance a stray quality produces is worth about a decibel and a half,
+    /// which is inside the margin a floor has to leave for an encoder that
+    /// legitimately improves. This test sees the flag itself.
+    #[test]
+    fn the_jpeg_xl_write_carries_no_quality() {
+        let processor = ImageProcessor::new(
+            "magick".to_owned(),
+            std::path::PathBuf::from("/tmp/sRGB.icc"),
+            40_000_000,
+            12_000,
+            Duration::from_secs(45),
+        );
+        let outputs =
+            ImageProcessor::output_paths(std::path::Path::new("/tmp"), 320, RenditionFormat::Jpeg);
+        let args = processor.rendition_args("JPEG:/tmp/source.jpg", 320, &outputs);
+
+        let jxl = args
+            .iter()
+            .position(|argument| argument.starts_with("JXL:"))
+            .expect("the JPEG XL rendition is written");
+        assert!(
+            !args[..jxl].iter().any(|argument| argument == "-quality"),
+            "a quality is in force when the JPEG XL rendition is written, \
+             and ImageMagick turns it into a libjxl distance: {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|argument| argument.starts_with("jxl:distance=")),
+            "JPEG XL should use libjxl's own distance, not an unverified define: {args:?}"
+        );
+    }
+
+    /// The fidelity test runs the real ImageMagick, so it needs the real
+    /// ImageMagick.
+    ///
+    /// The development shell refuses to open without the codecs this needs,
+    /// so a missing binary means the environment is broken rather than that
+    /// the test has nothing to say. Failing says so out loud: a test that
+    /// quietly passes without running is worse than no test at all.
+    fn require_image_magick() {
+        let available = std::process::Command::new("magick")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(
+            available,
+            "ImageMagick is required for the fidelity test; run the tests inside `nix develop`"
+        );
     }
 }

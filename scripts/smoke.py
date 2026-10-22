@@ -38,6 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from email.message import Message
 from pathlib import Path
 from typing import Any, Final, Self
 
@@ -101,6 +102,13 @@ class Server:
             ATLAS_API_TOKEN=self.token,
             ATLAS_DATA_DIR=str(self.data_dir),
             ATLAS_LISTEN_ADDR=f"127.0.0.1:{self.port}",
+            # Atlas reads a local `.env` for what the environment does not
+            # provide, and a developer's own file in the repository says
+            # something else — different widths, a different token, a
+            # different port. The checks below are about the defaults, so
+            # the file is pointed at a path that does not exist rather than
+            # at whatever happens to be in the working directory.
+            ATLAS_ENV_FILE=str(self.data_dir / "no-such.env"),
         )
         handle = self.log.open("wb")
         try:
@@ -533,12 +541,38 @@ def check_api(checks: Checks) -> None:
     summary = checks.request("GET", "/api/v1/summary")[1]
     checks.ok("summary images", summary["images"]["count"], 1)
     checks.ok("summary documents", summary["documents"]["count"], 2)
+    # The widths the instance generates are reported, so a consumer can check
+    # its assets against the configuration in one request.
+    checks.ok(
+        "summary reports the widths", summary["rendition_widths"], [320, 640, 960, 1280]
+    )
     srcset = checks.request("GET", f"/api/v1/images/{image_id}/srcset")[1]
     checks.ok("srcset candidates", len(srcset["srcset"].split(", ")), 4)
     checks.true("srcset width descriptors", " 320w" in srcset["srcset"])
     checks.ok(
         "srcset on a document",
         checks.request("GET", f"/api/v1/images/{document_id}/srcset")[0],
+        404,
+    )
+
+    print("\n== generating the renditions an asset is missing ==", flush=True)
+    # A deployment that configures the wrong widths leaves every asset unable
+    # to answer the widths its site needs, and nothing about that is
+    # recoverable from the outside. The operation is a change, so it needs the
+    # token.
+    checks.ok(
+        "needs the token",
+        checks.request("POST", f"/api/v1/images/{image_id}/renditions", token=None)[0],
+        401,
+    )
+    status, refreshed = checks.request("POST", f"/api/v1/images/{image_id}/renditions")
+    checks.ok("renditions generated", status, 200)
+    checks.ok("  the same asset", refreshed["id"], image_id)
+    checks.ok("  the configured widths", refreshed["widths"], [320, 640, 960, 1280])
+    checks.ok("  nothing was missing", refreshed["added"], [])
+    checks.ok(
+        "  a document has no renditions",
+        checks.request("POST", f"/api/v1/images/{document_id}/renditions")[0],
         404,
     )
 
@@ -742,6 +776,54 @@ def check_api(checks: Checks) -> None:
     checks.ok(
         "traversal is refused",
         checks.request("GET", "/media/../../etc/passwd", token=None)[0],
+        404,
+    )
+
+    print("\n== a caller can name the rendition format ==", flush=True)
+    # The `Accept` header is for a browser that cannot choose for itself. A
+    # crawler fetching an image for a marketplace needs a format the
+    # marketplace accepts, and that list does not always include the newest
+    # one Atlas has.
+
+    def rendition(path: str, accept: str | None = None) -> tuple[int, str, Message]:
+        """A public read, with the response headers the checks need."""
+        headers = {"Accept": accept} if accept else {}
+        request = urllib.request.Request(checks.base_url + path, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return (
+                    response.status,
+                    response.headers.get("Content-Type", ""),
+                    response.headers,
+                )
+        except urllib.error.HTTPError as error:
+            return (
+                error.code,
+                error.headers.get("Content-Type", ""),
+                error.headers,
+            )
+
+    status, content_type, headers = rendition(
+        f"/media/{image_id}/w320?format=webp", "image/avif,image/webp,image/*;q=0.8"
+    )
+    checks.ok("a named format is served", status, 200)
+    checks.ok("  in that format", content_type, "image/webp")
+    checks.true("  and does not vary by Accept", "Vary" not in headers)
+
+    status, content_type, headers = rendition(
+        f"/media/{image_id}/w320", "image/avif,image/webp,image/*;q=0.8"
+    )
+    checks.ok("without it the negotiation stands", content_type, "image/avif")
+    checks.true("  and varies by Accept", headers.get("Vary") == "Accept")
+
+    checks.ok(
+        "an unknown format is refused",
+        checks.request("GET", f"/media/{image_id}/w320?format=tiff", token=None)[0],
+        400,
+    )
+    checks.ok(
+        "a format the asset does not have is a 404",
+        checks.request("GET", f"/media/{image_id}/w320?format=jpeg", token=None)[0],
         404,
     )
 

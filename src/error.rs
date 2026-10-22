@@ -75,6 +75,34 @@ impl ApiError {
         )
     }
 
+    /// The asset has a rendition at that width, but not in the format the
+    /// caller asked for.
+    ///
+    /// A `404` rather than a fallback to the negotiation: the caller named a
+    /// format, and answering with a different one would hand a marketplace a
+    /// picture it cannot use, in a response that says it succeeded.
+    pub fn format_not_found(
+        format: crate::model::RenditionFormat,
+        available: &[&crate::model::RenditionRecord],
+    ) -> Self {
+        let mut formats: Vec<&str> = available
+            .iter()
+            .map(|rendition| rendition.format.key())
+            .collect();
+        formats.sort_unstable();
+        formats.dedup();
+        let detail = if formats.is_empty() {
+            format!("The asset has no rendition in the {} format.", format.key())
+        } else {
+            format!(
+                "The asset has no rendition in the {} format at this width; it has {}.",
+                format.key(),
+                formats.join(", ")
+            )
+        };
+        Self::new(StatusCode::NOT_FOUND, "rendition_format_not_found", detail)
+    }
+
     pub fn conflict(code: &'static str, detail: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, code, detail)
     }

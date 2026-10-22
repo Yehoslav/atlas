@@ -107,6 +107,32 @@ Placed at `examples/family-album/`.
 
 ## Open threads
 
+### For the first real consumer
+
+- [x] **Name a rendition format in its public URL.** A crawler fetching an
+      image for a marketplace cannot use `Accept` to choose a format, because
+      the crawler's header describes what the crawler can fetch, not what the
+      marketplace accepts. `/media/{id}/w800?format=webp` selects an already
+      generated representation, overrides `Accept`, and omits `Vary: Accept`.
+      Unknown formats are `400`; formats the asset does not have are `404`.
+- [x] **Keep JPEG XL faithful to its source.** ImageMagick's JXL coder turns
+      `-quality` into a libjxl distance, where higher means more loss. The
+      quality needed by AVIF leaked into the JXL write and degraded product
+      photos. Write JXL before setting any quality, and test a per-format PSNR
+      floor against a checked-in reference image so a future encoder change
+      cannot silently degrade every rendition.
+- [x] **Make rendition configuration discoverable and repairable.** Report
+      configured widths in the summary, make `srcset` default to those widths,
+      and add an authenticated operation that adds missing rendition profiles
+      without changing the asset ID or replacing bytes behind an existing URL.
+      Profiles that resolve to the same actual width share the stored file;
+      the additional profile rows point at it rather than re-encoding over it.
+- [x] **Ship a deployment path.** Include a systemd unit, an ImageMagick
+      container image, and a deployment runbook covering the environment file,
+      persistent storage, proxy, health check and upgrade order. Build the
+      image in CI and publish tagged images to GHCR; a one-core, one-gigabyte
+      service host should pull an image rather than compile the Rust tree.
+
 ### Needs a real file, not a test
 
 - [x] **Verify wide-gamut renditions.** The flag only tagged. ImageMagick
