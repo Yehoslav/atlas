@@ -103,6 +103,21 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "rendition_format_not_found", detail)
     }
 
+    /// The URL names a generation the asset never had.
+    ///
+    /// Not a fallback to the current one: a generation URL promises fixed
+    /// bytes, and serving others under it would break that promise for the
+    /// one cache that asked.
+    pub fn generation_not_found(requested: u32, current: u32) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "generation_not_found",
+            format!(
+                "The asset has no rendition generation {requested}; its current generation is {current}."
+            ),
+        )
+    }
+
     pub fn conflict(code: &'static str, detail: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, code, detail)
     }

@@ -335,6 +335,10 @@ pub struct AssetRecord {
     /// and never looks inside; see the migration for why the column is named
     /// more plainly than the API field.
     pub consumer_data: Option<String>,
+    /// Which encoding of the original the renditions are. Starts at 1 and
+    /// grows by one with every re-encode; a rendition URL names it, so the
+    /// bytes behind a URL that was handed out never change.
+    pub generation: u32,
 }
 
 impl AssetRecord {

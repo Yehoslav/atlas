@@ -98,8 +98,10 @@ end.
 - **Content-addressed originals.** Identical bytes are the same asset. An upload
   whose original matches a live asset returns that asset, costs a hash rather
   than a conversion, and makes a retry after a timeout idempotent.
-- **Immutable public URLs.** Replacing bytes means uploading a new asset id, so
-  a URL that is in a page cannot change meaning underneath it.
+- **Immutable public URLs.** Replacing an original means uploading a new asset
+  id, so a URL that is in a page cannot change meaning underneath it. A
+  rendition URL names the *generation* it was handed out for, and re-encoding
+  an asset writes a new generation beside the old one rather than over it.
 - **Deletion is a lifecycle.** Bytes move to a trash directory, are purged after
   a retention window, and leave a tombstone. A consumer can pin an asset it
   still uses, and that pin is the only hint Atlas ever gets about consumer
@@ -173,7 +175,8 @@ as an attachment instead of being re-encoded into a picture.
   could never hold, are both `400 invalid_mime`; `GET /api/v1/formats` says
   which types are on offer.
 - `GET /api/v1/{kind}/{id}` — authenticated metadata lookup, including the
-  asset's `kind`, `state` (`active`, `deleted`, or `purged`), and `pinned` flag.
+  asset's `kind`, `state` (`active`, `deleted`, or `purged`), `pinned` flag,
+  and the rendition `generation` its URLs name.
 - `POST /api/v1/{kind}/actions` — authenticated bulk action for ids the caller
   already has, such as `pin`, `unpin`, `delete`, or `restore`. Body
   `{"action": "pin", "ids": ["…"]}`, max 500 ids. Validation is all-or-nothing:
@@ -216,7 +219,11 @@ as an attachment instead of being re-encoded into a picture.
 - `GET /media/{id}/original` — public original delivery.
 - `GET /media/{id}/w{width}` — public width rendition. Atlas selects a
   pre-generated JXL, AVIF, WebP, or JPEG/PNG fallback using `Accept` and returns
-  `Vary: Accept`. The optional `format` parameter names the representation
+  `Vary: Accept`. The optional `g` parameter names the generation, and the URLs
+  the API hands out always carry it: `?g=2` is immutable and cached for a
+  year, while the bare URL serves the current generation and is cached for an
+  hour. An unknown generation is a `404 generation_not_found`; a `g` that is
+  not a positive integer is a `400 invalid_generation`. The optional `format` parameter names the representation
   instead: `?format=webp` serves the WebP whatever the `Accept` header says,
   and the response carries no `Vary: Accept`, because the URL already says
   which representation it is. An unknown format name is a `400
@@ -228,7 +235,8 @@ as an attachment instead of being re-encoded into a picture.
   candidates. Without a `widths` parameter it describes the instance's
   configured widths, so it is the answer a consumer gets without knowing the
   configuration. Errors on an unknown asset (`404`), a non-image, or a width
-  Atlas does not have.
+  Atlas does not have. Its URLs name the current generation, which the
+  response also reports as `generation`.
 - `POST /api/v1/images/{id}/renditions` — authenticated generation of the
   renditions an asset is missing. The widths an asset has are fixed when it is
   uploaded, so a deployment that configures the wrong widths leaves assets
@@ -242,6 +250,22 @@ as an attachment instead of being re-encoded into a picture.
   renditions as they are now. It never replaces a rendition that is already
   there: a public URL that changes its bytes is a lie to every cache that
   holds it.
+
+  With the body `{"re_encode": true}` it instead re-encodes every rendition
+  from the original as a new generation: every profile the asset has, plus
+  any configured width it lacks. The old generation's files stay, so every
+  URL that names it keeps its bytes; the asset id does not change; and the
+  answer carries the new `generation`, the renditions and the `srcset`, so a
+  consumer that stores a srcset learns the new URLs in the same call. This is
+  the way out of an encoding that turned out to be bad. A trashed image is a
+  `409`, and an unknown option in the body is a `400`.
+- `POST /api/v1/images/re-render` — authenticated re-encode of every live
+  image, one at a time and each under the conversion slot, a page per call.
+  Body `{"limit": 10, "after": "…"}`, both optional (`limit` max 100). The
+  answer has the `count` re-encoded, the `re_encoded` ids with their new
+  generation, the `failures`, how many images are `remaining`, and `next`, the
+  `after` for the following page, `null` once the walk is done. Trashed images
+  are skipped; re-encode one after restoring it.
 
 Uploads are content-addressed within their collection. If the exact bytes are
 already live there, nothing is written or converted and the response is `200`
@@ -278,7 +302,7 @@ real output width — while keeping the URL pointed at the profile:
 
 ```html
 <!-- A 500-pixel photo stored under profiles 320, 640, 960 and 1280 -->
-<img src="/media/4f2k9xq7m1b8w3z0pd/w960" srcset="/media/4f2k9xq7m1b8w3z0pd/w320 320w, /media/4f2k9xq7m1b8w3z0pd/w640 500w" sizes="640px" alt="…">
+<img src="/media/4f2k9xq7m1b8w3z0pd/w960?g=1" srcset="/media/4f2k9xq7m1b8w3z0pd/w320?g=1 320w, /media/4f2k9xq7m1b8w3z0pd/w640?g=1 500w" sizes="640px" alt="…">
 ```
 
 Asking for something narrower than anything stored is a `404` with
@@ -320,6 +344,42 @@ among them. A format the asset does not have at that width is a `404`, not a
 fallback to the negotiation — a caller that names a format and gets a
 different one has been handed a picture it cannot use, in a response that
 says it succeeded.
+
+### Generations
+
+A rendition's bytes are fixed when they are written, and an encoding that
+turns out to be bad would otherwise be permanent. So the renditions carry a
+**generation**, which starts at 1, and the URLs the API hands out name it:
+`/media/{id}/w800?g=2`. Re-encoding an asset writes generation 3 beside it,
+from the original, and moves the asset to it.
+
+The promise is that a URL the API hands out is immutable: `?g=2` serves the
+same bytes for as long as the asset lives, and is cached for a year. The one
+generation URL that is not is a profile the current generation does not have
+yet, which falls back to a narrower rendition until the profile is added; the
+API never hands such a URL out, and it is served with the one-hour policy.
+The bare `/media/{id}/w800` serves whichever generation is current and is
+cached for an hour, so a page that still uses it picks up a re-encode soon
+after it happens. The asset id never changes; a consumer that stores a srcset
+refreshes it from the re-encode's answer or from
+`GET /api/v1/images/{id}/srcset`.
+
+```sh
+curl -X POST -H "Authorization: Bearer $ATLAS_API_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"re_encode": true}' \
+  http://127.0.0.1:3000/api/v1/images/4f2k9xq7m1b8w3z0pd/renditions
+```
+
+After an encoder change — a newer ImageMagick, a corrected flag — every image
+needs it. `POST /api/v1/images/re-render` walks the live images a page per
+call; pass `next` back as `after` until it is `null`.
+
+A re-encode is not free and not idempotent. Every one writes a new copy of
+the asset's renditions and keeps every older copy until the asset is purged,
+so the disk an image's renditions take grows by one copy per re-encode, and
+the consumer's stored srcsets change each time. A page retried from the same
+`after` re-encodes the images it already did; keep pages small and resume from
+the last `next` that came back.
 
 ## Asset IDs
 
@@ -937,7 +997,8 @@ assumes success is a backup that does not exist, so verify each snapshot:
 ```sh
 sqlite3 /backup/atlas-20260101T000000Z.sqlite3 'PRAGMA integrity_check;'
 sqlite3 /backup/atlas-20260101T000000Z.sqlite3 \
-  'SELECT COUNT(*) FROM assets; SELECT COUNT(*) FROM renditions;'
+  'SELECT COUNT(*) FROM assets; SELECT COUNT(*) FROM renditions;
+   SELECT COUNT(*) FROM superseded_renditions;'
 ```
 
 `PRAGMA quick_check` is enough to catch a truncated file; `integrity_check` is

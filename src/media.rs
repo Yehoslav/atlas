@@ -550,12 +550,12 @@ fn has_delegate(configure: &str, wanted: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         ImageProcessor, SRGB_PROFILE, has_delegate, parse_dimensions, read_write_formats,
         validate_signature,
     };
-    use crate::model::{RenditionFormat, SourceFormat};
+    use crate::model::{RenditionFormat, RenditionRecord, SourceFormat};
     use std::path::Path;
     use std::time::Duration;
 
@@ -729,13 +729,13 @@ mod tests {
     /// that the numbers stay comparable between runs and between machines.
     /// It is a JPEG, like most of what a camera produces, so the test also
     /// covers the conventional fallback rather than the lossless one.
-    const REFERENCE_IMAGE: &str =
+    pub(crate) const REFERENCE_IMAGE: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/reference.jpg");
 
     /// The width the fidelity test converts at. One is enough: the encoders
     /// behave the same way at every size, and a second width would only double
     /// the time the test takes.
-    const FIDELITY_WIDTH: u32 = 320;
+    pub(crate) const FIDELITY_WIDTH: u32 = 320;
 
     /// How close a rendition has to stay to the source, per format.
     ///
@@ -797,8 +797,31 @@ mod tests {
         // A JPEG source gets the conventional JPEG fallback as well as the
         // three modern formats.
         assert_eq!(renditions.len(), 4, "every format should be written");
+        assert_renditions_are_faithful(
+            &processor,
+            &source,
+            &renditions,
+            directory.path(),
+            directory.path(),
+        )
+        .await;
+    }
 
-        for rendition in &renditions {
+    /// Hold every rendition of the reference image to its format's floor.
+    ///
+    /// Shared with the re-encode path, which has to meet the same floors as
+    /// the upload: a re-encode exists to correct an encoding, and one that
+    /// quietly made the pictures worse would be the bug it was meant to fix.
+    /// The renditions are read from `rendition_dir`; the lossless references
+    /// they are measured against are written to `scratch`.
+    pub(crate) async fn assert_renditions_are_faithful(
+        processor: &ImageProcessor,
+        source: &Path,
+        renditions: &[RenditionRecord],
+        rendition_dir: &Path,
+        scratch: &Path,
+    ) {
+        for rendition in renditions {
             let key = rendition.format.key();
             let floor = FIDELITY_FLOORS
                 .iter()
@@ -811,31 +834,27 @@ mod tests {
             // written with `-write` rather than as a second bare file name,
             // because a file name after the input is another *input* to
             // ImageMagick, not the output.
-            let reference = directory.path().join(format!("reference-{key}.png"));
+            let reference = scratch.join(format!("reference-{key}.png"));
             let mut args =
                 processor.base_args(&format!("JPEG:{}", source.display()), rendition.width);
             args.push("-write".to_owned());
             args.push(format!("PNG:{}", reference.display()));
             args.push("null:".to_owned());
             processor
-                .run(args, directory.path())
+                .run(args, scratch)
                 .await
                 .expect("the reference should render");
 
-            let expected = decode_to_rgb(
-                &processor,
-                &format!("PNG:{}", reference.display()),
-                directory.path(),
-            )
-            .await;
+            let expected =
+                decode_to_rgb(processor, &format!("PNG:{}", reference.display()), scratch).await;
             let actual = decode_to_rgb(
-                &processor,
+                processor,
                 &format!(
                     "{}:{}",
                     rendition.format.magick_name(),
-                    directory.path().join(&rendition.file_name).display()
+                    rendition_dir.join(&rendition.file_name).display()
                 ),
-                directory.path(),
+                scratch,
             )
             .await;
 
