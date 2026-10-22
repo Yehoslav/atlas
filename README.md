@@ -117,7 +117,9 @@ end.
 | `examples/cms-admin/` | A Rust consumer with no database at all: the same API seen from an operator's side. |
 | `scripts/smoke.py` | End-to-end checks against the real binary and the real examples. |
 | `assets/` | The placeholder served for retired assets, and the sRGB profile every rendition is converted to. |
-| `tests/fixtures/` | A Display P3 profile, for the test that renditions convert colours rather than relabel them. |
+| `tests/fixtures/` | A Display P3 profile, for the test that renditions convert colours rather than relabel them, and the reference photograph the fidelity test measures against. |
+| `contrib/` | A systemd unit and an example environment file for a host install. |
+| `Dockerfile` | The container image: the service and an ImageMagick with the codecs. |
 | `PLAN.md` | The design record: the decisions, and the reasoning behind them. |
 | `TODO.md` | What is open, and what has already been settled. |
 
@@ -178,7 +180,12 @@ as an attachment instead of being re-encoded into a picture.
   one unknown id, a duplicate, or an action the current state does not allow
   rejects the whole batch with `400` and changes nothing.
 - `GET /api/v1/summary` — authenticated counts and stored bytes for the whole
-  instance, including the trash. A cheap dashboard number, not a listing.
+  instance, including the trash, and the `rendition_widths` the instance
+  generates. A cheap dashboard number, not a listing. The widths are there
+  because the configuration is otherwise invisible: a consumer can only find
+  them out by listing every asset and reading the renditions of each one,
+  which is how a deployment with the wrong widths finds out that every one of
+  its assets is missing a width its site needs.
 - `GET /api/v1/formats` — authenticated list of what each collection accepts,
   the `mime` groups they answer to, and whether they get renditions. Derived
   from the same table the upload path validates against, so it cannot
@@ -209,12 +216,32 @@ as an attachment instead of being re-encoded into a picture.
 - `GET /media/{id}/original` — public original delivery.
 - `GET /media/{id}/w{width}` — public width rendition. Atlas selects a
   pre-generated JXL, AVIF, WebP, or JPEG/PNG fallback using `Accept` and returns
-  `Vary: Accept`.
+  `Vary: Accept`. The optional `format` parameter names the representation
+  instead: `?format=webp` serves the WebP whatever the `Accept` header says,
+  and the response carries no `Vary: Accept`, because the URL already says
+  which representation it is. An unknown format name is a `400
+  invalid_format`; a format the asset does not have at that width is a `404`.
 - `GET /api/v1/images/{id}/srcset` — authenticated ready-made `srcset` for one
-  image, one candidate per stored width. Each URL is the profile path and each
-  descriptor is the width that was really produced, so a photo narrower than
-  its largest profile is described honestly. Errors on an unknown asset
-  (`404`), a non-image, or a width Atlas does not have.
+  image, one candidate per distinct actual output width. Each URL is a profile
+  path and each descriptor is the width that was really produced, so a photo
+  narrower than its largest profile is described honestly without duplicate
+  candidates. Without a `widths` parameter it describes the instance's
+  configured widths, so it is the answer a consumer gets without knowing the
+  configuration. Errors on an unknown asset (`404`), a non-image, or a width
+  Atlas does not have.
+- `POST /api/v1/images/{id}/renditions` — authenticated generation of the
+  renditions an asset is missing. The widths an asset has are fixed when it is
+  uploaded, so a deployment that configures the wrong widths leaves assets
+  that can never gain the widths its site needs, and nothing about that is
+  recoverable from the outside: uploads are content-addressed, so the same
+  bytes return the same asset, and uploading again under a new id leaves every
+  reference a consumer holds pointing at a tombstone. This is the repair. The
+  original bytes do not change, so the asset id does not have to change
+  either, and a consumer's references keep working. It answers with the
+  widths the instance generates, the widths this call added, and the asset's
+  renditions as they are now. It never replaces a rendition that is already
+  there: a public URL that changes its bytes is a lie to every cache that
+  holds it.
 
 Uploads are content-addressed within their collection. If the exact bytes are
 already live there, nothing is written or converted and the response is `200`
@@ -225,10 +252,15 @@ twice.
 The default rendition widths are 320, 640, 960, and 1280 pixels. They preserve
 the original aspect ratio and are not upscaled. Configure a different fixed
 set with `ATLAS_VARIANT_WIDTHS=320,640,1280`; arbitrary sizes are not generated
-on public requests. Consuming sites can fetch `/api/v1/images/{id}/srcset` and
-set their own `sizes` value. Atlas does not index media *content* — it filters
-on filenames, media types and lifecycle state, and leaves meaning to the
-consumer — and it never converts or re-encodes on a read.
+on public requests. `GET /api/v1/summary` reports the widths the instance
+generates, so a consumer can check its assets against the configuration in one
+request. `POST /api/v1/images/{id}/renditions` generates the ones an asset is
+missing, which is how a deployment that configured the wrong widths repairs
+its assets without re-uploading them. Consuming sites can fetch
+`/api/v1/images/{id}/srcset` and set their own `sizes` value. Atlas does not
+index media *content* — it filters on filenames, media types and lifecycle
+state, and leaves meaning to the consumer — and it never converts or
+re-encodes on a read.
 
 ## How a rendition URL resolves
 
@@ -257,6 +289,37 @@ different from `asset_not_found`, which means Atlas has never heard of the ID:
 curl http://127.0.0.1:3000/media/4f2k9xq7m1b8w3z0pd/w64
 {"error":{"code":"rendition_not_found","message":"The asset has no rendition at or below 64 pixels; stored widths are 320, 640, 960, 1280."}}
 ```
+
+### Asking for a format by name
+
+The width says how wide; the format says which representation. By default the
+format is negotiated from the `Accept` header, which is right for a browser
+and wrong for a crawler that has to fetch an image for a marketplace:
+Google's Merchant Center accepts JPEG, PNG, GIF, BMP, TIFF and WebP, and a
+modern Googlebot sends
+
+```
+Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8
+```
+
+so the negotiation answers AVIF — the one format the marketplace does not
+accept. The `format` parameter names the representation instead:
+
+```sh
+curl -o thumb.webp 'http://127.0.0.1:3000/media/4f2k9xq7m1b8w3z0pd/w800?format=webp'
+```
+
+The parameter wins over the header, and the header is not consulted at all. The
+response carries no `Vary: Accept`, because the URL already says which
+representation it is and one copy per URL is enough. The names are the ones
+Atlas uses in a response: `jxl`, `avif`, `webp`, `jpeg`, `png`.
+
+Nothing is created, upscaled or stored: every width already has a JXL, an
+AVIF, a WebP and a conventional fallback, and the parameter only chooses
+among them. A format the asset does not have at that width is a `404`, not a
+fallback to the negotiation — a caller that names a format and gets a
+different one has been handed a picture it cannot use, in a response that
+says it succeeded.
 
 ## Asset IDs
 
@@ -473,6 +536,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
+`cargo test` runs the real ImageMagick: one test converts
+`tests/fixtures/reference.jpg` and measures how far each rendition is from
+the source, in decibels, with a floor per format. A change to the encoder
+settings that quietly degrades every image the service has ever produced
+passes every other test in the suite — they check that a rendition exists,
+that it has the right width, that it has the right signature, and none of
+them can see that the picture got worse. Run the tests inside `nix develop`,
+where the ImageMagick is the one the floors were measured against.
+
 ### End-to-end check against a real binary
 
 The test suite drives the router in process, and the example's tests replace
@@ -616,16 +688,229 @@ Schema changes live in `migrations/` and run through `sqlx::migrate!`. See
 limits, the `ON DELETE CASCADE` hazard when rebuilding a table, and the
 additive-migration policy Atlas follows.
 
-## Production notes
+## Deploying Atlas
 
-Production targets ordinary Linux hosts, not specifically NixOS. Use a dedicated
-private persistent data directory with mode `0700`; Atlas rejects an existing
-non-empty data directory that is accessible by group/other users. Install
-SQLite runtime libraries and ImageMagick with the required codecs and LCMS. Check
-codec support with `magick -list format`, and LCMS on the `DELEGATES` line of
-`magick -list configure`. Run Atlas behind the site's HTTPS reverse
-proxy, routing `/media/` publicly and keeping the token-protected API on the
-server side. Proxy path matching must be case-preserving.
+Production targets ordinary Linux hosts, not specifically NixOS. Atlas is one
+process next to the site it serves, behind that site's reverse proxy, with a
+private directory of its own.
+
+There are two ways to deploy it: a systemd unit on a host, or a container
+image. Both need the same three things — the binary, an ImageMagick with the
+codecs, and a private data directory — and both put the token in a file
+rather than on a command line.
+
+### What a host needs
+
+- **The binary.** `cargo build --release` produces `target/release/atlas`. It
+  links SQLite statically, so there is no SQLite library to install.
+- **ImageMagick with the codecs.** Atlas reads and writes JPEG, PNG, WebP,
+  AVIF, JPEG XL and HEIC, and converts colour profiles through LCMS. It
+  refuses to start without them, which is the right refusal: a build without
+  them fails on somebody's first upload, or on a phone photograph, long
+  after the cause. Check a host before installing:
+
+  ```sh
+  bash scripts/check-magick-codecs.sh
+  ```
+
+  This is the check the development shell makes as it opens, and the one the
+  container image makes as it builds. It names the codec that is missing
+  instead of leaving it to be discovered later.
+
+  Getting those codecs is the awkward part of a host install, and it is worth
+  saying plainly: **Debian and Ubuntu do not ship an ImageMagick that can
+  write JPEG XL.** Debian bookworm's is 6.9.11 from 2021 with no JPEG XL
+  coder at all, and Debian trixie's 7.1.1 has AVIF and HEIC as read-only. A
+  host install therefore means either building ImageMagick from source with
+  `--with-jxl` and `--with-heic`, or taking the ImageMagick from Nixpkgs,
+  which is the same build the development environment and the container image
+  use. The container image is the easier of the two on a small host.
+- **A private data directory**, mode `0700`, owned by the service account.
+  Atlas refuses to start against a non-empty directory that group or other
+  users can reach.
+
+### The environment file
+
+The token is a secret and lives in a file, not in a unit file and not on a
+command line where it would show up in `ps`. `contrib/atlas.env.example` is a
+starting point:
+
+```sh
+useradd --system --user-group --home-dir /var/lib/atlas \
+    --no-create-home --shell /usr/sbin/nologin atlas
+install -d -o atlas -g atlas -m 0750 /etc/atlas
+install -o atlas -g atlas -m 0600 contrib/atlas.env.example /etc/atlas/atlas.env
+$EDITOR /etc/atlas/atlas.env
+```
+
+```ini
+ATLAS_API_TOKEN=the-long-random-string-openssl-rand-hex-32-gives
+ATLAS_LISTEN_ADDR=127.0.0.1:3000
+ATLAS_DATA_DIR=/var/lib/atlas
+ATLAS_VARIANT_WIDTHS=320,640,960,1280
+```
+
+The token authorises every write and every metadata read, and it never
+reaches a browser: the consuming application keeps it on its own server. The
+widths belong in this file *before the first upload* — an asset keeps the
+widths it was uploaded with, and
+`POST /api/v1/images/{id}/renditions` adds the ones that are missing, so a
+wrong setting is repairable but not free.
+
+The other settings are described under [Configuration](#configuration). A
+TOML file is the better place for the non-secret shape of a deployment; the
+environment file is the better place for the token.
+
+### The systemd unit
+
+`contrib/atlas.service` runs the service as its own account, in the
+foreground, with the environment file and the data directory handled:
+
+```sh
+install -m 0755 target/release/atlas /usr/local/bin/atlas
+install -m 0644 contrib/atlas.service /etc/systemd/system/atlas.service
+systemctl daemon-reload
+systemctl enable --now atlas
+```
+
+The unit's `StateDirectory=atlas` creates `/var/lib/atlas` as the service
+account owns it, with mode `0700`, before the first start. Nothing else has to
+create it and nothing else has to remember to make it private — which is the
+detail that is easy to get wrong and that Atlas refuses to start without.
+
+### The container image
+
+The `Dockerfile` builds the service and an ImageMagick that has the codecs.
+Build it where there are cores and memory — a CI runner, a laptop, anything
+bigger than the server it is going to run on.
+
+The repository's Actions workflow builds and smoke-tests the image on every
+change. After the PR that updates `Cargo.toml` is merged, tag that merged
+commit to publish it to GitHub Container Registry. Use the SemVer version
+from `Cargo.toml` verbatim, including its pre-release label; the workflow
+checks that the tag matches. For the current `0.1.0-alpha.1` crate version:
+
+```sh
+jj git fetch --remote origin
+jj tag set 0.1.0-alpha.1 -r master@origin
+jj git push --tag 0.1.0-alpha.1
+```
+
+The server pulls the versioned image rather than compiling the Rust tree:
+
+```sh
+docker pull ghcr.io/yehoslav/atlas:0.1.0-alpha.1
+```
+
+The floating `latest` image tag is updated only by stable SemVer tags; an
+alpha release never becomes `latest`.
+
+The first published GHCR package may be private by default. To let the server
+pull without credentials, open the package's **Package settings** on GitHub and
+change its visibility to public. Otherwise, configure a read-only GitHub
+token with `read:packages` and log in to `ghcr.io` on the server.
+
+Pull a *version*, never a floating tag: a floating tag changes the bytes under
+a running service, which is the same mistake as a mutable URL. A server with
+no registry to talk to can carry the image as a file instead:
+
+```sh
+docker save ghcr.io/yehoslav/atlas:0.1.0-alpha.1 | gzip > atlas-0.1.0-alpha.1.tar.gz
+# on the server
+gunzip -c atlas-0.1.0-alpha.1.tar.gz | docker load
+```
+
+Copy `contrib/atlas.container.env.example` to `/etc/atlas/atlas.container.env`,
+set the token, and make the file readable only by root. Run it with that file,
+the data directory on a volume, and the port published to the host's loopback:
+
+```sh
+sudo install -o root -g root -m 0600 contrib/atlas.container.env.example /etc/atlas/atlas.container.env
+sudoedit /etc/atlas/atlas.container.env
+
+sudo docker run --detach --name atlas \
+    --publish 127.0.0.1:3000:3000 \
+    --env-file /etc/atlas/atlas.container.env \
+    --volume atlas-data:/var/lib/atlas \
+    ghcr.io/yehoslav/atlas:0.1.0-alpha.1
+```
+
+Two details worth knowing. A **named volume** inherits its ownership from the
+image, so the service account can write to it; a **bind mount** takes the host
+directory's ownership instead, and the service account is uid 100 and gid 101,
+so the host directory has to be given to it (`chown 100:101`) or every upload
+fails with a permission error. And the port is published to the host's
+loopback on purpose: the media is meant to be public, but through the site's
+own proxy, not through a port the whole internet can reach.
+
+### The reverse proxy
+
+Atlas expects the site's HTTPS proxy in front of it. The proxy routes
+`/media/` publicly; the consuming application's backend calls the API on the
+host's loopback directly, so the API and token never reach the browser:
+
+```nginx
+location /media/ {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+}
+
+```
+
+Proxy path matching must be case-preserving: asset IDs are lowercase, and a
+proxy that folds case turns a valid ID into a `404`.
+
+### The health check
+
+`GET /healthz` answers `{"status":"ok"}` once the service is up. It is worth
+more than a liveness ping, because the service only starts serving after it
+has applied the schema migrations and run `PRAGMA integrity_check` and
+`PRAGMA foreign_key_check` — a database that fails either of those stops the
+service from starting at all, with the reason in the log. A `200` from
+`/healthz` therefore means the database is sound, not merely that a process
+answers.
+
+### Upgrading
+
+The schema migrations run at startup, so stop the old process before replacing
+the binary or image.
+
+For a container deployment, bump the version in `Cargo.toml`, push that exact
+SemVer tag (for example, `0.1.0-alpha.2`), then pull and
+replace the container. Removing the container does not remove its named data
+volume:
+
+```sh
+sudo docker pull ghcr.io/yehoslav/atlas:X.Y.Z-alpha.N
+sudo docker stop atlas
+sudo docker rm atlas
+sudo docker run --detach --name atlas \
+    --publish 127.0.0.1:3000:3000 \
+    --env-file /etc/atlas/atlas.container.env \
+    --volume atlas-data:/var/lib/atlas \
+    ghcr.io/yehoslav/atlas:X.Y.Z-alpha.N
+sudo docker logs atlas
+```
+
+For a systemd deployment:
+
+```sh
+systemctl stop atlas
+install -m 0755 target/release/atlas /usr/local/bin/atlas
+systemctl start atlas
+journalctl -u atlas
+```
+
+For either deployment, finish with `curl -s localhost:3000/healthz`, which
+should answer `{"status":"ok"}`.
+
+The migrations are additive and guarded, so the failure mode is that the
+service does not start and the log says why. A failed migration rolls back
+that migration; earlier successfully applied migrations remain recorded. The
+service refuses to serve rather than serving from a half-migrated database.
+Fix the cause in the log and start the new version again. Nothing else is
+needed around a successful upgrade: the files are unchanged, the URLs are
+unchanged, and the assets are the same assets.
 
 ## Backup and restore
 

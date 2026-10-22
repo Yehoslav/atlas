@@ -51,6 +51,44 @@ media files and media metadata only.
   stored rendition on read. Public rendition URLs negotiate among
   pre-generated representations from `Accept`; they do not perform image work
   on reads and send `Vary: Accept`.
+- The width says how wide, the format says which representation, and a caller
+  may name the format in the URL: `/media/{id}/w800?format=webp`. The
+  parameter wins over `Accept`, and the response then carries no `Vary:
+  Accept`, because the URL already says which representation it is. The
+  header is for a browser that cannot choose for itself; a crawler fetching an
+  image for a marketplace needs a format the marketplace accepts, and that
+  list does not always include the newest one Atlas has. Nothing is created,
+  upscaled or stored: the parameter chooses among the representations that
+  were already generated. A format the asset does not have is a `404` rather
+  than a fallback to the negotiation, because a caller that names a format
+  and gets a different one has been handed a picture it cannot use in a
+  response that says it succeeded.
+- The JPEG XL rendition is written before any quality setting is in force, so
+  libjxl chooses the distance. ImageMagick's JPEG XL coder does not take a
+  quality: it turns one into a libjxl *distance*, where a larger distance
+  means more loss, and libjxl's own default is a distance of 1.0. A quality
+  left over from an earlier write — the AVIF write needs one — therefore
+  decides the distance without saying so, and the rendition comes out smaller
+  and measurably worse. A `jxl:distance` define is not the answer either: it
+  is honoured by some builds and ignored by others, and a build that ignores
+  it lands further from the default than the default is. Omitting the quality
+  is the only instruction both builds obey.
+- The rendition widths are a property of the instance, and the instance's
+  configuration is supposed to be right before the first upload. It is
+  otherwise invisible, and a deployment that gets it wrong produces assets
+  that can never gain the widths its site needs: uploads are content-addressed,
+  so the same bytes return the same asset, and uploading again under a new id
+  leaves every reference a consumer holds pointing at a tombstone. So the
+  widths are reported (`GET /api/v1/summary`), the `srcset` endpoint defaults
+  to them rather than to a hardcoded list, and an authenticated operation
+  generates the ones an asset is missing.
+- That operation *adds* renditions and never replaces one. A public URL that
+  changes its bytes is a lie to every cache that holds it, and the pages that
+  reference it would keep the old copy for as long as their cache policy
+  says. The bytes behind a published URL are therefore fixed when it is
+  published, and a re-render that changed them would break the promise the
+  rest of the design rests on. What the operation repairs is the mistake this
+  exists for: a width the site needs that the asset does not have.
 - Renditions are converted to sRGB through the source's embedded ICC profile
   before metadata is stripped, so a Display P3 phone photo keeps its colours
   instead of being relabelled. The target is a compact sRGB profile embedded in
@@ -216,7 +254,8 @@ collections.
   original facts, available width renditions, and lifecycle state.
 - `POST /api/v1/{kind}/actions` — authenticated bulk `pin`, `unpin`, `delete`,
   or `restore` for up to 500 caller-supplied ids, validated all-or-nothing.
-- `GET /api/v1/summary` — authenticated counts and stored bytes, trash included.
+- `GET /api/v1/summary` — authenticated counts and stored bytes, trash included,
+  and the rendition widths the instance generates.
 - `GET /api/v1/formats` — authenticated accepted media types per collection,
   the `mime` groups they answer to, and whether renditions are generated.
   One media type per format in `formats`, every accepted spelling in
@@ -234,10 +273,16 @@ collections.
   both collections, paged with `limit` (default 200, max 500) and `offset`, with
   a `total`.
 - `GET /api/v1/images/{id}/srcset` — authenticated `srcset` for one image, one
-  candidate per stored width, described by the width actually produced.
+  candidate per distinct actual output width, described by the width actually
+  produced. Without a `widths` parameter it describes the instance's
+  configured widths.
+- `POST /api/v1/images/{id}/renditions` — authenticated generation of the
+  renditions an asset is missing, under the same asset id.
 - `GET /media/{id}/original` — public, unmodified original.
 - `GET /media/{id}/w{max_width}` — public rendition with format selected from
-  `Accept`; JXL, AVIF, WebP, then an acceptable JPEG/PNG fallback.
+  `Accept`; JXL, AVIF, WebP, then an acceptable JPEG/PNG fallback. A `format`
+  parameter names the representation instead, and then the header is not
+  consulted.
 
 Public files support `ETag`, conditional requests, single byte ranges, a
 one-year immutable cache policy, and `X-Content-Type-Options: nosniff`. PDFs are
@@ -313,6 +358,18 @@ do with media, and only a consumer with its own content database can answer.
   `flake.lock`.
 - Production: bind Atlas to loopback behind the site's HTTPS reverse proxy;
   expose `/media/` publicly and keep token-authenticated API calls server-side.
+- A deployment is a unit or an image, and both put the token in an environment
+  file rather than on a command line. The unit creates the data directory with
+  its owner and its mode, because Atlas refuses to start against a directory
+  other users can reach, and a unit that does not create it privately is a
+  unit that does not start.
+- The container image is built where there are cores and memory, and the
+  server pulls it. Building the Rust dependency tree and installing the
+  ImageMagick runtime on a one-core service host is unnecessary deployment
+  work; CI proves the image and publishes a versioned image for the server.
+- The image is built with the codecs Atlas needs, and the build says so: the
+  same codec check the development shell and the startup path make runs inside
+  it, so an image that cannot write JPEG XL cannot be produced.
 - Keep the SQLite database and media directory persistent and on local storage.
 - Snapshot the database with `VACUUM INTO`, never `cp` — WAL mode means a copied
   database file can be missing committed rows. Verify each snapshot, then copy
