@@ -303,6 +303,13 @@ pub fn app(state: AppState) -> Router {
         )
         // Images only: documents have no renditions, so there is no such route.
         .route("/api/v1/images/{id}/srcset", get(api::get_srcset))
+        // Images only, and authenticated: a rendition is made of the original
+        // bytes, so only someone who may change the asset may ask for more of
+        // them.
+        .route(
+            "/api/v1/images/{id}/renditions",
+            axum::routing::post(api::refresh_renditions),
+        )
         // Uniform reads: a caller naturally asks about a mixed set of ids, and
         // reading is harmless when the caller's classification is wrong.
         .route(

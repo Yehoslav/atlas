@@ -349,6 +349,45 @@ impl Store {
         Ok(InsertOutcome::Created)
     }
 
+    /// Add renditions to an asset that already exists.
+    ///
+    /// Used when an asset gains a width it did not have: the bytes are
+    /// written first and the rows follow, so a crash in between leaves files
+    /// nobody points at rather than rows whose files are not there.
+    ///
+    /// The rows are unique per `(asset_id, max_width, format)`, so a width
+    /// that is already recorded is refused rather than replaced. What a
+    /// public URL means does not change under a consumer that is holding it.
+    pub async fn insert_renditions(
+        &self,
+        asset_id: &AssetId,
+        renditions: &[RenditionRecord],
+    ) -> Result<(), StoreError> {
+        if renditions.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin().await?;
+        for rendition in renditions {
+            sqlx::query(
+                "INSERT INTO renditions
+                    (asset_id, max_width, width, height, format, bytes, sha256, file_name)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(asset_id.as_str())
+            .bind(i64::from(rendition.max_width))
+            .bind(i64::from(rendition.width))
+            .bind(i64::from(rendition.height))
+            .bind(rendition.format.key())
+            .bind(i64::try_from(rendition.bytes).unwrap_or(i64::MAX))
+            .bind(&rendition.sha256)
+            .bind(&rendition.file_name)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// SQLite extended result codes for a primary-key or unique constraint failure.
     fn is_unique_violation(error: &sqlx::Error) -> bool {
         match error {

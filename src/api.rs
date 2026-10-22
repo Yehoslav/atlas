@@ -1093,6 +1093,7 @@ pub(super) async fn summary(
         images,
         documents,
         total,
+        rendition_widths: state.config.variant_widths.clone(),
     }))
 }
 
@@ -1176,6 +1177,13 @@ pub(super) struct SummaryResponse {
     images: CollectionSummary,
     documents: CollectionSummary,
     total: CollectionSummary,
+    /// The widths this instance generates renditions at.
+    ///
+    /// The configuration is otherwise invisible: a consumer can only find out
+    /// by listing every asset and reading the renditions of each one, which
+    /// is how a deployment with the wrong widths finds out that every one of
+    /// its assets is missing a width its site needs.
+    rendition_widths: Vec<u32>,
 }
 
 /// Apply an action to many assets at once.
@@ -1314,34 +1322,71 @@ pub(super) async fn get_srcset(
     authorize(&state, &headers)?;
     let id = parse_id(&id)?;
     let asset = load_asset(&state, &id, Some(Kind::Image)).await?;
-    let widths = params.widths()?;
+    // Without a `widths` parameter the answer is the instance's own set of
+    // widths. The hardcoded default this used to carry was the *default
+    // configuration* leaking into the place where the *configuration*
+    // belongs: on an instance configured with any other set of widths, the
+    // default asked for renditions that do not exist, matched none of them,
+    // and answered with no srcset at all.
+    let use_configured_widths = params.widths.is_none();
+    let widths = params.widths(&state.config.variant_widths)?;
 
-    // One entry per width: each stored rendition has one row per *format*, and
-    // a srcset descriptor describes a width, not a representation.
-    let mut chosen: Vec<&RenditionRecord> = Vec::new();
+    // One entry per actual width: each stored rendition has one row per
+    // *format*, and a srcset descriptor describes a width, not a
+    // representation. When a configuration has changed, a requested profile
+    // can still resolve to an older, narrower one. That is a usable fallback,
+    // not an empty srcset, and repeated actual widths have only one useful
+    // descriptor.
+    let mut chosen: Vec<(u32, &RenditionRecord)> = Vec::new();
     for width in widths {
-        let Some(rendition) = asset
+        let exact = asset
             .renditions
             .iter()
             .find(|rendition| rendition.max_width == width)
-        else {
+            .or_else(|| {
+                if !use_configured_widths {
+                    return None;
+                }
+                let actual = asset
+                    .renditions
+                    .iter()
+                    .filter(|rendition| rendition.width <= width)
+                    .map(|rendition| rendition.width)
+                    .max()?;
+                asset
+                    .renditions
+                    .iter()
+                    .find(|rendition| rendition.width == actual)
+            });
+        let Some(rendition) = exact else {
             continue;
         };
-        chosen.push(rendition);
+        if let Some((requested, _)) = chosen
+            .iter_mut()
+            .find(|(_, present)| present.width == rendition.width)
+        {
+            // Keep the widest requested profile for this actual width. It
+            // resolves to the same stored bytes and makes `src` useful even
+            // when the configured profiles exceed what a small image can
+            // provide.
+            *requested = width;
+        } else {
+            chosen.push((width, rendition));
+        }
     }
-    chosen.sort_by_key(|rendition| rendition.max_width);
+    chosen.sort_by_key(|(requested, _)| *requested);
 
     // The fallback `src` is the widest width that was asked for and exists, or
     // the original when none of the requested widths were generated.
     let src = match chosen.last() {
-        Some(rendition) => format!("/media/{id}/w{}", rendition.max_width),
+        Some((requested, _)) => format!("/media/{id}/w{requested}"),
         None => format!("/media/{id}/original"),
     };
 
     let srcset = (!chosen.is_empty()).then(|| {
         chosen
             .iter()
-            .map(|rendition| format!("/media/{id}/w{} {}w", rendition.max_width, rendition.width))
+            .map(|(requested, rendition)| format!("/media/{id}/w{requested} {}w", rendition.width))
             .collect::<Vec<_>>()
             .join(", ")
     });
@@ -1355,8 +1400,15 @@ pub(super) struct SrcsetParams {
 }
 
 impl SrcsetParams {
-    fn widths(&self) -> Result<Vec<u32>, ApiError> {
-        let raw = self.widths.as_deref().unwrap_or("320,640,960,1280");
+    /// The widths to describe.
+    ///
+    /// A caller may name its own; otherwise the instance's configured widths
+    /// are the answer, because those are the widths the assets actually have
+    /// renditions for.
+    fn widths(&self, configured: &[u32]) -> Result<Vec<u32>, ApiError> {
+        let Some(raw) = self.widths.as_deref() else {
+            return Ok(configured.to_vec());
+        };
         let widths: Vec<u32> = raw
             .split(',')
             .map(str::trim)
@@ -1384,6 +1436,239 @@ pub(super) struct SrcsetResponse {
     src: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     srcset: Option<String>,
+}
+
+/// Generate the renditions an asset is missing.
+///
+/// The widths an asset has are fixed when it is uploaded, and a deployment
+/// that configures the wrong widths leaves every asset unable to answer the
+/// widths its site needs. Nothing about that is recoverable from the outside:
+/// uploads are content-addressed, so the same bytes return the same asset,
+/// and uploading again under a new id leaves every reference the consumer
+/// holds pointing at a tombstone.
+///
+/// This is the repair. The original bytes do not change, so the asset id does
+/// not have to change either, and a consumer's references keep working.
+///
+/// What it does *not* do is replace a rendition that is already there. A
+/// public URL that changes its bytes is a lie to every cache that holds it,
+/// and the pages that reference it would keep the old copy for as long as
+/// their cache policy says. So the widths that exist are left exactly as
+/// they are, and only the missing ones are generated — which is what the
+/// mistake this repairs needs.
+pub(super) async fn refresh_renditions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<RenditionRefreshResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let id = parse_id(&id)?;
+    // Reject an unknown id before waiting behind another conversion.
+    load_asset(&state, &id, Some(Kind::Image)).await?;
+    // Serialise conversions and re-renders: the output paths are named after
+    // actual widths, and two requests must not both share a staging directory
+    // or promote a file there.
+    let _permit = state
+        .conversion_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(ApiError::internal)?;
+
+    // Reload after waiting for the conversion slot: another re-render may
+    // have added the profiles while this request was queued.
+    let asset = load_asset(&state, &id, Some(Kind::Image)).await?;
+    if asset.asset.state() != AssetState::Active {
+        // The bytes of a retired asset are in the trash, and a rendition is
+        // something an asset has while it is alive.
+        return Err(ApiError::conflict(
+            "asset_retired",
+            "The asset is in the trash; restore it before generating renditions for it.",
+        ));
+    }
+
+    let source_format = asset.asset.source_format;
+    let original = state
+        .asset_dir(&id)
+        .join(format!("original.{}", source_format.extension()));
+
+    // The staging directory is where the new files are written before they
+    // are moved into place. A previous failed request can leave it behind;
+    // it is private temporary data, so clear it before beginning this run.
+    let staging = state.staging_dir(&id);
+    match fs::remove_dir_all(&staging).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ApiError::internal(error)),
+    }
+    fs::create_dir(&staging).await.map_err(ApiError::internal)?;
+
+    let dimensions = match state
+        .image_processor
+        .inspect(&original, source_format, &staging)
+        .await
+    {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging).await;
+            return Err(map_media_error(error));
+        }
+    };
+
+    // A configured profile is metadata, even when a small image means that
+    // several profiles all resolve to the same actual width. Add rows for
+    // every profile. Existing actual widths reuse their existing files;
+    // only wholly new actual widths go through ImageMagick.
+    let wanted = implied_widths(&state.config.variant_widths, dimensions.width);
+    let present_profiles: Vec<u32> = asset
+        .renditions
+        .iter()
+        .map(|rendition| rendition.max_width)
+        .collect();
+    let missing: Vec<(u32, u32)> = wanted
+        .into_iter()
+        .filter(|(profile, _)| !present_profiles.contains(profile))
+        .collect();
+
+    if !missing.is_empty() {
+        let mut to_generate: Vec<u32> = Vec::new();
+        for (_, actual) in &missing {
+            let already_stored = asset
+                .renditions
+                .iter()
+                .any(|rendition| rendition.width == *actual);
+            if !already_stored
+                && !to_generate
+                    .iter()
+                    .any(|profile| (*profile).min(dimensions.width) == *actual)
+            {
+                to_generate.push(missing.iter().find(|(_, width)| width == actual).unwrap().0);
+            }
+        }
+
+        let generated = if to_generate.is_empty() {
+            Vec::new()
+        } else {
+            match tokio::time::timeout(
+                state.config.image_processing_timeout,
+                state.image_processor.generate(
+                    &original,
+                    source_format,
+                    dimensions,
+                    &to_generate,
+                    &staging,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(records)) => records,
+                Ok(Err(error)) => {
+                    let _ = fs::remove_dir_all(&staging).await;
+                    return Err(map_media_error(error));
+                }
+                Err(_) => {
+                    let _ = fs::remove_dir_all(&staging).await;
+                    return Err(ApiError::invalid(
+                        "Image processing exceeded its time limit.",
+                    ));
+                }
+            }
+        };
+
+        let mut additions = Vec::new();
+        for (profile, actual) in &missing {
+            let generated_records: Vec<&RenditionRecord> = generated
+                .iter()
+                .filter(|record| record.width == *actual)
+                .collect();
+            let source_records: Vec<&RenditionRecord> = if !generated_records.is_empty() {
+                generated_records
+            } else {
+                asset
+                    .renditions
+                    .iter()
+                    .filter(|record| record.width == *actual)
+                    .collect()
+            };
+            for source in source_records {
+                let mut alias = source.clone();
+                alias.max_width = *profile;
+                additions.push(alias);
+            }
+        }
+
+        // The files are moved into the asset directory before the rows that
+        // name them are written, so a crash in between leaves files nobody
+        // points at rather than rows whose files are not there. The names
+        // are after actual widths the asset does not have yet, so nothing is
+        // overwritten. Existing actual widths are aliases to their current
+        // file names, not regenerated output.
+        let asset_dir = state.asset_dir(&id);
+        let mut promoted = Vec::with_capacity(generated.len());
+        for rendition in &generated {
+            let from = staging.join(&rendition.file_name);
+            let to = asset_dir.join(&rendition.file_name);
+            if let Err(error) = fs::rename(&from, &to).await {
+                for (moved_from, moved_to) in promoted {
+                    let _ = fs::rename(moved_to, moved_from).await;
+                }
+                let _ = fs::remove_dir_all(&staging).await;
+                return Err(ApiError::internal(error));
+            }
+            promoted.push((from, to));
+        }
+
+        if let Err(error) = state.store.insert_renditions(&id, &additions).await {
+            // The rows did not go in, so the files must not stay: they would
+            // be files nobody points at, taking up space for nothing.
+            for (from, to) in promoted {
+                let _ = fs::rename(to, from).await;
+            }
+            let _ = fs::remove_dir_all(&staging).await;
+            return Err(ApiError::internal(error));
+        }
+    }
+
+    let mut added: Vec<u32> = missing.iter().map(|(profile, _)| *profile).collect();
+    added.sort_unstable();
+    added.dedup();
+
+    // The staging directory has served its purpose. Startup sweeps it too,
+    // but there is no reason to leave it behind in the meantime.
+    let _ = fs::remove_dir_all(&staging).await;
+
+    let asset = load_asset(&state, &id, Some(Kind::Image)).await?;
+
+    Ok(Json(RenditionRefreshResponse {
+        id: id.to_string(),
+        widths: state.config.variant_widths.clone(),
+        added,
+        renditions: AssetResponse::from(&asset).renditions,
+    }))
+}
+
+/// The widths a configuration implies, and the width each one produces.
+///
+/// A profile is a maximum, so a photo narrower than the profile is stored at
+/// its own width, and several profiles can end up asking for the same one. The
+/// narrowest profile that asks for a width is the one it is stored under, and
+/// the rest resolve to it when they are read.
+fn implied_widths(configured: &[u32], source_width: u32) -> Vec<(u32, u32)> {
+    configured
+        .iter()
+        .map(|profile| (*profile, (*profile).min(source_width)))
+        .collect()
+}
+
+#[derive(Serialize)]
+pub(super) struct RenditionRefreshResponse {
+    id: String,
+    /// The widths the instance generates.
+    widths: Vec<u32>,
+    /// The widths this call added. Empty when the asset already had them all.
+    added: Vec<u32>,
+    /// The asset's renditions, as they are now.
+    renditions: Vec<RenditionResponse>,
 }
 
 pub(super) async fn list_trash(
@@ -1475,6 +1760,7 @@ pub(super) async fn get_rendition(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((id, name)): Path<(String, String)>,
+    Query(query): Query<RenditionQuery>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id)?;
     let max_width = name
@@ -1482,11 +1768,16 @@ pub(super) async fn get_rendition(
         .and_then(|value| value.parse::<u32>().ok())
         .ok_or_else(ApiError::not_found)?;
     let asset = load_asset(&state, &id, None).await?;
+    let requested = query
+        .format
+        .as_deref()
+        .map(parse_rendition_format)
+        .transpose()?;
     if let Some(response) = serve_placeholder_if_retired(&headers, &asset) {
         return Ok(response);
     }
 
-    let (selected, path) = resolve_rendition(&state, &asset, &headers, max_width)?;
+    let (selected, path) = resolve_rendition(&state, &asset, &headers, max_width, requested)?;
     serve_file(
         &headers,
         &path,
@@ -1495,9 +1786,30 @@ pub(super) async fn get_rendition(
         None,
         selected.format.mime_type(),
         "inline",
-        true,
+        // A URL that names its format already says which representation it
+        // is, so one copy per URL is enough and the response does not vary by
+        // the `Accept` header.
+        requested.is_none(),
     )
     .await
+}
+
+/// The optional `format` parameter of a rendition URL.
+#[derive(Deserialize)]
+pub(super) struct RenditionQuery {
+    /// The format the caller wants, named the way Atlas names it in a
+    /// response: `jxl`, `avif`, `webp`, `jpeg`, `png`.
+    format: Option<String>,
+}
+
+/// A format name a caller may ask for.
+fn parse_rendition_format(value: &str) -> Result<RenditionFormat, ApiError> {
+    RenditionFormat::from_key(&value.trim().to_ascii_lowercase()).ok_or_else(|| {
+        ApiError::bad_request(
+            "invalid_format",
+            "format must be one of jxl, avif, webp, jpeg or png.",
+        )
+    })
 }
 
 /// Choose the stored representation for a `/w{max_width}` request.
@@ -1512,11 +1824,17 @@ pub(super) async fn get_rendition(
 /// The same fallback covers profiles that generation deduplicated: when several
 /// requested widths produce one actual width, only the first is stored, and the
 /// skipped profiles resolve here.
+///
+/// A caller that names a format gets that one, whatever the `Accept` header
+/// says: the header is for a browser that cannot choose for itself, and a
+/// crawler fetching an image for a marketplace needs a format the marketplace
+/// accepts, not the newest one the server has.
 fn resolve_rendition<'a>(
     state: &AppState,
     asset: &'a StoredAsset,
     headers: &HeaderMap,
     max_width: u32,
+    requested: Option<RenditionFormat>,
 ) -> Result<(&'a RenditionRecord, std::path::PathBuf), ApiError> {
     let group: Vec<&RenditionRecord> = {
         let exact: Vec<_> = asset
@@ -1553,7 +1871,14 @@ fn resolve_rendition<'a>(
         }
     };
 
-    let selected = select_format(headers, &group).ok_or_else(ApiError::not_acceptable)?;
+    let selected = match requested {
+        Some(format) => group
+            .iter()
+            .copied()
+            .find(|rendition| rendition.format == format)
+            .ok_or_else(|| ApiError::format_not_found(format, &group))?,
+        None => select_format(headers, &group).ok_or_else(ApiError::not_acceptable)?,
+    };
     let path = state.asset_dir(&asset.asset.id).join(&selected.file_name);
     Ok((selected, path))
 }
@@ -2169,9 +2494,23 @@ mod tests {
 
     /// A public media request, keeping the headers so a test can compare ETags.
     async fn fetch(router: &Router, uri: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
+        fetch_with(router, uri, None).await
+    }
+
+    /// A public read with an `Accept` header, which is what a browser sends
+    /// and what a crawler cannot.
+    async fn fetch_with(
+        router: &Router,
+        uri: &str,
+        accept: Option<&str>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut request = Request::builder().uri(uri);
+        if let Some(accept) = accept {
+            request = request.header(ACCEPT, accept);
+        }
         let response = router
             .clone()
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -4057,6 +4396,286 @@ mod tests {
         );
     }
 
+    /// The configuration is visible, the srcset follows it, and an asset can
+    /// gain a width it was uploaded without.
+    ///
+    /// A deployment that configures the wrong widths produces assets that can
+    /// never gain the widths its site needs, and the only way to find out was
+    /// to list every asset and read the renditions of each one.
+    #[tokio::test]
+    async fn the_configured_widths_are_reported_and_can_be_added() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_test_image(&directory.path().join("source.png"), "1400x900");
+        let data_dir = directory.path().join("atlas");
+
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![400, 800];
+        let router = app(AppState::new(config).await.unwrap());
+
+        let (status, value) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = value["id"].as_str().unwrap().to_owned();
+
+        // The summary reports the widths this instance generates.
+        let (status, summary) = send(&router, authorized("GET", "/api/v1/summary")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(summary["rendition_widths"], serde_json::json!([400, 800]));
+
+        // The srcset describes those widths, not the ones the binary was
+        // built with.
+        let (status, srcset) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/images/{id}/srcset")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let candidates = srcset["srcset"].as_str().unwrap();
+        assert!(candidates.contains(" 400w"), "{candidates}");
+        assert!(candidates.contains(" 800w"), "{candidates}");
+        assert!(!candidates.contains(" 960w"), "{candidates}");
+
+        // The operator changes the configuration and restarts. The assets are
+        // still the ones that were uploaded.
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![200, 400, 800];
+        let router = app(AppState::new(config).await.unwrap());
+
+        // The width the site needs is still missing: nothing this asset has
+        // is narrow enough for it.
+        let (status, _, _) = fetch(&router, &format!("/media/{id}/w200")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The rendition is generated in place, under the same asset id.
+        let (status, refreshed) = send(
+            &router,
+            authorized("POST", &format!("/api/v1/images/{id}/renditions")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(refreshed["id"], id.as_str());
+        assert_eq!(refreshed["widths"], serde_json::json!([200, 400, 800]));
+        assert_eq!(refreshed["added"], serde_json::json!([200]));
+
+        let (status, _, body) = fetch(&router, &format!("/media/{id}/w200")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.is_empty());
+
+        // The srcset now describes the new width as well.
+        let (status, srcset) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/images/{id}/srcset")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(srcset["srcset"].as_str().unwrap().contains(" 200w"));
+
+        // Running it again changes nothing.
+        let (status, refreshed) = send(
+            &router,
+            authorized("POST", &format!("/api/v1/images/{id}/renditions")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(refreshed["added"], serde_json::json!([]));
+
+        // The original is untouched, and the asset is still the same one.
+        let (status, value) =
+            send(&router, authorized("GET", &format!("/api/v1/images/{id}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["id"], id.as_str());
+    }
+
+    /// A rendition that is already there keeps its bytes.
+    ///
+    /// A public URL that changes its bytes is a lie to every cache that holds
+    /// it, so generating the missing widths must not touch the ones that
+    /// exist.
+    #[tokio::test]
+    async fn adding_a_width_leaves_the_others_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_test_image(&directory.path().join("source.png"), "1400x900");
+        let data_dir = directory.path().join("atlas");
+
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![200, 400];
+        let router = app(AppState::new(config).await.unwrap());
+
+        let (status, value) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = value["id"].as_str().unwrap().to_owned();
+
+        let (status, headers, before) = fetch(&router, &format!("/media/{id}/w200")).await;
+        assert_eq!(status, StatusCode::OK);
+        let etag = headers["etag"].to_str().unwrap().to_owned();
+
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![200, 400, 800];
+        let router = app(AppState::new(config).await.unwrap());
+        let (status, _) = send(
+            &router,
+            authorized("POST", &format!("/api/v1/images/{id}/renditions")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, headers, after) = fetch(&router, &format!("/media/{id}/w200")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            before, after,
+            "the bytes behind a published URL do not change"
+        );
+        assert_eq!(headers["etag"].to_str().unwrap(), etag);
+    }
+
+    /// Several configured profiles can name the same actual width for a
+    /// small image. Adding another such profile adds metadata that points at
+    /// the already-stored bytes; it does not run ImageMagick over that path.
+    #[tokio::test]
+    async fn re_render_adds_aliases_for_profiles_that_share_an_actual_width() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_test_image(&directory.path().join("source.png"), "300x180");
+        let data_dir = directory.path().join("atlas");
+
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![200, 400];
+        let router = app(AppState::new(config).await.unwrap());
+        let (status, value) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = value["id"].as_str().unwrap().to_owned();
+
+        // The old w400 URL points to the 300-pixel file.
+        let (status, headers_before, bytes_before) =
+            fetch(&router, &format!("/media/{id}/w400")).await;
+        assert_eq!(status, StatusCode::OK);
+        let etag_before = headers_before["etag"].to_str().unwrap().to_owned();
+
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![200, 400, 800];
+        let router = app(AppState::new(config).await.unwrap());
+        let (status, refreshed) = send(
+            &router,
+            authorized("POST", &format!("/api/v1/images/{id}/renditions")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(refreshed["added"], serde_json::json!([800]));
+
+        let (status, headers_after, bytes_after) =
+            fetch(&router, &format!("/media/{id}/w400")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes_before, bytes_after);
+        assert_eq!(headers_after["etag"].to_str().unwrap(), etag_before);
+
+        // The new configured profile is represented in srcset, but shares
+        // the existing 300-pixel candidate rather than duplicating it.
+        let (status, srcset) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/images/{id}/srcset")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let candidates = srcset["srcset"].as_str().unwrap();
+        assert!(candidates.contains(" 200w"), "{candidates}");
+        assert!(
+            candidates.contains(&format!("/media/{id}/w800 300w")),
+            "{candidates}"
+        );
+        assert_eq!(candidates.matches("300w").count(), 1, "{candidates}");
+    }
+
+    /// Generating renditions is a change, so it needs the token.
+    #[tokio::test]
+    async fn generating_renditions_needs_the_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_test_image(&directory.path().join("source.png"), "640x480");
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        let (status, value) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = value["id"].as_str().unwrap().to_owned();
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/images/{id}/renditions"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A caller can ask for a rendition format by name.
+    ///
+    /// The `Accept` header is for a browser that cannot choose for itself. A
+    /// crawler fetching an image for a marketplace needs a format the
+    /// marketplace accepts, and the marketplace's list does not always
+    /// include the newest one Atlas has.
+    #[tokio::test]
+    async fn a_caller_can_name_the_format_it_wants() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_test_image(&directory.path().join("source.png"), "640x480");
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let (status, value) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = value["id"].as_str().unwrap().to_owned();
+
+        // The format in the URL wins over the header, whatever the header
+        // says.
+        let (status, headers, body) = fetch_with(
+            &router,
+            &format!("/media/{id}/w320?format=webp"),
+            Some("image/avif,image/webp,image/*;q=0.8"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "image/webp");
+        assert_eq!(&body[..4], b"RIFF", "the WebP rendition is served");
+        assert!(
+            !headers.contains_key("vary"),
+            "a URL that names its format does not vary by Accept"
+        );
+
+        // Without the parameter the negotiation is exactly as it was.
+        let (status, headers, _) = fetch_with(
+            &router,
+            &format!("/media/{id}/w320"),
+            Some("image/avif,image/webp,image/*;q=0.8"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "image/avif");
+        assert_eq!(headers["vary"], "Accept");
+
+        // A format the asset does have is served whatever the header says.
+        let (status, headers, _) = fetch_with(
+            &router,
+            &format!("/media/{id}/w320?format=png"),
+            Some("image/avif"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "image/png");
+
+        // An unknown format is refused, with the usual error body.
+        let (status, error) = fetch_error(&router, &format!("/media/{id}/w320?format=tiff")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "invalid_format");
+
+        // A format the asset does not have at that width is a 404: this image
+        // is a PNG, so its fallback is a PNG and it has no JPEG rendition.
+        let (status, error) = fetch_error(&router, &format!("/media/{id}/w320?format=jpeg")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error["error"]["code"], "rendition_format_not_found");
+    }
+
     #[tokio::test]
     async fn rendition_urls_also_fall_back_to_the_placeholder() {
         let directory = tempfile::tempdir().unwrap();
@@ -4091,6 +4710,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "image/png");
         assert_eq!(response.headers()["cache-control"], "public, max-age=60");
+
+        // Even though a retired asset is represented by a placeholder, an
+        // unrecognized format name is still a malformed request.
+        let (status, error) = fetch_error(&router, &format!("/media/{id}/w320?format=tiff")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "invalid_format");
     }
 
     #[tokio::test]
