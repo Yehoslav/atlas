@@ -85,17 +85,36 @@ media files and media metadata only.
 - That operation *adds* renditions and never replaces one. A public URL that
   changes its bytes is a lie to every cache that holds it, and the pages that
   reference it would keep the old copy for as long as their cache policy
-  says. The bytes behind a published URL are therefore fixed when it is
-  published, and a re-render that changed them would break the promise the
-  rest of the design rests on. What the operation repairs is the mistake this
-  exists for: a width the site needs that the asset does not have.
+  says. The bytes behind a URL the API hands out are therefore fixed, and a
+  re-render that changed them would break the promise the rest of the design
+  rests on. What the operation repairs is the mistake this exists for: a width
+  the site needs that the asset does not have. A srcset never names a profile
+  the asset is only falling back for, because adding it would change what that
+  URL serves.
+- An encoding that turned out to be bad is corrected with a new *generation*,
+  not by re-encoding in place and not with a new asset id. The asset carries a
+  generation that starts at 1, the rendition URLs the API hands out name it
+  (`/media/{id}/w800?g=2`), and a re-encode writes every rendition again from
+  the original as the next generation, beside the old files. The promise is
+  made precise rather than weakened: a URL that names a generation is
+  immutable, and the bare URL serves the current one with a one-hour cache
+  policy. Re-encoding in place would hide the fix from every cache that holds
+  the old copy; a new id would move the cost into the consumer's rows, feeds
+  and published URLs. Content-addressed rendition URLs would say the same
+  thing with a longer URL. The superseded rows are kept in their own table, so
+  the change is additive and the current generation stays in `renditions`.
+  The cost is disk: every generation's files are kept until the asset is
+  purged.
+  A bulk re-render walks the live images a page per request, each under the
+  conversion slot; there is no job queue, so the caller drives the walk.
 - Renditions are converted to sRGB through the source's embedded ICC profile
   before metadata is stripped, so a Display P3 phone photo keeps its colours
   instead of being relabelled. The target is a compact sRGB profile embedded in
   the binary and written to the data directory at startup; an untagged source
   is labelled with it and its pixels are left as they are. `-colorspace sRGB`
   alone does not do this, because ImageMagick already calls a P3 photo sRGB.
-- Asset URLs are immutable. Replacing bytes means uploading a new asset ID.
+- Asset URLs are immutable. Replacing an original means uploading a new asset
+  ID; re-encoding its renditions means a new generation of the same one.
 - Identical bytes are the same asset. An upload whose original matches a live
   asset returns that asset with `200` instead of `201`, costs a hash rather than
   a conversion, and makes a retry after a timeout idempotent. Deduplication is
@@ -202,8 +221,9 @@ Mutations and rendition requests are typed: `POST /api/v1/images`,
 `GET /api/v1/images/{id}/srcset`, which simply has no documents equivalent.
 Read-only queries a consumer makes over a mixed set stay uniform:
 `POST /api/v1/assets/state` for batch drift repair, `GET /api/v1/trash`,
-`GET /api/v1/summary`. Public media URLs are untyped and immutable:
-`/media/{id}/original` and `/media/{id}/w{width}`.
+`GET /api/v1/summary`. Public media URLs are untyped: `/media/{id}/original`
+is immutable, `/media/{id}/w{width}?g={generation}` is immutable, and the bare
+`/media/{id}/w{width}` follows the current generation.
 
 Handlers are shared behind one `Kind` value, so the split costs an enum and a
 route rather than a second implementation of the lifecycle.
@@ -277,15 +297,22 @@ collections.
   produced. Without a `widths` parameter it describes the instance's
   configured widths.
 - `POST /api/v1/images/{id}/renditions` — authenticated generation of the
-  renditions an asset is missing, under the same asset id.
+  renditions an asset is missing, under the same asset id; with
+  `{"re_encode": true}`, a re-encode of every rendition as a new generation.
+- `POST /api/v1/images/re-render` — authenticated re-encode of every live
+  image, a page per call, answering with the count, the failures and the
+  cursor for the next page.
 - `GET /media/{id}/original` — public, unmodified original.
 - `GET /media/{id}/w{max_width}` — public rendition with format selected from
   `Accept`; JXL, AVIF, WebP, then an acceptable JPEG/PNG fallback. A `format`
   parameter names the representation instead, and then the header is not
-  consulted.
+  consulted. A `g` parameter names the generation; without one, the current
+  generation is served.
 
 Public files support `ETag`, conditional requests, single byte ranges, a
-one-year immutable cache policy, and `X-Content-Type-Options: nosniff`. PDFs are
+one-year immutable cache policy, and `X-Content-Type-Options: nosniff`. The one
+exception is a rendition URL that names no generation, which follows the
+current one and is cached for an hour. PDFs are
 served inline; Word files are served as attachments. Media paths use only
 opaque lowercase base36 IDs and a configured width profile, never filesystem
 paths or user-controlled names. Anything that fails ID validation resolves to
