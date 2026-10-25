@@ -381,6 +381,12 @@ the consumer's stored srcsets change each time. A page retried from the same
 `after` re-encodes the images it already did; keep pages small and resume from
 the last `next` that came back.
 
+A page re-encodes its images one after another inside the request, so it holds
+the request open for one conversion per image. Behind a proxy, keep `limit`
+small enough that a page finishes inside the proxy's read timeout (nginx waits
+60 seconds by default): a page the proxy gives up on may already have
+re-encoded some of its images, and retrying it re-encodes those again.
+
 ## Asset IDs
 
 Asset IDs are random lowercase base36 strings, 18 characters by default

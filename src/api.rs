@@ -1941,9 +1941,12 @@ fn optional_json<T: serde::de::DeserializeOwned + Default>(body: &[u8]) -> Resul
 
 /// How many images one re-render call re-encodes, by default and at most.
 ///
-/// Each one is a full conversion, so a page is kept small enough that a
-/// request finishes well inside a proxy's timeout; a caller walks the whole
-/// collection by passing `next` back as `after`.
+/// Each one is a full conversion, run one after another inside the request,
+/// so a page holds the request open for `limit` conversions. A conversion is
+/// usually seconds, but only `image_processing_timeout` bounds it: the worst
+/// case is the default page at 10 times that, and the maximum page at 100
+/// times. A caller behind a proxy sizes `limit` to the proxy's read timeout
+/// and walks the whole collection by passing `next` back as `after`.
 const DEFAULT_RE_RENDER_LIMIT: i64 = 10;
 const MAX_RE_RENDER_LIMIT: i64 = 100;
 
