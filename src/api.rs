@@ -2186,10 +2186,12 @@ pub(super) async fn get_rendition(
     }
 
     // A URL that names an older generation is answered from that
-    // generation's rows, which a re-encode kept for exactly this.
+    // generation's rows, which a re-encode kept for exactly this. Those rows
+    // are frozen: an asset only ever gains widths in its current generation.
     let superseded;
+    let frozen = generation.is_some_and(|generation| generation != asset.asset.generation);
     let renditions = match generation {
-        Some(generation) if generation != asset.asset.generation => {
+        Some(generation) if frozen => {
             superseded = state
                 .store
                 .superseded_renditions(&id, generation)
@@ -2228,9 +2230,10 @@ pub(super) async fn get_rendition(
         // the `Accept` header.
         requested.is_none(),
         // The bytes of a generation never change; the bare URL follows
-        // whichever generation is current, and so does a profile the
-        // generation is missing, which it may still gain.
-        if generation.is_some() && settled {
+        // whichever generation is current, and so does a profile the current
+        // generation is missing, which it may still gain. A superseded
+        // generation gains nothing, so even its fallback is final.
+        if generation.is_some() && (settled || frozen) {
             CACHE_POLICY
         } else {
             LATEST_CACHE_POLICY
@@ -5311,6 +5314,38 @@ mod tests {
         );
         let (_, headers, _) = fetch(&router, &format!("/media/{large}/w640?g=1")).await;
         assert_eq!(headers["etag"], etag, "the URL handed out kept its bytes");
+    }
+
+    /// A superseded generation can no longer gain a width, so a profile it
+    /// falls back on is final and is cached like the rest of it.
+    #[tokio::test]
+    async fn a_superseded_generation_fallback_is_immutable() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
+        let id = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("large.png"), "1400x900"),
+        )
+        .await;
+
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![320, 640, 1280];
+        let router = app(AppState::new(config).await.unwrap());
+        let (_, headers, before) = fetch(&router, &format!("/media/{id}/w1280?g=1")).await;
+        assert_eq!(headers["cache-control"], "public, max-age=3600");
+
+        let (status, refreshed) = send(&router, re_encode_request(&id)).await;
+        assert_eq!(status, StatusCode::OK, "{refreshed}");
+        assert_eq!(refreshed["generation"], 2);
+
+        let (status, headers, after) = fetch(&router, &format!("/media/{id}/w1280?g=1")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(after, before, "generation 1 still falls back to its 640");
+        assert_eq!(
+            headers["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
     }
 
     fn write_test_image_blue(path: &std::path::Path) -> Vec<u8> {
