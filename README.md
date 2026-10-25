@@ -859,18 +859,18 @@ The repository's Actions workflow builds and smoke-tests the image on every
 change. After the PR that updates `Cargo.toml` is merged, tag that merged
 commit to publish it to GitHub Container Registry. Use the SemVer version
 from `Cargo.toml` verbatim, including its pre-release label; the workflow
-checks that the tag matches. For the current `0.1.0-alpha.1` crate version:
+checks that the tag matches. For the current `0.1.0-alpha.2` crate version:
 
 ```sh
 jj git fetch --remote origin
-jj tag set 0.1.0-alpha.1 -r master@origin
-jj git push --tag 0.1.0-alpha.1
+jj tag set 0.1.0-alpha.2 -r master@origin
+jj git push --tag 0.1.0-alpha.2
 ```
 
 The server pulls the versioned image rather than compiling the Rust tree:
 
 ```sh
-docker pull ghcr.io/yehoslav/atlas:0.1.0-alpha.1
+docker pull ghcr.io/yehoslav/atlas:0.1.0-alpha.2
 ```
 
 The floating `latest` image tag is updated only by stable SemVer tags; an
@@ -886,9 +886,9 @@ a running service, which is the same mistake as a mutable URL. A server with
 no registry to talk to can carry the image as a file instead:
 
 ```sh
-docker save ghcr.io/yehoslav/atlas:0.1.0-alpha.1 | gzip > atlas-0.1.0-alpha.1.tar.gz
+docker save ghcr.io/yehoslav/atlas:0.1.0-alpha.2 | gzip > atlas-0.1.0-alpha.2.tar.gz
 # on the server
-gunzip -c atlas-0.1.0-alpha.1.tar.gz | docker load
+gunzip -c atlas-0.1.0-alpha.2.tar.gz | docker load
 ```
 
 Copy `contrib/atlas.container.env.example` to `/etc/atlas/atlas.container.env`,
@@ -903,7 +903,7 @@ sudo docker run --detach --name atlas \
     --publish 127.0.0.1:3000:3000 \
     --env-file /etc/atlas/atlas.container.env \
     --volume atlas-data:/var/lib/atlas \
-    ghcr.io/yehoslav/atlas:0.1.0-alpha.1
+    ghcr.io/yehoslav/atlas:0.1.0-alpha.2
 ```
 
 Two details worth knowing. A **named volume** inherits its ownership from the
