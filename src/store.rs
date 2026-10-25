@@ -418,19 +418,38 @@ impl Store {
             return Ok(None);
         }
 
-        // Read through `to_rendition`, so a row without a file name gets the
+        // A row that names its file is copied as it is, so one this build
+        // cannot read, such as a format a newer Atlas wrote, moves with the
+        // rest instead of being dropped while its file stays on disk.
+        sqlx::query(
+            "INSERT INTO superseded_renditions
+                (asset_id, generation, max_width, width, height, format, bytes, sha256, file_name)
+             SELECT asset_id, ?, max_width, width, height, format, bytes, sha256, file_name
+             FROM renditions WHERE asset_id = ? AND file_name IS NOT NULL",
+        )
+        .bind(i64::from(generation))
+        .bind(asset_id.as_str())
+        .execute(&mut *transaction)
+        .await?;
+
+        // A row without one is read through `to_rendition`, so it gets the
         // same legacy name every reader resolves it to.
-        let current: Vec<RenditionRecord> = sqlx::query(
+        let legacy = sqlx::query(
             "SELECT asset_id, max_width, width, height, format, bytes, sha256, file_name
-             FROM renditions WHERE asset_id = ?",
+             FROM renditions WHERE asset_id = ? AND file_name IS NULL",
         )
         .bind(asset_id.as_str())
         .fetch_all(&mut *transaction)
-        .await?
-        .into_iter()
-        .filter_map(to_rendition)
-        .map(|(_, rendition)| rendition)
-        .collect();
+        .await?;
+        let legacy_rows = legacy.len();
+        let current: Vec<RenditionRecord> = legacy
+            .into_iter()
+            .filter_map(to_rendition)
+            .map(|(_, rendition)| rendition)
+            .collect();
+        if current.len() < legacy_rows {
+            tracing::warn!(asset = %asset_id, dropped = legacy_rows - current.len(), "dropping rendition rows with neither a file name nor a format this build reads");
+        }
         for rendition in &current {
             sqlx::query(
                 "INSERT INTO superseded_renditions
@@ -1410,6 +1429,40 @@ mod tests {
             store.superseded_renditions(&id, 1).await.unwrap()[0].file_name,
             "w320.jpg",
             "a superseded row keeps the name it was served under"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseding_keeps_a_row_this_build_cannot_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, id) = store_with_asset(directory.path()).await;
+        sqlx::query(
+            "INSERT INTO renditions
+                (asset_id, max_width, width, height, format, bytes, sha256, file_name)
+             VALUES (?, 320, 320, 240, 'jxl2', 7, 'abc', 'w320.jxl2')",
+        )
+        .bind(id.as_str())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        store
+            .supersede_renditions(&id, 1, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        let formats: Vec<String> = sqlx::query_scalar(
+            "SELECT format FROM superseded_renditions
+             WHERE asset_id = ? AND generation = 1 ORDER BY format",
+        )
+        .bind(id.as_str())
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            formats,
+            ["jpeg", "jxl2"],
+            "a format a newer Atlas wrote moves with the rest instead of vanishing"
         );
     }
 
