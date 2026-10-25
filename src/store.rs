@@ -737,6 +737,12 @@ impl Store {
     }
 
     pub async fn get_asset(&self, id: &AssetId) -> Result<Option<StoredAsset>, StoreError> {
+        // One read transaction, so the asset and its renditions come from the
+        // same snapshot. Two autocommit reads would let a re-encode commit
+        // between them, pairing one generation's number with the next one's
+        // rows, and a `?g=` URL would then serve, and cache for a year, bytes
+        // it never named.
+        let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT id, source_format, bytes, sha256, width, height, created_at,
                     original_name, kind, deleted_at, purged_at, pinned, consumer_data,
@@ -744,7 +750,7 @@ impl Store {
              FROM assets WHERE id = ?",
         )
         .bind(id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await?;
 
         let Some(row) = row else {
@@ -760,8 +766,9 @@ impl Store {
              FROM renditions WHERE asset_id = ? ORDER BY max_width ASC, format ASC",
         )
         .bind(id.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *transaction)
         .await?;
+        transaction.commit().await?;
 
         let renditions = rows
             .into_iter()
