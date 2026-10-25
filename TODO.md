@@ -172,6 +172,17 @@ Placed at `examples/family-album/`.
       that a sequence is a `415` now. It turns a `201` into a `415`, so it
       wants a decision of its own rather than riding along with a fix.
 
+### Rendition generations
+
+- [ ] **Let a re-render skip what the current encoder already made.** A
+      generation does not record what produced it, so a walk restarted from
+      the beginning re-encodes every image again and keeps another copy of
+      its renditions. Store an encoder stamp beside the generation (the
+      ImageMagick and libjxl versions, or a build stamp) and let the walk
+      skip an image whose current generation carries the current stamp. It
+      changes what a walk does and needs a migration, so it wants a decision
+      of its own.
+
 ## Things that got through, and why
 
 Worth keeping because each shipped green and each was found by hand:

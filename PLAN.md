@@ -107,6 +107,12 @@ media files and media metadata only.
   purged.
   A bulk re-render walks the live images a page per request, each under the
   conversion slot; there is no job queue, so the caller drives the walk.
+  Nothing records what produced a generation, so "re-render after the libjxl
+  fix" and "re-render again because the cursor was lost" are the same request,
+  and each adds a full copy of every image's renditions. The lever is data,
+  not machinery: an encoder stamp beside the generation (the ImageMagick and
+  libjxl versions, or a build stamp) would let the walk skip the images the
+  current encoder already produced. It is left open in `TODO.md`.
 - Renditions are converted to sRGB through the source's embedded ICC profile
   before metadata is stripped, so a Display P3 phone photo keeps its colours
   instead of being relabelled. The target is a compact sRGB profile embedded in
