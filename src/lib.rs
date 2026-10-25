@@ -310,6 +310,11 @@ pub fn app(state: AppState) -> Router {
             "/api/v1/images/{id}/renditions",
             axum::routing::post(api::refresh_renditions),
         )
+        // Every live image, re-encoded a page at a time.
+        .route(
+            "/api/v1/images/re-render",
+            axum::routing::post(api::re_render_images),
+        )
         // Uniform reads: a caller naturally asks about a mixed set of ids, and
         // reading is harmless when the caller's classification is wrong.
         .route(

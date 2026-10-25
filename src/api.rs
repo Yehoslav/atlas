@@ -1,13 +1,14 @@
 use std::{
     collections::BTreeMap,
     io::SeekFrom,
+    path::PathBuf,
     sync::LazyLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, Query, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
@@ -43,6 +44,11 @@ use crate::{
 };
 
 const CACHE_POLICY: &str = "public, max-age=31536000, immutable";
+/// For a rendition URL that names no generation. It serves whichever
+/// generation is current, so a re-encode changes its bytes, and a year-long
+/// immutable copy would hide the fix exactly where it matters. The URLs the
+/// API hands out name their generation and are cached as immutable.
+const LATEST_CACHE_POLICY: &str = "public, max-age=3600";
 /// Deliberately short: the placeholder stands in for an asset that may come back
 /// from the trash, and an immutable one could outlive that restore by a year.
 const PLACEHOLDER_CACHE_POLICY: &str = "public, max-age=60";
@@ -89,6 +95,8 @@ pub(super) struct AssetResponse {
     deleted_at: Option<i64>,
     purged_at: Option<i64>,
     pinned: bool,
+    /// Which encoding of the original the rendition URLs name.
+    generation: u32,
     original: OriginalResponse,
     renditions: Vec<RenditionResponse>,
 }
@@ -222,7 +230,7 @@ impl From<&StoredAsset> for AssetResponse {
                     max_width,
                     width,
                     height,
-                    url: format!("/media/{}/w{max_width}", asset.id),
+                    url: rendition_url(&asset.id, max_width, asset.generation),
                     formats,
                 }
             })
@@ -238,6 +246,7 @@ impl From<&StoredAsset> for AssetResponse {
             deleted_at: asset.deleted_at,
             purged_at: asset.purged_at,
             pinned: asset.pinned,
+            generation: asset.generation,
             original: OriginalResponse {
                 url: format!("/media/{}/original", asset.id),
                 filename: asset.original_name.clone(),
@@ -250,6 +259,15 @@ impl From<&StoredAsset> for AssetResponse {
             renditions,
         }
     }
+}
+
+/// The public URL of one rendition profile at one generation.
+///
+/// Always versioned: the bytes behind it never change, so it is the URL a
+/// consumer can store and a cache can keep. The bare `/media/{id}/w{width}`
+/// still works and serves whichever generation is current.
+fn rendition_url(id: &AssetId, max_width: u32, generation: u32) -> String {
+    format!("/media/{id}/w{max_width}?g={generation}")
 }
 
 impl From<&StoredAsset> for TrashEntryResponse {
@@ -493,6 +511,7 @@ async fn create_asset(
         purged_at: None,
         pinned: false,
         consumer_data: None,
+        generation: 1,
     };
 
     let mut final_dir = state.asset_dir(&record.id);
@@ -1330,7 +1349,17 @@ pub(super) async fn get_srcset(
     // and answered with no srcset at all.
     let use_configured_widths = params.widths.is_none();
     let widths = params.widths(&state.config.variant_widths)?;
+    Ok(Json(srcset_for(&asset, widths, use_configured_widths)))
+}
 
+/// The `src` and `srcset` for some widths of an asset's current generation.
+fn srcset_for(
+    asset: &StoredAsset,
+    widths: Vec<u32>,
+    use_configured_widths: bool,
+) -> SrcsetResponse {
+    let id = &asset.asset.id;
+    let generation = asset.asset.generation;
     // One entry per actual width: each stored rendition has one row per
     // *format*, and a srcset descriptor describes a width, not a
     // representation. When a configuration has changed, a requested profile
@@ -1342,24 +1371,39 @@ pub(super) async fn get_srcset(
         let exact = asset
             .renditions
             .iter()
-            .find(|rendition| rendition.max_width == width)
-            .or_else(|| {
+            .find(|rendition| rendition.max_width == width);
+        let (profile, rendition) = match exact {
+            Some(rendition) => (width, rendition),
+            None => {
                 if !use_configured_widths {
-                    return None;
+                    continue;
                 }
-                let actual = asset
+                let Some(actual) = asset
                     .renditions
                     .iter()
                     .filter(|rendition| rendition.width <= width)
                     .map(|rendition| rendition.width)
-                    .max()?;
-                asset
+                    .max()
+                else {
+                    continue;
+                };
+                let Some(rendition) = asset
                     .renditions
                     .iter()
                     .find(|rendition| rendition.width == actual)
-            });
-        let Some(rendition) = exact else {
-            continue;
+                else {
+                    continue;
+                };
+                // The URL handed out names its generation, so its bytes have
+                // to be final. A profile the asset is merely missing would
+                // get different bytes once it is added; the narrower
+                // profile that was stored will not.
+                if is_settled(width, rendition.width, false, asset.asset.width) {
+                    (width, rendition)
+                } else {
+                    (rendition.max_width, rendition)
+                }
+            }
         };
         if let Some((requested, _)) = chosen
             .iter_mut()
@@ -1369,9 +1413,9 @@ pub(super) async fn get_srcset(
             // resolves to the same stored bytes and makes `src` useful even
             // when the configured profiles exceed what a small image can
             // provide.
-            *requested = width;
+            *requested = (*requested).max(profile);
         } else {
-            chosen.push((width, rendition));
+            chosen.push((profile, rendition));
         }
     }
     chosen.sort_by_key(|(requested, _)| *requested);
@@ -1379,19 +1423,29 @@ pub(super) async fn get_srcset(
     // The fallback `src` is the widest width that was asked for and exists, or
     // the original when none of the requested widths were generated.
     let src = match chosen.last() {
-        Some((requested, _)) => format!("/media/{id}/w{requested}"),
+        Some((requested, _)) => rendition_url(id, *requested, generation),
         None => format!("/media/{id}/original"),
     };
 
     let srcset = (!chosen.is_empty()).then(|| {
         chosen
             .iter()
-            .map(|(requested, rendition)| format!("/media/{id}/w{requested} {}w", rendition.width))
+            .map(|(requested, rendition)| {
+                format!(
+                    "{} {}w",
+                    rendition_url(id, *requested, generation),
+                    rendition.width
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ")
     });
 
-    Ok(Json(SrcsetResponse { src, srcset }))
+    SrcsetResponse {
+        src,
+        srcset,
+        generation,
+    }
 }
 
 #[derive(Deserialize)]
@@ -1436,6 +1490,8 @@ pub(super) struct SrcsetResponse {
     src: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     srcset: Option<String>,
+    /// The generation every URL here names.
+    generation: u32,
 }
 
 /// Generate the renditions an asset is missing.
@@ -1460,11 +1516,16 @@ pub(super) async fn refresh_renditions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    body: Bytes,
 ) -> Result<Json<RenditionRefreshResponse>, ApiError> {
     authorize(&state, &headers)?;
+    let request: RenditionsRequest = optional_json(&body)?;
     let id = parse_id(&id)?;
     // Reject an unknown id before waiting behind another conversion.
     load_asset(&state, &id, Some(Kind::Image)).await?;
+    if request.re_encode {
+        return re_encode(&state, &id).await.map(Json);
+    }
     // Serialise conversions and re-renders: the output paths are named after
     // actual widths, and two requests must not both share a staging directory
     // or promote a file there.
@@ -1495,13 +1556,7 @@ pub(super) async fn refresh_renditions(
     // The staging directory is where the new files are written before they
     // are moved into place. A previous failed request can leave it behind;
     // it is private temporary data, so clear it before beginning this run.
-    let staging = state.staging_dir(&id);
-    match fs::remove_dir_all(&staging).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ApiError::internal(error)),
-    }
-    fs::create_dir(&staging).await.map_err(ApiError::internal)?;
+    let staging = fresh_staging_dir(&state, &id).await?;
 
     let dimensions = match state
         .image_processor
@@ -1574,6 +1629,15 @@ pub(super) async fn refresh_renditions(
                 }
             }
         };
+        // A width added to a re-encoded asset belongs to its generation, and
+        // its files must not take the name an older generation's file has.
+        let mut generated = generated;
+        if let Err(error) =
+            name_for_generation(&staging, &mut generated, asset.asset.generation).await
+        {
+            let _ = fs::remove_dir_all(&staging).await;
+            return Err(ApiError::internal(error));
+        }
 
         let mut additions = Vec::new();
         for (profile, actual) in &missing {
@@ -1638,13 +1702,353 @@ pub(super) async fn refresh_renditions(
     let _ = fs::remove_dir_all(&staging).await;
 
     let asset = load_asset(&state, &id, Some(Kind::Image)).await?;
+    Ok(Json(refresh_response(&state, &asset, added)))
+}
 
-    Ok(Json(RenditionRefreshResponse {
-        id: id.to_string(),
+/// What both modes of the renditions operation answer with.
+fn refresh_response(
+    state: &AppState,
+    asset: &StoredAsset,
+    added: Vec<u32>,
+) -> RenditionRefreshResponse {
+    RenditionRefreshResponse {
+        id: asset.asset.id.to_string(),
+        generation: asset.asset.generation,
         widths: state.config.variant_widths.clone(),
         added,
-        renditions: AssetResponse::from(&asset).renditions,
+        renditions: AssetResponse::from(asset).renditions,
+        srcset: srcset_for(asset, state.config.variant_widths.clone(), true),
+    }
+}
+
+/// A private, empty staging directory for one asset's conversion.
+///
+/// A previous failed request can leave one behind; it is temporary data, so
+/// it is cleared before a run begins.
+async fn fresh_staging_dir(state: &AppState, id: &AssetId) -> Result<PathBuf, ApiError> {
+    let staging = state.staging_dir(id);
+    match fs::remove_dir_all(&staging).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ApiError::internal(error)),
+    }
+    fs::create_dir(&staging).await.map_err(ApiError::internal)?;
+    Ok(staging)
+}
+
+/// The name a rendition file has in a given generation.
+///
+/// The first generation keeps the names every file has had since the start,
+/// `w640.webp`; later ones carry the generation, `w640-g2.webp`, so a new
+/// encoding is written beside the old one instead of over it.
+fn generation_file_name(name: &str, generation: u32) -> String {
+    if generation <= 1 {
+        return name.to_owned();
+    }
+    match name.split_once('.') {
+        Some((stem, extension)) => format!("{stem}-g{generation}.{extension}"),
+        None => format!("{name}-g{generation}"),
+    }
+}
+
+/// Rename freshly generated files in staging to their generation's names.
+async fn name_for_generation(
+    staging: &std::path::Path,
+    renditions: &mut [RenditionRecord],
+    generation: u32,
+) -> std::io::Result<()> {
+    for rendition in renditions {
+        let name = generation_file_name(&rendition.file_name, generation);
+        if name != rendition.file_name {
+            fs::rename(staging.join(&rendition.file_name), staging.join(&name)).await?;
+            rendition.file_name = name;
+        }
+    }
+    Ok(())
+}
+
+/// Re-encode every rendition of an image from its original, as a new
+/// generation.
+///
+/// This is the way out of an encoding that turned out to be bad. The asset id
+/// does not change, so a consumer's references keep working, and the old
+/// generation's files and rows are kept, so every URL that names it keeps the
+/// bytes it was handed out with. What moves is the current generation: the
+/// URLs the API hands out from now on name the new one, and the bare URL
+/// serves it.
+///
+/// Every profile the asset has is re-encoded, and every configured width it
+/// lacks is added: a new generation is what the instance would make of the
+/// original today. Bounded by the conversion slot like every other
+/// conversion, and staged then promoted, so a failure leaves the current
+/// generation exactly as it was.
+async fn re_encode(state: &AppState, id: &AssetId) -> Result<RenditionRefreshResponse, ApiError> {
+    let _permit = state
+        .conversion_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(ApiError::internal)?;
+    let asset = load_asset(state, id, Some(Kind::Image)).await?;
+    if asset.asset.state() != AssetState::Active {
+        return Err(ApiError::conflict(
+            "asset_retired",
+            "The asset is in the trash; restore it before re-encoding it.",
+        ));
+    }
+
+    let staging = fresh_staging_dir(state, id).await?;
+    let result = re_encode_staged(state, &asset, &staging).await;
+    // Startup sweeps staging too, but there is no reason to leave it behind.
+    let _ = fs::remove_dir_all(&staging).await;
+    let added = result?;
+
+    let asset = load_asset(state, id, Some(Kind::Image)).await?;
+    Ok(refresh_response(state, &asset, added))
+}
+
+/// The conversion and the promotion of a re-encode, answering with the
+/// profiles the previous generation did not have.
+async fn re_encode_staged(
+    state: &AppState,
+    asset: &StoredAsset,
+    staging: &std::path::Path,
+) -> Result<Vec<u32>, ApiError> {
+    let id = &asset.asset.id;
+    let source_format = asset.asset.source_format;
+    let original = state
+        .asset_dir(id)
+        .join(format!("original.{}", source_format.extension()));
+    let generation = asset.asset.generation + 1;
+
+    let mut profiles: Vec<u32> = asset
+        .renditions
+        .iter()
+        .map(|rendition| rendition.max_width)
+        .chain(state.config.variant_widths.iter().copied())
+        .collect();
+    profiles.sort_unstable();
+    profiles.dedup();
+
+    let (dimensions, mut generated) =
+        tokio::time::timeout(state.config.image_processing_timeout, async {
+            let dimensions = state
+                .image_processor
+                .inspect(&original, source_format, staging)
+                .await?;
+            let generated = state
+                .image_processor
+                .generate(&original, source_format, dimensions, &profiles, staging)
+                .await?;
+            Ok::<_, MediaError>((dimensions, generated))
+        })
+        .await
+        .map_err(|_| ApiError::invalid("Image processing exceeded its time limit."))?
+        .map_err(map_media_error)?;
+    name_for_generation(staging, &mut generated, generation)
+        .await
+        .map_err(ApiError::internal)?;
+
+    // One row per profile, as the repair writes them: a profile that shares
+    // its actual width with a narrower one points at that one's files.
+    let mut rows = Vec::new();
+    for (profile, actual) in implied_widths(&profiles, dimensions.width) {
+        for record in generated.iter().filter(|record| record.width == actual) {
+            let mut row = record.clone();
+            row.max_width = profile;
+            rows.push(row);
+        }
+    }
+
+    // The names carry the new generation, so nothing that is published is
+    // overwritten, and taking the files back out on a failure touches only
+    // what this run put there.
+    let asset_dir = state.asset_dir(id);
+    let mut promoted = Vec::with_capacity(generated.len());
+    let mut outcome = Ok(());
+    for record in &generated {
+        let to = asset_dir.join(&record.file_name);
+        if let Err(error) = fs::rename(staging.join(&record.file_name), &to).await {
+            outcome = Err(ApiError::internal(error));
+            break;
+        }
+        promoted.push(&record.file_name);
+    }
+    if outcome.is_ok() {
+        outcome = match state
+            .store
+            .supersede_renditions(id, asset.asset.generation, &rows)
+            .await
+        {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(ApiError::conflict(
+                "asset_changed",
+                "The asset changed while it was being re-encoded; nothing was replaced.",
+            )),
+            Err(error) => Err(ApiError::internal(error)),
+        };
+    }
+    if let Err(error) = outcome {
+        // A delete does not wait for the conversion slot, so the directory
+        // may have moved to the trash since the files went in. They are
+        // taken out of wherever it is now; nothing else has these names.
+        for name in promoted {
+            let _ = fs::remove_file(asset_dir.join(name)).await;
+            let _ = fs::remove_file(state.trash_dir(id).join(name)).await;
+        }
+        return Err(error);
+    }
+
+    let previous: Vec<u32> = asset
+        .renditions
+        .iter()
+        .map(|rendition| rendition.max_width)
+        .collect();
+    Ok(profiles
+        .into_iter()
+        .filter(|profile| !previous.contains(profile))
+        .collect())
+}
+
+/// The body of `POST /api/v1/images/{id}/renditions`. An empty body is the
+/// repair that adds the missing widths.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RenditionsRequest {
+    /// Re-encode every rendition from the original, as a new generation.
+    #[serde(default)]
+    re_encode: bool,
+}
+
+/// An optional JSON body: an absent, empty or `null` one is the default
+/// request.
+///
+/// Unknown fields are refused by the request types, so a misspelt option is
+/// a `400` rather than the other mode quietly running instead.
+fn optional_json<T: serde::de::DeserializeOwned + Default>(body: &[u8]) -> Result<T, ApiError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    serde_json::from_slice::<Option<T>>(body)
+        .map(Option::unwrap_or_default)
+        .map_err(|error| {
+            ApiError::bad_request(
+                "invalid_request_body",
+                format!("The request body is not valid for this operation: {error}"),
+            )
+        })
+}
+
+/// How many images one re-render call re-encodes, by default and at most.
+///
+/// Each one is a full conversion, run one after another inside the request,
+/// so a page holds the request open for `limit` conversions. A conversion is
+/// usually seconds, but only `image_processing_timeout` bounds it: the worst
+/// case is the default page at 10 times that, and the maximum page at 100
+/// times. A caller behind a proxy sizes `limit` to the proxy's read timeout
+/// and walks the whole collection by passing `next` back as `after`.
+const DEFAULT_RE_RENDER_LIMIT: i64 = 10;
+const MAX_RE_RENDER_LIMIT: i64 = 100;
+
+/// Re-encode every live image, a page at a time.
+///
+/// An encoder change is not one asset, it is every asset: a newer
+/// ImageMagick, a newer libjxl, a corrected flag. Each image is re-encoded on
+/// its own, taking the conversion slot for that image only, so an upload
+/// waits for one conversion rather than for the whole collection. A page
+/// answers with how many it re-encoded, which ones failed and why, and how
+/// many are left after it; there is no job queue, so the caller drives the
+/// walk and sees the progress.
+pub(super) async fn re_render_images(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ReRenderResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let request: ReRenderRequest = optional_json(&body)?;
+    let limit = request
+        .limit
+        .unwrap_or(DEFAULT_RE_RENDER_LIMIT)
+        .clamp(1, MAX_RE_RENDER_LIMIT);
+    let after = request
+        .after
+        .as_deref()
+        .map(|value| {
+            AssetId::parse(value).map_err(|_| {
+                ApiError::bad_request("invalid_cursor", "after must be an asset id from next.")
+            })
+        })
+        .transpose()?;
+
+    let (ids, remaining) = state
+        .store
+        .live_images_after(after.as_ref(), limit)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let mut re_encoded = Vec::with_capacity(ids.len());
+    let mut failures = Vec::new();
+    for id in &ids {
+        match re_encode(&state, id).await {
+            Ok(refreshed) => {
+                tracing::info!(asset = %id, generation = refreshed.generation, "re-encoded an image");
+                re_encoded.push(ReEncodedImage {
+                    id: id.to_string(),
+                    generation: refreshed.generation,
+                });
+            }
+            Err(error) => {
+                tracing::error!(asset = %id, error = error.detail(), "could not re-encode an image");
+                failures.push(ActionResult {
+                    id: id.to_string(),
+                    status: "error",
+                    error: Some(error.detail().to_owned()),
+                });
+            }
+        }
+    }
+    tracing::info!(
+        count = re_encoded.len(),
+        failed = failures.len(),
+        remaining,
+        "re-render page done"
+    );
+
+    Ok(Json(ReRenderResponse {
+        count: re_encoded.len(),
+        re_encoded,
+        failures,
+        next: (remaining > 0)
+            .then(|| ids.last().map(AssetId::to_string))
+            .flatten(),
+        remaining,
     }))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReRenderRequest {
+    limit: Option<i64>,
+    /// The `next` of the previous page; absent to start from the beginning.
+    after: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(super) struct ReEncodedImage {
+    id: String,
+    generation: u32,
+}
+
+#[derive(Serialize)]
+pub(super) struct ReRenderResponse {
+    /// How many images this page re-encoded.
+    count: usize,
+    re_encoded: Vec<ReEncodedImage>,
+    failures: Vec<ActionResult>,
+    /// Where the next page starts; `null` once the walk is done.
+    next: Option<String>,
+    /// Live images after this page, not yet visited by this walk.
+    remaining: i64,
 }
 
 /// The widths a configuration implies, and the width each one produces.
@@ -1663,12 +2067,17 @@ fn implied_widths(configured: &[u32], source_width: u32) -> Vec<(u32, u32)> {
 #[derive(Serialize)]
 pub(super) struct RenditionRefreshResponse {
     id: String,
+    /// The generation the renditions are at now.
+    generation: u32,
     /// The widths the instance generates.
     widths: Vec<u32>,
     /// The widths this call added. Empty when the asset already had them all.
     added: Vec<u32>,
     /// The asset's renditions, as they are now.
     renditions: Vec<RenditionResponse>,
+    /// The srcset for the configured widths, so a consumer that stores one
+    /// learns the new URLs from this answer.
+    srcset: SrcsetResponse,
 }
 
 pub(super) async fn list_trash(
@@ -1752,6 +2161,7 @@ pub(super) async fn get_original(
         asset.asset.source_format.mime_type(),
         disposition,
         false,
+        CACHE_POLICY,
     )
     .await
 }
@@ -1773,11 +2183,43 @@ pub(super) async fn get_rendition(
         .as_deref()
         .map(parse_rendition_format)
         .transpose()?;
+    let generation = query.g.as_deref().map(parse_generation).transpose()?;
     if let Some(response) = serve_placeholder_if_retired(&headers, &asset) {
         return Ok(response);
     }
 
-    let (selected, path) = resolve_rendition(&state, &asset, &headers, max_width, requested)?;
+    // A URL that names an older generation is answered from that
+    // generation's rows, which a re-encode kept for exactly this. Those rows
+    // are frozen: an asset only ever gains widths in its current generation.
+    let superseded;
+    let frozen = generation.is_some_and(|generation| generation != asset.asset.generation);
+    let renditions = match generation {
+        Some(generation) if frozen => {
+            superseded = state
+                .store
+                .superseded_renditions(&id, generation)
+                .await
+                .map_err(ApiError::internal)?;
+            if superseded.is_empty() {
+                return Err(ApiError::generation_not_found(
+                    generation,
+                    asset.asset.generation,
+                ));
+            }
+            &superseded
+        }
+        _ => &asset.renditions,
+    };
+
+    let (selected, path, settled) = resolve_rendition(
+        &state,
+        &asset.asset.id,
+        renditions,
+        asset.asset.width,
+        &headers,
+        max_width,
+        requested,
+    )?;
     serve_file(
         &headers,
         &path,
@@ -1790,6 +2232,15 @@ pub(super) async fn get_rendition(
         // is, so one copy per URL is enough and the response does not vary by
         // the `Accept` header.
         requested.is_none(),
+        // The bytes of a generation never change; the bare URL follows
+        // whichever generation is current, and so does a profile the current
+        // generation is missing, which it may still gain. A superseded
+        // generation gains nothing, so even its fallback is final.
+        if generation.is_some() && (settled || frozen) {
+            CACHE_POLICY
+        } else {
+            LATEST_CACHE_POLICY
+        },
     )
     .await
 }
@@ -1800,6 +2251,18 @@ pub(super) struct RenditionQuery {
     /// The format the caller wants, named the way Atlas names it in a
     /// response: `jxl`, `avif`, `webp`, `jpeg`, `png`.
     format: Option<String>,
+    /// The generation the URL was handed out for. Absent means the current
+    /// one, whichever that is.
+    g: Option<String>,
+}
+
+/// A generation a caller may name: a positive integer.
+fn parse_generation(value: &str) -> Result<u32, ApiError> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| ApiError::bad_request("invalid_generation", "g must be a positive integer."))
 }
 
 /// A format name a caller may ask for.
@@ -1829,31 +2292,33 @@ fn parse_rendition_format(value: &str) -> Result<RenditionFormat, ApiError> {
 /// says: the header is for a browser that cannot choose for itself, and a
 /// crawler fetching an image for a marketplace needs a format the marketplace
 /// accepts, not the newest one the server has.
+///
+/// Also answers whether the choice is final; see [`is_settled`].
 fn resolve_rendition<'a>(
     state: &AppState,
-    asset: &'a StoredAsset,
+    id: &AssetId,
+    renditions: &'a [RenditionRecord],
+    source_width: Option<u32>,
     headers: &HeaderMap,
     max_width: u32,
     requested: Option<RenditionFormat>,
-) -> Result<(&'a RenditionRecord, std::path::PathBuf), ApiError> {
+) -> Result<(&'a RenditionRecord, std::path::PathBuf, bool), ApiError> {
+    let exact: Vec<_> = renditions
+        .iter()
+        .filter(|rendition| rendition.max_width == max_width)
+        .collect();
+    let is_exact = !exact.is_empty();
     let group: Vec<&RenditionRecord> = {
-        let exact: Vec<_> = asset
-            .renditions
-            .iter()
-            .filter(|rendition| rendition.max_width == max_width)
-            .collect();
-        if !exact.is_empty() {
+        if is_exact {
             exact
         } else {
-            let widest = asset
-                .renditions
+            let widest = renditions
                 .iter()
                 .filter(|rendition| rendition.width <= max_width)
                 .map(|rendition| rendition.width)
                 .max();
             let Some(widest) = widest else {
-                let mut available: Vec<u32> = asset
-                    .renditions
+                let mut available: Vec<u32> = renditions
                     .iter()
                     .map(|rendition| rendition.max_width)
                     .collect();
@@ -1863,8 +2328,7 @@ fn resolve_rendition<'a>(
             };
             // Every stored representation of that one width, so format
             // negotiation still chooses between them.
-            asset
-                .renditions
+            renditions
                 .iter()
                 .filter(|rendition| rendition.width == widest)
                 .collect()
@@ -1879,8 +2343,19 @@ fn resolve_rendition<'a>(
             .ok_or_else(|| ApiError::format_not_found(format, &group))?,
         None => select_format(headers, &group).ok_or_else(ApiError::not_acceptable)?,
     };
-    let path = state.asset_dir(&asset.asset.id).join(&selected.file_name);
-    Ok((selected, path))
+    let path = state.asset_dir(id).join(&selected.file_name);
+    let settled = is_settled(max_width, selected.width, is_exact, source_width);
+    Ok((selected, path, settled))
+}
+
+/// Whether what a profile resolves to is final within its generation.
+///
+/// A profile with its own rows is. One that falls back to a narrower
+/// rendition is final only when that rendition is what the profile would
+/// produce anyway, because the source is no wider: otherwise adding the
+/// profile later puts different bytes behind the same URL.
+fn is_settled(profile: u32, served_width: u32, exact: bool, source_width: Option<u32>) -> bool {
+    exact || source_width.is_some_and(|source| served_width == profile.min(source))
 }
 
 /// How a file is presented when it is served.
@@ -2149,13 +2624,14 @@ async fn serve_file(
     mime_type: &str,
     disposition: &str,
     vary_accept: bool,
+    cache_policy: &'static str,
 ) -> Result<Response, ApiError> {
     let etag = format!("\"{sha256}\"");
     if etag_matches(request_headers, &etag) {
         let mut response = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(ETAG, etag)
-            .header(CACHE_CONTROL, CACHE_POLICY)
+            .header(CACHE_CONTROL, cache_policy)
             .body(Body::empty())
             .map_err(ApiError::internal)?;
         if vary_accept {
@@ -2177,7 +2653,7 @@ async fn serve_file(
         match range_header {
             Some(value) => match parse_range(value, expected_size) {
                 Ok(range) => range,
-                Err(()) => return range_not_satisfiable(expected_size, vary_accept),
+                Err(()) => return range_not_satisfiable(expected_size, vary_accept, cache_policy),
             },
             None => None,
         }
@@ -2233,7 +2709,7 @@ async fn serve_file(
         .header(CONTENT_LENGTH, content_length.to_string())
         .header(CONTENT_DISPOSITION, content_disposition)
         .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(CACHE_CONTROL, CACHE_POLICY)
+        .header(CACHE_CONTROL, cache_policy)
         .header(ETAG, etag)
         .header(ACCEPT_RANGES, "bytes");
     if let Some(range) = range {
@@ -2248,11 +2724,15 @@ async fn serve_file(
     builder.body(body).map_err(ApiError::internal)
 }
 
-fn range_not_satisfiable(size: u64, vary_accept: bool) -> Result<Response, ApiError> {
+fn range_not_satisfiable(
+    size: u64,
+    vary_accept: bool,
+    cache_policy: &'static str,
+) -> Result<Response, ApiError> {
     let mut builder = Response::builder()
         .status(StatusCode::RANGE_NOT_SATISFIABLE)
         .header(CONTENT_RANGE, format!("bytes */{size}"))
-        .header(CACHE_CONTROL, CACHE_POLICY);
+        .header(CACHE_CONTROL, cache_policy);
     if vary_accept {
         builder = builder.header(VARY, "Accept");
     }
@@ -4314,12 +4794,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body["src"],
-            format!("/media/{small_id}/w640"),
+            format!("/media/{small_id}/w640?g=1"),
             "the fallback src is the widest requested width that exists"
         );
         assert_eq!(
             body["srcset"],
-            format!("/media/{small_id}/w320 320w, /media/{small_id}/w640 500w"),
+            format!("/media/{small_id}/w320?g=1 320w, /media/{small_id}/w640?g=1 500w"),
             "descriptors are the widths that were actually produced"
         );
 
@@ -4577,7 +5057,7 @@ mod tests {
         let candidates = srcset["srcset"].as_str().unwrap();
         assert!(candidates.contains(" 200w"), "{candidates}");
         assert!(
-            candidates.contains(&format!("/media/{id}/w800 300w")),
+            candidates.contains(&format!("/media/{id}/w800?g=1 300w")),
             "{candidates}"
         );
         assert_eq!(candidates.matches("300w").count(), 1, "{candidates}");
@@ -4601,6 +5081,468 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/v1/images/{id}/renditions"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn re_encode_request(id: &str) -> Request<Body> {
+        json_request(
+            "POST",
+            &format!("/api/v1/images/{id}/renditions"),
+            &json!({"re_encode": true}),
+        )
+    }
+
+    /// A re-encode writes a new generation beside the old one.
+    ///
+    /// The case it exists for is an encoding that turned out to be bad, so
+    /// the test plants one: the first generation's PNG is swapped for a
+    /// different picture before the re-encode. The URL that names the first
+    /// generation keeps serving it, the new URLs serve the fresh encoding, and
+    /// the asset is the same asset throughout.
+    #[tokio::test]
+    async fn a_re_encode_writes_a_new_generation_and_keeps_the_old_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_test_image(&directory.path().join("source.png"), "640x480");
+        let data_dir = directory.path().join("atlas");
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![320];
+        let state = AppState::new(config).await.unwrap();
+        let router = app(state.clone());
+
+        let (status, uploaded) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = uploaded["id"].as_str().unwrap().to_owned();
+        assert_eq!(uploaded["generation"], 1);
+        assert_eq!(
+            uploaded["renditions"][0]["url"],
+            format!("/media/{id}/w320?g=1"),
+            "the URLs the API hands out name their generation"
+        );
+
+        // The bad encoding: a blue picture where the red one should be.
+        let asset_dir = data_dir.join("assets").join(&id);
+        let planted = write_test_image_blue(&directory.path().join("blue.png"));
+        std::fs::write(asset_dir.join("w320.png"), &planted).unwrap();
+        state
+            .store
+            .replace_rendition_bytes(
+                &AssetId::parse(&id).unwrap(),
+                "w320.png",
+                planted.len() as u64,
+                &crate::media::sha256_bytes(&planted),
+            )
+            .await;
+
+        let (status, refreshed) = send(&router, re_encode_request(&id)).await;
+        assert_eq!(status, StatusCode::OK, "{refreshed}");
+        assert_eq!(refreshed["id"], id.as_str());
+        assert_eq!(refreshed["generation"], 2);
+        assert_eq!(refreshed["added"], json!([]));
+        assert_eq!(
+            refreshed["renditions"][0]["url"],
+            format!("/media/{id}/w320?g=2")
+        );
+        assert_eq!(refreshed["srcset"]["generation"], 2);
+        assert_eq!(
+            refreshed["srcset"]["srcset"],
+            format!("/media/{id}/w320?g=2 320w"),
+            "the answer carries the srcset a consumer stores"
+        );
+
+        // The URL that was handed out keeps its bytes, and stays immutable.
+        let (status, headers, first) =
+            fetch(&router, &format!("/media/{id}/w320?g=1&format=png")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first, planted, "the bytes behind a generation never change");
+        assert_eq!(
+            headers["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+
+        let (status, headers, second) =
+            fetch(&router, &format!("/media/{id}/w320?g=2&format=png")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(second, planted, "the new generation is a fresh encoding");
+        assert_eq!(
+            headers["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+
+        // The bare URL follows the current generation, and says so in its
+        // cache policy.
+        let (status, headers, latest) =
+            fetch(&router, &format!("/media/{id}/w320?format=png")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(latest, second);
+        assert_eq!(headers["cache-control"], "public, max-age=3600");
+
+        // Negotiation works inside an old generation as it does in the new.
+        let (status, headers, _) = fetch_with(
+            &router,
+            &format!("/media/{id}/w320?g=1"),
+            Some("image/webp"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "image/webp");
+        assert_eq!(headers["vary"], "Accept");
+
+        // The asset, the srcset and the files say the same thing.
+        let (_, asset) = send(&router, authorized("GET", &format!("/api/v1/images/{id}"))).await;
+        assert_eq!(asset["id"], id.as_str());
+        assert_eq!(asset["generation"], 2);
+        let (_, srcset) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/images/{id}/srcset")),
+        )
+        .await;
+        assert_eq!(srcset["src"], format!("/media/{id}/w320?g=2"));
+        assert_eq!(srcset["generation"], 2);
+        assert!(asset_dir.join("w320.png").exists());
+        assert!(asset_dir.join("w320-g2.png").exists());
+        assert!(asset_dir.join("w320-g2.jxl").exists());
+
+        // A generation the asset never had is not quietly the current one.
+        let (status, error) = fetch_error(&router, &format!("/media/{id}/w320?g=3")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error["error"]["code"], "generation_not_found");
+        for bad in ["0", "two", "-1"] {
+            let (status, error) = fetch_error(&router, &format!("/media/{id}/w320?g={bad}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "g={bad}");
+            assert_eq!(error["error"]["code"], "invalid_generation");
+        }
+
+        // A width added after the re-encode belongs to the new generation and
+        // does not take an old file's name.
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![200, 320];
+        let router = app(AppState::new(config).await.unwrap());
+        let (status, refreshed) = send(
+            &router,
+            authorized("POST", &format!("/api/v1/images/{id}/renditions")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(refreshed["generation"], 2);
+        assert_eq!(refreshed["added"], json!([200]));
+        assert!(asset_dir.join("w200-g2.png").exists());
+        assert!(!asset_dir.join("w200.png").exists());
+        let (status, _, _) = fetch(&router, &format!("/media/{id}/w200?g=2")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A URL that names a generation keeps its bytes even when the asset
+    /// gains a width.
+    ///
+    /// A profile the asset is missing falls back to a narrower rendition,
+    /// and adding the profile later puts different bytes behind it. So the
+    /// srcset never hands out such a URL, and serving one is not immutable.
+    /// A profile that falls back because the photo is smaller than it is
+    /// final already, and stays immutable.
+    #[tokio::test]
+    async fn a_generation_url_cannot_change_when_a_width_is_added() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
+        let large = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("large.png"), "1400x900"),
+        )
+        .await;
+        let small = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("small.png"), "300x200"),
+        )
+        .await;
+
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![320, 640, 1280];
+        let router = app(AppState::new(config).await.unwrap());
+
+        let (_, srcset) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/images/{large}/srcset")),
+        )
+        .await;
+        assert_eq!(srcset["src"], format!("/media/{large}/w640?g=1"));
+        assert_eq!(
+            srcset["srcset"],
+            format!("/media/{large}/w320?g=1 320w, /media/{large}/w640?g=1 640w"),
+            "a profile the asset does not have yet is not handed out"
+        );
+        let (status, headers, _) = fetch(&router, &format!("/media/{large}/w1280?g=1")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "public, max-age=3600");
+        let (_, headers, _) = fetch(&router, &format!("/media/{large}/w640?g=1")).await;
+        assert_eq!(
+            headers["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        let etag = headers["etag"].clone();
+
+        // The small photo has nothing wider to give, so its widest profile is
+        // final and can be handed out.
+        let (_, srcset) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/images/{small}/srcset")),
+        )
+        .await;
+        assert_eq!(srcset["srcset"], format!("/media/{small}/w1280?g=1 300w"));
+        let (_, headers, _) = fetch(&router, &format!("/media/{small}/w1280?g=1")).await;
+        assert_eq!(
+            headers["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+
+        let (status, refreshed) = send(
+            &router,
+            authorized("POST", &format!("/api/v1/images/{large}/renditions")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(refreshed["added"], json!([1280]));
+        assert_eq!(
+            refreshed["srcset"]["src"],
+            format!("/media/{large}/w1280?g=1")
+        );
+        let (_, headers, _) = fetch(&router, &format!("/media/{large}/w1280?g=1")).await;
+        assert_eq!(
+            headers["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        let (_, headers, _) = fetch(&router, &format!("/media/{large}/w640?g=1")).await;
+        assert_eq!(headers["etag"], etag, "the URL handed out kept its bytes");
+    }
+
+    /// A superseded generation can no longer gain a width, so a profile it
+    /// falls back on is final and is cached like the rest of it.
+    #[tokio::test]
+    async fn a_superseded_generation_fallback_is_immutable() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
+        let id = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("large.png"), "1400x900"),
+        )
+        .await;
+
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![320, 640, 1280];
+        let router = app(AppState::new(config).await.unwrap());
+        let (_, headers, before) = fetch(&router, &format!("/media/{id}/w1280?g=1")).await;
+        assert_eq!(headers["cache-control"], "public, max-age=3600");
+
+        let (status, refreshed) = send(&router, re_encode_request(&id)).await;
+        assert_eq!(status, StatusCode::OK, "{refreshed}");
+        assert_eq!(refreshed["generation"], 2);
+
+        let (status, headers, after) = fetch(&router, &format!("/media/{id}/w1280?g=1")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(after, before, "generation 1 still falls back to its 640");
+        assert_eq!(
+            headers["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    fn write_test_image_blue(path: &std::path::Path) -> Vec<u8> {
+        let generated = Command::new("magick")
+            .args(["-size", "320x240", "xc:blue"])
+            .arg(format!("PNG:{}", path.display()))
+            .output()
+            .unwrap();
+        assert!(generated.status.success());
+        std::fs::read(path).unwrap()
+    }
+
+    /// A re-encode that cannot start leaves the asset where it was.
+    #[tokio::test]
+    async fn a_re_encode_is_refused_rather_than_guessed_at() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_test_image(&directory.path().join("source.png"), "640x480");
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        let (status, uploaded) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = uploaded["id"].as_str().unwrap().to_owned();
+
+        // A misspelt option is an error, not the other mode running instead.
+        let (status, error) = send(
+            &router,
+            json_request(
+                "POST",
+                &format!("/api/v1/images/{id}/renditions"),
+                &json!({"reencode": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "invalid_request_body");
+
+        // An explicit `false` is the repair, as an empty or `null` body is.
+        for body in [json!({"re_encode": false}), json!({}), json!(null)] {
+            let (status, refreshed) = send(
+                &router,
+                json_request("POST", &format!("/api/v1/images/{id}/renditions"), &body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(refreshed["generation"], 1, "{body}");
+        }
+
+        // A trashed image has no bytes to re-encode.
+        place_in_trash(&router, "images", &id).await;
+        let (status, error) = send(&router, re_encode_request(&id)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error["error"]["code"], "asset_retired");
+
+        // A document has no renditions, so there is no such image.
+        let document = upload_document(&router, b"%PDF-1.7\nno renditions").await;
+        let (status, _) = send(&router, re_encode_request(&document)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The re-encode meets the same fidelity floors as the upload.
+    ///
+    /// It runs the same encoder settings, but it reaches them by its own
+    /// path, and a path that passed different widths or a different source
+    /// would pass every other test here while making the pictures worse.
+    #[tokio::test]
+    async fn a_re_encode_stays_close_to_the_source() {
+        use crate::media::tests::{
+            FIDELITY_WIDTH, REFERENCE_IMAGE, assert_renditions_are_faithful,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let mut config = test_config(data_dir.clone());
+        config.variant_widths = vec![FIDELITY_WIDTH];
+        let state = AppState::new(config).await.unwrap();
+        let router = app(state.clone());
+
+        let (status, uploaded) = send(
+            &router,
+            upload_request("image/jpeg", std::fs::read(REFERENCE_IMAGE).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = AssetId::parse(uploaded["id"].as_str().unwrap()).unwrap();
+        let (status, _) = send(&router, re_encode_request(id.as_str())).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let stored = state.store.get_asset(&id).await.unwrap().unwrap();
+        assert_eq!(stored.asset.generation, 2);
+        assert_eq!(stored.renditions.len(), 4, "every format is re-encoded");
+        assert!(
+            stored
+                .renditions
+                .iter()
+                .all(|rendition| rendition.file_name.contains("-g2.")),
+            "the current rows point at the new generation's files"
+        );
+        let scratch = directory.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        assert_renditions_are_faithful(
+            &state.image_processor,
+            std::path::Path::new(REFERENCE_IMAGE),
+            &stored.renditions,
+            &state.asset_dir(&id),
+            &scratch,
+        )
+        .await;
+    }
+
+    /// Every live image, re-encoded a page at a time, with the progress in
+    /// each answer.
+    #[tokio::test]
+    async fn re_render_walks_every_live_image_a_page_at_a_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let router = app(state.clone());
+
+        let mut live = Vec::new();
+        for size in ["400x300", "500x300"] {
+            let image = write_test_image(&directory.path().join(format!("{size}.png")), size);
+            live.push(upload_image(&router, &image).await);
+        }
+        let trashed = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("trashed.png"), "600x300"),
+        )
+        .await;
+        place_in_trash(&router, "images", &trashed).await;
+        upload_document(&router, b"%PDF-1.7\nnot an image").await;
+        live.sort();
+
+        let (status, page) = send(
+            &router,
+            json_request("POST", "/api/v1/images/re-render", &json!({"limit": 1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["count"], 1);
+        assert_eq!(
+            page["re_encoded"],
+            json!([{"id": live[0], "generation": 2}])
+        );
+        assert_eq!(page["failures"], json!([]));
+        assert_eq!(page["remaining"], 1);
+        assert_eq!(page["next"], live[0].as_str());
+
+        let (status, page) = send(
+            &router,
+            json_request(
+                "POST",
+                "/api/v1/images/re-render",
+                &json!({"limit": 1, "after": live[0]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["count"], 1);
+        assert_eq!(page["re_encoded"][0]["id"], live[1].as_str());
+        assert_eq!(page["remaining"], 0);
+        assert!(page["next"].is_null(), "the walk is done");
+
+        for id in &live {
+            let (_, asset) = send(&router, authorized("GET", &asset_uri("images", id))).await;
+            assert_eq!(asset["generation"], 2, "{id}");
+        }
+        let (_, asset) = send(&router, authorized("GET", &asset_uri("images", &trashed))).await;
+        assert_eq!(asset["generation"], 1, "the trash is not re-encoded");
+
+        // An empty body starts from the beginning with the default page.
+        let (status, page) = send(&router, authorized("POST", "/api/v1/images/re-render")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["count"], 2);
+
+        let (status, error) = send(
+            &router,
+            json_request(
+                "POST",
+                "/api/v1/images/re-render",
+                &json!({"after": "../x"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "invalid_cursor");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/images/re-render")
                     .body(Body::empty())
                     .unwrap(),
             )

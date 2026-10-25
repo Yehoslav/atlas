@@ -60,9 +60,10 @@ documentation, with one Atlas-specific hazard:
   Inside one it is a silent no-op.
 - The pragma applies to a single connection. With a connection pool, acquire one
   connection and run the whole rebuild on it.
-- `DROP TABLE assets` fires `ON DELETE CASCADE` on `renditions`. With
-  enforcement left on, the rebuild completes, the parent table comes back, and
-  the database looks perfectly self-consistent while every rendition is gone.
+- `DROP TABLE assets` fires `ON DELETE CASCADE` on `renditions` and
+  `superseded_renditions`. With enforcement left on, the rebuild completes,
+  the parent table comes back, and the database looks perfectly
+  self-consistent while every rendition is gone.
   `PRAGMA foreign_key_check` finds nothing to complain about, because the
   cascade deleted the orphan instead of leaving it.
 - Run `PRAGMA foreign_key_check` after the rebuild and roll back if it reports

@@ -127,6 +127,13 @@ Placed at `examples/family-album/`.
       without changing the asset ID or replacing bytes behind an existing URL.
       Profiles that resolve to the same actual width share the stored file;
       the additional profile rows point at it rather than re-encoding over it.
+- [x] **Correct a bad encoding without a new asset id.** Rendition URLs
+      carry a generation (`?g=2`); `{"re_encode": true}` on the renditions
+      operation writes the next generation from the original beside the old
+      files, and `POST /api/v1/images/re-render` does it for every live image
+      a page at a time. A generation URL is immutable; the bare URL follows
+      the current generation with a one-hour cache. The re-encode is held to
+      the upload's fidelity floors.
 - [x] **Ship a deployment path.** Include a systemd unit, an ImageMagick
       container image, and a deployment runbook covering the environment file,
       persistent storage, proxy, health check and upgrade order. Build the
@@ -164,6 +171,17 @@ Placed at `examples/family-album/`.
       sequence-branded file is refused, and say in the README and the plan
       that a sequence is a `415` now. It turns a `201` into a `415`, so it
       wants a decision of its own rather than riding along with a fix.
+
+### Rendition generations
+
+- [ ] **Let a re-render skip what the current encoder already made.** A
+      generation does not record what produced it, so a walk restarted from
+      the beginning re-encodes every image again and keeps another copy of
+      its renditions. Store an encoder stamp beside the generation (the
+      ImageMagick and libjxl versions, or a build stamp) and let the walk
+      skip an image whose current generation carries the current stamp. It
+      changes what a walk does and needs a migration, so it wants a decision
+      of its own.
 
 ## Things that got through, and why
 

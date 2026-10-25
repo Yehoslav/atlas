@@ -388,6 +388,171 @@ impl Store {
         Ok(())
     }
 
+    /// Replace an asset's renditions with a new generation of them.
+    ///
+    /// The rows being replaced are kept, under the generation they belonged
+    /// to, because the URLs that name that generation are still out there and
+    /// must keep their bytes. The new files are already in place; this only
+    /// moves the rows, so a crash leaves files nobody points at rather than
+    /// rows whose files are not there.
+    ///
+    /// `None` when the asset is no longer at `generation`: another re-encode
+    /// got there first, and nothing was changed.
+    pub async fn supersede_renditions(
+        &self,
+        asset_id: &AssetId,
+        generation: u32,
+        renditions: &[RenditionRecord],
+    ) -> Result<Option<u32>, StoreError> {
+        let next = generation + 1;
+        let mut transaction = self.pool.begin().await?;
+        let bumped = sqlx::query(
+            "UPDATE assets SET generation = ? WHERE id = ? AND generation = ? AND deleted_at IS NULL",
+        )
+        .bind(i64::from(next))
+        .bind(asset_id.as_str())
+        .bind(i64::from(generation))
+        .execute(&mut *transaction)
+        .await?;
+        if bumped.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        // A row that names its file is copied as it is, so one this build
+        // cannot read, such as a format a newer Atlas wrote, moves with the
+        // rest instead of being dropped while its file stays on disk.
+        sqlx::query(
+            "INSERT INTO superseded_renditions
+                (asset_id, generation, max_width, width, height, format, bytes, sha256, file_name)
+             SELECT asset_id, ?, max_width, width, height, format, bytes, sha256, file_name
+             FROM renditions WHERE asset_id = ? AND file_name IS NOT NULL",
+        )
+        .bind(i64::from(generation))
+        .bind(asset_id.as_str())
+        .execute(&mut *transaction)
+        .await?;
+
+        // A row without one is read through `to_rendition`, so it gets the
+        // same legacy name every reader resolves it to.
+        let legacy = sqlx::query(
+            "SELECT asset_id, max_width, width, height, format, bytes, sha256, file_name
+             FROM renditions WHERE asset_id = ? AND file_name IS NULL",
+        )
+        .bind(asset_id.as_str())
+        .fetch_all(&mut *transaction)
+        .await?;
+        let legacy_rows = legacy.len();
+        let current: Vec<RenditionRecord> = legacy
+            .into_iter()
+            .filter_map(to_rendition)
+            .map(|(_, rendition)| rendition)
+            .collect();
+        if current.len() < legacy_rows {
+            tracing::warn!(asset = %asset_id, dropped = legacy_rows - current.len(), "dropping rendition rows with neither a file name nor a format this build reads");
+        }
+        for rendition in &current {
+            sqlx::query(
+                "INSERT INTO superseded_renditions
+                    (asset_id, generation, max_width, width, height, format, bytes, sha256, file_name)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(asset_id.as_str())
+            .bind(i64::from(generation))
+            .bind(i64::from(rendition.max_width))
+            .bind(i64::from(rendition.width))
+            .bind(i64::from(rendition.height))
+            .bind(rendition.format.key())
+            .bind(i64::try_from(rendition.bytes).unwrap_or(i64::MAX))
+            .bind(&rendition.sha256)
+            .bind(&rendition.file_name)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        sqlx::query("DELETE FROM renditions WHERE asset_id = ?")
+            .bind(asset_id.as_str())
+            .execute(&mut *transaction)
+            .await?;
+        for rendition in renditions {
+            sqlx::query(
+                "INSERT INTO renditions
+                    (asset_id, max_width, width, height, format, bytes, sha256, file_name)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(asset_id.as_str())
+            .bind(i64::from(rendition.max_width))
+            .bind(i64::from(rendition.width))
+            .bind(i64::from(rendition.height))
+            .bind(rendition.format.key())
+            .bind(i64::try_from(rendition.bytes).unwrap_or(i64::MAX))
+            .bind(&rendition.sha256)
+            .bind(&rendition.file_name)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(Some(next))
+    }
+
+    /// The renditions an asset had at a generation it has since moved past.
+    ///
+    /// Empty for a generation the asset never had, and for its current one,
+    /// whose rows are in `renditions`.
+    pub async fn superseded_renditions(
+        &self,
+        asset_id: &AssetId,
+        generation: u32,
+    ) -> Result<Vec<RenditionRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT asset_id, max_width, width, height, format, bytes, sha256, file_name
+             FROM superseded_renditions WHERE asset_id = ? AND generation = ?
+             ORDER BY max_width ASC, format ASC",
+        )
+        .bind(asset_id.as_str())
+        .bind(i64::from(generation))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(to_rendition)
+            .map(|(_, rendition)| rendition)
+            .collect())
+    }
+
+    /// Live images in id order, after `after`, for walking the whole
+    /// collection a page at a time. Also how many live images follow the
+    /// page, so a caller can tell how far along it is.
+    pub async fn live_images_after(
+        &self,
+        after: Option<&AssetId>,
+        limit: i64,
+    ) -> Result<(Vec<AssetId>, i64), StoreError> {
+        let after = after.map(AssetId::as_str).unwrap_or("");
+        let rows = sqlx::query(
+            "SELECT id FROM assets
+             WHERE kind = 'image' AND deleted_at IS NULL AND id > ?
+             ORDER BY id ASC LIMIT ?",
+        )
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let ids: Vec<AssetId> = rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<String, _>("id").ok())
+            .filter_map(|id| AssetId::parse(&id).ok())
+            .collect();
+
+        let last = ids.last().map(AssetId::as_str).unwrap_or(after);
+        let remaining: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM assets WHERE kind = 'image' AND deleted_at IS NULL AND id > ?",
+        )
+        .bind(last)
+        .fetch_one(&self.pool)
+        .await?
+        .try_get(0)?;
+        Ok((ids, remaining))
+    }
+
     /// SQLite extended result codes for a primary-key or unique constraint failure.
     fn is_unique_violation(error: &sqlx::Error) -> bool {
         match error {
@@ -470,7 +635,8 @@ impl Store {
 
         let mut page = QueryBuilder::<Sqlite>::new(
             "SELECT id, source_format, bytes, sha256, width, height, created_at, \
-             original_name, kind, deleted_at, purged_at, pinned, consumer_data FROM assets",
+             original_name, kind, deleted_at, purged_at, pinned, consumer_data, generation \
+             FROM assets",
         );
         push_filters(&mut page, &query);
         page.push(format!(" ORDER BY {ordering} LIMIT "));
@@ -590,13 +756,20 @@ impl Store {
     }
 
     pub async fn get_asset(&self, id: &AssetId) -> Result<Option<StoredAsset>, StoreError> {
+        // One read transaction, so the asset and its renditions come from the
+        // same snapshot. Two autocommit reads would let a re-encode commit
+        // between them, pairing one generation's number with the next one's
+        // rows, and a `?g=` URL would then serve, and cache for a year, bytes
+        // it never named.
+        let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT id, source_format, bytes, sha256, width, height, created_at,
-                    original_name, kind, deleted_at, purged_at, pinned, consumer_data
+                    original_name, kind, deleted_at, purged_at, pinned, consumer_data,
+                    generation
              FROM assets WHERE id = ?",
         )
         .bind(id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await?;
 
         let Some(row) = row else {
@@ -612,8 +785,9 @@ impl Store {
              FROM renditions WHERE asset_id = ? ORDER BY max_width ASC, format ASC",
         )
         .bind(id.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *transaction)
         .await?;
+        transaction.commit().await?;
 
         let renditions = rows
             .into_iter()
@@ -703,6 +877,10 @@ impl Store {
             .bind(id.as_str())
             .execute(&mut *transaction)
             .await?;
+        sqlx::query("DELETE FROM superseded_renditions WHERE asset_id = ?")
+            .bind(id.as_str())
+            .execute(&mut *transaction)
+            .await?;
         let result = sqlx::query("UPDATE assets SET purged_at = ? WHERE id = ?")
             .bind(now)
             .bind(id.as_str())
@@ -734,7 +912,8 @@ impl Store {
     ) -> Result<Vec<StoredAsset>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, source_format, bytes, sha256, width, height, created_at,
-                    original_name, kind, deleted_at, purged_at, pinned, consumer_data
+                    original_name, kind, deleted_at, purged_at, pinned, consumer_data,
+                    generation
              FROM assets WHERE deleted_at IS NOT NULL
              ORDER BY deleted_at DESC, id ASC
              LIMIT ? OFFSET ?",
@@ -772,6 +951,32 @@ impl Store {
             .execute(&self.pool)
             .await
             .expect("the asset row exists");
+    }
+
+    /// Record different bytes for one rendition file, so a test can stand in
+    /// for an encoding that turned out to be bad.
+    #[cfg(test)]
+    pub(crate) async fn replace_rendition_bytes(
+        &self,
+        id: &AssetId,
+        file_name: &str,
+        bytes: u64,
+        sha256: &str,
+    ) {
+        let result = sqlx::query(
+            "UPDATE renditions SET bytes = ?, sha256 = ? WHERE asset_id = ? AND file_name = ?",
+        )
+        .bind(i64::try_from(bytes).unwrap())
+        .bind(sha256)
+        .bind(id.as_str())
+        .bind(file_name)
+        .execute(&self.pool)
+        .await
+        .expect("the rendition row can be updated");
+        assert!(
+            result.rows_affected() > 0,
+            "no rendition is stored as {file_name}"
+        );
     }
 }
 
@@ -825,6 +1030,7 @@ fn asset_from_row(
         purged_at: row.try_get("purged_at")?,
         pinned: row.try_get::<bool, _>("pinned")?,
         consumer_data: row.try_get("consumer_data")?,
+        generation: u32::try_from(row.try_get::<i64, _>("generation")?).unwrap_or(1),
     }))
 }
 
@@ -911,6 +1117,7 @@ mod tests {
             purged_at: None,
             pinned: false,
             consumer_data: None,
+            generation: 1,
         }
     }
 
@@ -1028,7 +1235,8 @@ mod tests {
                 purged_at INTEGER,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 note TEXT,
-                consumer_data TEXT
+                consumer_data TEXT,
+                generation INTEGER NOT NULL DEFAULT 1
             )",
         )
         .execute(&mut *transaction)
@@ -1037,10 +1245,10 @@ mod tests {
         sqlx::query(
             "INSERT INTO assets_new (id, source_format, bytes, sha256, width, height,
                                      created_at, original_name, kind, deleted_at, purged_at, pinned,
-                                     consumer_data)
+                                     consumer_data, generation)
              SELECT id, source_format, bytes, sha256, width, height,
                     created_at, original_name, kind, deleted_at, purged_at, pinned,
-                    consumer_data
+                    consumer_data, generation
              FROM assets",
         )
         .execute(&mut *transaction)
@@ -1072,6 +1280,11 @@ mod tests {
     async fn guarded_table_rebuild_keeps_child_rows() {
         let directory = tempfile::tempdir().unwrap();
         let (store, id) = store_with_asset(directory.path()).await;
+        // Superseded renditions hang off `assets` the same way.
+        store
+            .supersede_renditions(&id, 1, &[rendition()])
+            .await
+            .unwrap();
         rebuild_assets_with_note_column(&store, true).await;
 
         assert!(store.foreign_key_violations().await.unwrap().is_empty());
@@ -1080,6 +1293,11 @@ mod tests {
             stored.renditions.len(),
             1,
             "renditions survived the rebuild"
+        );
+        assert_eq!(
+            store.superseded_renditions(&id, 1).await.unwrap().len(),
+            1,
+            "superseded renditions survived the rebuild"
         );
         assert_eq!(stored.asset.sha256, "abc123");
     }
@@ -1201,6 +1419,51 @@ mod tests {
             stored.renditions[0].file_name, "w320.jpg",
             "a row the backfill missed keeps the legacy name instead of vanishing"
         );
+
+        store
+            .supersede_renditions(&id, 1, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.superseded_renditions(&id, 1).await.unwrap()[0].file_name,
+            "w320.jpg",
+            "a superseded row keeps the name it was served under"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseding_keeps_a_row_this_build_cannot_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, id) = store_with_asset(directory.path()).await;
+        sqlx::query(
+            "INSERT INTO renditions
+                (asset_id, max_width, width, height, format, bytes, sha256, file_name)
+             VALUES (?, 320, 320, 240, 'jxl2', 7, 'abc', 'w320.jxl2')",
+        )
+        .bind(id.as_str())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        store
+            .supersede_renditions(&id, 1, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        let formats: Vec<String> = sqlx::query_scalar(
+            "SELECT format FROM superseded_renditions
+             WHERE asset_id = ? AND generation = 1 ORDER BY format",
+        )
+        .bind(id.as_str())
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            formats,
+            ["jpeg", "jxl2"],
+            "a format a newer Atlas wrote moves with the rest instead of vanishing"
+        );
     }
 
     #[tokio::test]
@@ -1219,5 +1482,95 @@ mod tests {
         assert_eq!(trashed[0].asset.id, purged, "newest deletion first");
         assert_eq!(trashed[0].asset.state(), AssetState::Purged);
         assert_eq!(trashed[1].asset.id, deleted);
+    }
+
+    /// A re-encode moves the current rows aside under their generation, so
+    /// the URLs that name it keep resolving to the same files.
+    #[tokio::test]
+    async fn a_new_generation_keeps_the_rows_it_replaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, id) = store_with_asset(directory.path()).await;
+        let mut next = rendition();
+        next.sha256 = "0a1b2c".to_owned();
+        next.file_name = "w320-g2.jpg".to_owned();
+
+        assert_eq!(
+            store
+                .supersede_renditions(&id, 1, std::slice::from_ref(&next))
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        let stored = store.get_asset(&id).await.unwrap().unwrap();
+        assert_eq!(stored.asset.generation, 2);
+        assert_eq!(stored.renditions.len(), 1);
+        assert_eq!(stored.renditions[0].file_name, "w320-g2.jpg");
+
+        let first = store.superseded_renditions(&id, 1).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].file_name, "w320.jpg");
+        assert_eq!(first[0].sha256, "def456");
+        assert!(
+            store
+                .superseded_renditions(&id, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A re-encode that started from a generation the asset has left
+        // changes nothing.
+        assert_eq!(
+            store
+                .supersede_renditions(&id, 1, std::slice::from_ref(&next))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .get_asset(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .asset
+                .generation,
+            2
+        );
+
+        // A tombstone advertises no generation's bytes.
+        store.mark_deleted(&id, 1_700_000_100).await.unwrap();
+        store.mark_purged(&id, 1_700_000_200).await.unwrap();
+        assert!(
+            store
+                .superseded_renditions(&id, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.foreign_key_violations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_images_are_walked_in_pages_with_a_count_of_what_is_left() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, first) = store_with_asset(directory.path()).await;
+        let mut ids = vec![first];
+        for _ in 0..2 {
+            let id = AssetId::generate(DEFAULT_LENGTH).unwrap();
+            store.insert_asset(&record(&id), &[]).await.unwrap();
+            ids.push(id);
+        }
+        let trashed = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        store.insert_asset(&record(&trashed), &[]).await.unwrap();
+        store.mark_deleted(&trashed, 1_700_000_100).await.unwrap();
+        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+        let (page, remaining) = store.live_images_after(None, 2).await.unwrap();
+        assert_eq!(page, ids[..2]);
+        assert_eq!(remaining, 1);
+        let (page, remaining) = store.live_images_after(Some(&ids[1]), 2).await.unwrap();
+        assert_eq!(page, ids[2..]);
+        assert_eq!(remaining, 0);
     }
 }
