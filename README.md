@@ -980,8 +980,20 @@ service does not start and the log says why. A failed migration rolls back
 that migration; earlier successfully applied migrations remain recorded. The
 service refuses to serve rather than serving from a half-migrated database.
 Fix the cause in the log and start the new version again. Nothing else is
-needed around a successful upgrade: the files are unchanged, the URLs are
-unchanged, and the assets are the same assets.
+needed around a successful upgrade: the files are unchanged, the URLs that were
+handed out keep working, and the assets are the same assets.
+
+The upgrade that introduces [generations](#generations) changes what a
+consumer is given, though not what it already has. Every asset reads as
+generation 1 and its existing URLs keep their bytes, but the rendition URLs in
+responses now carry `?g=1`, and the bare `/media/{id}/w{width}` is cached for
+an hour instead of a year. A consumer should re-read its srcsets after the
+upgrade and store the `?g=` URLs. Until it does, there is one trap: a browser
+or CDN that cached a bare URL before the upgrade holds it under the old
+year-long `immutable` policy, so after a re-encode it keeps serving the bad
+encoding until that copy expires — the very thing the re-encode exists to fix.
+Switch the consumer to the URLs the re-encode answers with, or purge those
+bare URLs from the CDN.
 
 ## Backup and restore
 
