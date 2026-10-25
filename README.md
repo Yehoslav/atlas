@@ -264,7 +264,8 @@ as an attachment instead of being re-encoded into a picture.
   Body `{"limit": 10, "after": "…"}`, both optional (`limit` max 100). The
   answer has the `count` re-encoded, the `re_encoded` ids with their new
   generation, the `failures`, how many images are `remaining`, and `next`, the
-  `after` for the following page, `null` once the walk is done. Trashed images
+  `after` for the following page, `null` once the walk is done. The cursor
+  moves past a failure, so collect the `failures` as you go. Trashed images
   are skipped; re-encode one after restoring it.
 
 Uploads are content-addressed within their collection. If the exact bytes are
@@ -372,7 +373,11 @@ curl -X POST -H "Authorization: Bearer $ATLAS_API_TOKEN" \
 
 After an encoder change — a newer ImageMagick, a corrected flag — every image
 needs it. `POST /api/v1/images/re-render` walks the live images a page per
-call; pass `next` back as `after` until it is `null`.
+call; pass `next` back as `after` until it is `null`. The cursor moves past an
+image that failed, so `null` means every live image was tried, not that every
+one was re-encoded. Keep the `failures` of each page: every entry names its
+image, and once the cause is fixed each one is re-encoded on its own with
+`{"re_encode": true}`.
 
 A re-encode is not free and not idempotent. Every one writes a new copy of
 the asset's renditions and keeps every older copy until the asset is purged,
