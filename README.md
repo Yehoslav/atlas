@@ -899,18 +899,18 @@ The repository's Actions workflow builds and smoke-tests the image on every
 change. After the PR that updates `Cargo.toml` is merged, tag that merged
 commit to publish it to GitHub Container Registry. Use the SemVer version
 from `Cargo.toml` verbatim, including its pre-release label; the workflow
-checks that the tag matches. For the current `0.1.0-alpha.2` crate version:
+checks that the tag matches. For the current `0.1.0-alpha.3` crate version:
 
 ```sh
 jj git fetch --remote origin
-jj tag set 0.1.0-alpha.2 -r master@origin
-jj git push --tag 0.1.0-alpha.2
+jj tag set 0.1.0-alpha.3 -r master@origin
+jj git push --tag 0.1.0-alpha.3
 ```
 
 The server pulls the versioned image rather than compiling the Rust tree:
 
 ```sh
-docker pull ghcr.io/yehoslav/atlas:0.1.0-alpha.2
+docker pull ghcr.io/yehoslav/atlas:0.1.0-alpha.3
 ```
 
 The floating `latest` image tag is updated only by stable SemVer tags; an
@@ -926,9 +926,9 @@ a running service, which is the same mistake as a mutable URL. A server with
 no registry to talk to can carry the image as a file instead:
 
 ```sh
-docker save ghcr.io/yehoslav/atlas:0.1.0-alpha.2 | gzip > atlas-0.1.0-alpha.2.tar.gz
+docker save ghcr.io/yehoslav/atlas:0.1.0-alpha.3 | gzip > atlas-0.1.0-alpha.3.tar.gz
 # on the server
-gunzip -c atlas-0.1.0-alpha.2.tar.gz | docker load
+gunzip -c atlas-0.1.0-alpha.3.tar.gz | docker load
 ```
 
 Copy `contrib/atlas.container.env.example` to `/etc/atlas/atlas.container.env`,
@@ -943,7 +943,7 @@ sudo docker run --detach --name atlas \
     --publish 127.0.0.1:3000:3000 \
     --env-file /etc/atlas/atlas.container.env \
     --volume atlas-data:/var/lib/atlas \
-    ghcr.io/yehoslav/atlas:0.1.0-alpha.2
+    ghcr.io/yehoslav/atlas:0.1.0-alpha.3
 ```
 
 Two details worth knowing. A **named volume** inherits its ownership from the
@@ -987,7 +987,7 @@ The schema migrations run at startup, so stop the old process before replacing
 the binary or image.
 
 For a container deployment, bump the version in `Cargo.toml`, push that exact
-SemVer tag (for example, `0.1.0-alpha.2`), then pull and
+SemVer tag (for example, `0.1.0-alpha.3`), then pull and
 replace the container. Removing the container does not remove its named data
 volume:
 
