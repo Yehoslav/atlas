@@ -1975,7 +1975,10 @@ pub(super) async fn re_render_images(
         .as_deref()
         .map(|value| {
             AssetId::parse(value).map_err(|_| {
-                ApiError::bad_request("invalid_cursor", "after must be an asset id from next.")
+                ApiError::bad_request(
+                    "invalid_cursor",
+                    format!("after value {value:?} is not an asset id from next."),
+                )
             })
         })
         .transpose()?;
@@ -5536,6 +5539,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error["error"]["code"], "invalid_cursor");
+        assert!(error["error"]["message"].as_str().unwrap().contains("../x"));
 
         let response = router
             .clone()
