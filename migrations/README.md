@@ -105,8 +105,9 @@ which cannot be created on a database that already holds two live assets with
 the same bytes — and making room for it means deleting one of them, along with
 its files, at the moment someone runs a migration. A row a published post still
 references does not care that its bytes are a duplicate. So the lookup stays
-best effort: two *concurrent* uploads of identical bytes can both become assets,
-and the window is one conversion wide.
+best effort: two *concurrent* uploads of identical bytes can both become assets.
+The number of conversions that can race is bounded by the configured
+`ATLAS_CONVERSION_CONCURRENCY` (one by default).
 
 ## Adding a migration
 

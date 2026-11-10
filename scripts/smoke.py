@@ -46,6 +46,8 @@ REPO = Path(__file__).resolve().parents[1]
 DEFAULT_PORT = 3200
 TOKEN = "smoke-token-abc"
 HEALTH_TIMEOUT = 15.0
+#: The default `ATLAS_ID_LENGTH`, so an unknown-id check needs no real asset.
+ASSET_ID_LENGTH = 18
 
 #: Sentinel for "use this client's token", distinct from "send no token".
 USE_DEFAULT_TOKEN: Final = object()
@@ -617,6 +619,49 @@ def check_api(checks: Checks) -> None:
     checks.true("  and re-encoded them", walk["count"] >= 1)
     checks.ok("  without failures", walk["failures"], [])
     checks.ok("  to the end", walk["next"], None)
+
+    print("\n== explicit re-render, retry-safe ==", flush=True)
+    # The walk re-encodes unconditionally; the explicit-id mode is the
+    # recovery path. An expectation the asset already meets is answered
+    # without spending a conversion, so retrying after a lost response
+    # costs nothing. An unknown id is a per-item failure, not a batch 400.
+    # The walk re-encodes unconditionally, so the asset's generation has
+    # moved since the re-encode above; a consumer builds its expectation
+    # from what the server says now, not from an earlier response.
+    generation = checks.request("GET", f"/api/v1/images/{image_id}")[1]["generation"]
+    expectation = {"id": image_id, "expect_generation": generation}
+    status, batch = checks.request(
+        "POST", "/api/v1/images/re-render", {"ids": [expectation]}
+    )
+    checks.ok("an expectation the asset already meets skips", status, 200)
+    checks.ok("  without a conversion", batch["count"], 0)
+    checks.ok(
+        "  naming the generation it holds",
+        batch["skipped"],
+        [{"id": image_id, "generation": generation}],
+    )
+    status, retry = checks.request(
+        "POST", "/api/v1/images/re-render", {"ids": [expectation]}
+    )
+    checks.ok("retrying the same batch skips again", retry["count"], 0)
+    status, batch = checks.request(
+        "POST",
+        "/api/v1/images/re-render",
+        {"ids": [expectation, {"id": "0" * ASSET_ID_LENGTH}]},
+    )
+    checks.ok("an unknown id is a per-item failure", status, 200)
+    checks.ok("  naming the code", batch["failures"][0]["error"]["code"], "asset_not_found")
+    checks.ok(
+        "  beside the skipped one",
+        batch["skipped"],
+        [{"id": image_id, "generation": generation}],
+    )
+    status, error = checks.request(
+        "POST",
+        "/api/v1/images/re-render",
+        {"ids": [expectation], "limit": 1},
+    )
+    checks.ok("the modes cannot be mixed", status, 400)
 
     print("\n== heif, in the spelling the desktop sends ==", flush=True)
     # HEIF has two spellings and the desktop decides which one a browser

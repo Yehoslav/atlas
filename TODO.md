@@ -174,14 +174,13 @@ Placed at `examples/family-album/`.
 
 ### Rendition generations
 
-- [ ] **Let a re-render skip what the current encoder already made.** A
-      generation does not record what produced it, so a walk restarted from
-      the beginning re-encodes every image again and keeps another copy of
-      its renditions. Store an encoder stamp beside the generation (the
-      ImageMagick and libjxl versions, or a build stamp) and let the walk
-      skip an image whose current generation carries the current stamp. It
-      changes what a walk does and needs a migration, so it wants a decision
-      of its own.
+- [ ] **Record which encoder produced a generation.** Re-render batches can
+      now be retried safely when the caller supplies expected generations, but
+      Atlas still cannot tell whether the current encoder produced an asset's
+      generation. An encoder stamp (ImageMagick/libjxl versions or a build
+      stamp) could make a walk automatically skip assets already rendered by
+      the current encoder. This needs a migration and remains a separate
+      decision.
 
 ## Things that got through, and why
 

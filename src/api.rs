@@ -646,6 +646,7 @@ pub(super) async fn delete_asset(
 /// Move an asset to the trash. Shared with the bulk endpoint so both take the
 /// same order of operations, not just the same outcome.
 async fn delete_inner(state: &AppState, id: &AssetId) -> Result<(), ApiError> {
+    let _asset_guard = state.lock_asset_conversion(id).await;
     let asset = load_asset(state, id, None).await?;
     if asset.asset.state() != AssetState::Active {
         return Ok(());
@@ -689,6 +690,7 @@ pub(super) async fn restore_asset(
 /// row update leaves a deleted row over files that are back in `assets/`, which
 /// recovery resolves back into the trash.
 async fn restore_inner(state: &AppState, id: &AssetId) -> Result<(), ApiError> {
+    let _asset_guard = state.lock_asset_conversion(id).await;
     let asset = load_asset(state, id, None).await?;
     match asset.asset.state() {
         AssetState::Active => return Ok(()),
@@ -1526,9 +1528,10 @@ pub(super) async fn refresh_renditions(
     if request.re_encode {
         return re_encode(&state, &id).await.map(Json);
     }
-    // Serialise conversions and re-renders: the output paths are named after
-    // actual widths, and two requests must not both share a staging directory
-    // or promote a file there.
+    // Serialize work on this asset: the output paths are named after actual
+    // widths, and two requests must not share a staging directory or promote
+    // the same generation. The semaphore bounds work across different assets.
+    let _asset_guard = state.lock_asset_conversion(&id).await;
     let _permit = state
         .conversion_slots
         .clone()
@@ -1783,6 +1786,23 @@ async fn name_for_generation(
 /// conversion, and staged then promoted, so a failure leaves the current
 /// generation exactly as it was.
 async fn re_encode(state: &AppState, id: &AssetId) -> Result<RenditionRefreshResponse, ApiError> {
+    match re_encode_conditionally(state, id, None).await? {
+        ReEncodeOutcome::ReEncoded(response) => Ok(response),
+        ReEncodeOutcome::Skipped(_) => unreachable!("an unconditional re-encode cannot skip"),
+    }
+}
+
+enum ReEncodeOutcome {
+    ReEncoded(RenditionRefreshResponse),
+    Skipped(u32),
+}
+
+async fn re_encode_conditionally(
+    state: &AppState,
+    id: &AssetId,
+    expect_generation: Option<u32>,
+) -> Result<ReEncodeOutcome, ApiError> {
+    let _asset_guard = state.lock_asset_conversion(id).await;
     let _permit = state
         .conversion_slots
         .clone()
@@ -1796,6 +1816,9 @@ async fn re_encode(state: &AppState, id: &AssetId) -> Result<RenditionRefreshRes
             "The asset is in the trash; restore it before re-encoding it.",
         ));
     }
+    if expect_generation.is_some_and(|expected| asset.asset.generation >= expected) {
+        return Ok(ReEncodeOutcome::Skipped(asset.asset.generation));
+    }
 
     let staging = fresh_staging_dir(state, id).await?;
     let result = re_encode_staged(state, &asset, &staging).await;
@@ -1804,7 +1827,9 @@ async fn re_encode(state: &AppState, id: &AssetId) -> Result<RenditionRefreshRes
     let added = result?;
 
     let asset = load_asset(state, id, Some(Kind::Image)).await?;
-    Ok(refresh_response(state, &asset, added))
+    Ok(ReEncodeOutcome::ReEncoded(refresh_response(
+        state, &asset, added,
+    )))
 }
 
 /// The conversion and the promotion of a re-encode, answering with the
@@ -1939,26 +1964,12 @@ fn optional_json<T: serde::de::DeserializeOwned + Default>(body: &[u8]) -> Resul
         })
 }
 
-/// How many images one re-render call re-encodes, by default and at most.
-///
-/// Each one is a full conversion, run one after another inside the request,
-/// so a page holds the request open for `limit` conversions. A conversion is
-/// usually seconds, but only `image_processing_timeout` bounds it: the worst
-/// case is the default page at 10 times that, and the maximum page at 100
-/// times. A caller behind a proxy sizes `limit` to the proxy's read timeout
-/// and walks the whole collection by passing `next` back as `after`.
+/// How many images one re-render page may contain.
 const DEFAULT_RE_RENDER_LIMIT: i64 = 10;
 const MAX_RE_RENDER_LIMIT: i64 = 100;
+const MAX_RE_RENDER_IDS: usize = 100;
 
-/// Re-encode every live image, a page at a time.
-///
-/// An encoder change is not one asset, it is every asset: a newer
-/// ImageMagick, a newer libjxl, a corrected flag. Each image is re-encoded on
-/// its own, taking the conversion slot for that image only, so an upload
-/// waits for one conversion rather than for the whole collection. A page
-/// answers with how many it re-encoded, which ones failed and why, and how
-/// many are left after it; there is no job queue, so the caller drives the
-/// walk and sees the progress.
+/// Re-encode selected images or walk every live image a page at a time.
 pub(super) async fn re_render_images(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1966,6 +1977,16 @@ pub(super) async fn re_render_images(
 ) -> Result<Json<ReRenderResponse>, ApiError> {
     authorize(&state, &headers)?;
     let request: ReRenderRequest = optional_json(&body)?;
+    if let Some(items) = request.ids {
+        if request.limit.is_some() || request.after.is_some() {
+            return Err(ApiError::bad_request(
+                "conflicting_re_render_modes",
+                "ids cannot be combined with limit or after.",
+            ));
+        }
+        return re_render_ids(&state, items).await.map(Json);
+    }
+
     let limit = request
         .limit
         .unwrap_or(DEFAULT_RE_RENDER_LIMIT)
@@ -1973,14 +1994,7 @@ pub(super) async fn re_render_images(
     let after = request
         .after
         .as_deref()
-        .map(|value| {
-            AssetId::parse(value).map_err(|_| {
-                ApiError::bad_request(
-                    "invalid_cursor",
-                    format!("after value {value:?} is not an asset id from next."),
-                )
-            })
-        })
+        .map(decode_re_render_cursor)
         .transpose()?;
 
     let (ids, remaining) = state
@@ -1989,27 +2003,22 @@ pub(super) async fn re_render_images(
         .await
         .map_err(ApiError::internal)?;
 
-    let mut re_encoded = Vec::with_capacity(ids.len());
-    let mut failures = Vec::new();
-    for id in &ids {
-        match re_encode(&state, id).await {
-            Ok(refreshed) => {
-                tracing::info!(asset = %id, generation = refreshed.generation, "re-encoded an image");
-                re_encoded.push(ReEncodedImage {
-                    id: id.to_string(),
-                    generation: refreshed.generation,
-                });
-            }
-            Err(error) => {
-                tracing::error!(asset = %id, error = error.detail(), "could not re-encode an image");
-                failures.push(ActionResult {
-                    id: id.to_string(),
-                    status: "error",
-                    error: Some(error.detail().to_owned()),
-                });
-            }
-        }
+    if ids.is_empty() && remaining > 0 {
+        return Err(ApiError::internal(
+            "re-render page selected no IDs while live images remain",
+        ));
     }
+    let next = if remaining > 0 {
+        Some(encode_re_render_cursor(
+            ids.last()
+                .ok_or_else(|| ApiError::internal("re-render page cursor is missing"))?
+                .as_str(),
+        ))
+    } else {
+        None
+    };
+    let (re_encoded, skipped, failures) =
+        process_re_render_items(&state, ids.into_iter().map(|id| (id, None)).collect()).await;
     tracing::info!(
         count = re_encoded.len(),
         failed = failures.len(),
@@ -2020,10 +2029,9 @@ pub(super) async fn re_render_images(
     Ok(Json(ReRenderResponse {
         count: re_encoded.len(),
         re_encoded,
+        skipped,
         failures,
-        next: (remaining > 0)
-            .then(|| ids.last().map(AssetId::to_string))
-            .flatten(),
+        next,
         remaining,
     }))
 }
@@ -2031,9 +2039,17 @@ pub(super) async fn re_render_images(
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ReRenderRequest {
+    ids: Option<Vec<ReRenderItem>>,
     limit: Option<i64>,
-    /// The `next` of the previous page; absent to start from the beginning.
+    /// The `next` token of the previous page; absent to start from the beginning.
     after: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReRenderItem {
+    id: String,
+    expect_generation: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -2047,11 +2063,141 @@ pub(super) struct ReRenderResponse {
     /// How many images this page re-encoded.
     count: usize,
     re_encoded: Vec<ReEncodedImage>,
-    failures: Vec<ActionResult>,
+    skipped: Vec<SkippedImage>,
+    failures: Vec<ReRenderFailure>,
     /// Where the next page starts; `null` once the walk is done.
     next: Option<String>,
     /// Live images after this page, not yet visited by this walk.
     remaining: i64,
+}
+
+#[derive(Serialize)]
+struct SkippedImage {
+    id: String,
+    generation: u32,
+}
+
+#[derive(Serialize)]
+struct ReRenderFailure {
+    id: String,
+    error: ReRenderErrorDetail,
+}
+
+#[derive(Serialize)]
+struct ReRenderErrorDetail {
+    code: &'static str,
+    message: String,
+}
+
+fn encode_re_render_cursor(id: &str) -> String {
+    format!("v1_{}", hex::encode(id))
+}
+
+fn decode_re_render_cursor(value: &str) -> Result<AssetId, ApiError> {
+    let encoded = value.strip_prefix("v1_").ok_or_else(|| {
+        ApiError::bad_request("invalid_cursor", "after must be a cursor returned in next.")
+    })?;
+    let bytes = hex::decode(encoded).map_err(|_| {
+        ApiError::bad_request("invalid_cursor", "after must be a cursor returned in next.")
+    })?;
+    let id = std::str::from_utf8(&bytes).map_err(|_| {
+        ApiError::bad_request("invalid_cursor", "after must be a cursor returned in next.")
+    })?;
+    AssetId::parse(id).map_err(|_| {
+        ApiError::bad_request("invalid_cursor", "after must be a cursor returned in next.")
+    })
+}
+
+async fn re_render_ids(
+    state: &AppState,
+    items: Vec<ReRenderItem>,
+) -> Result<ReRenderResponse, ApiError> {
+    if items.len() > MAX_RE_RENDER_IDS {
+        return Err(ApiError::bad_request(
+            "too_many_ids",
+            format!("ids may contain at most {MAX_RE_RENDER_IDS} items."),
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(items.len());
+    let items = items
+        .into_iter()
+        .map(|item| {
+            let id = AssetId::parse(&item.id).map_err(|_| {
+                ApiError::bad_request("invalid_asset_id", "ids must contain valid asset IDs.")
+            })?;
+            if !seen.insert(id.to_string()) {
+                return Err(ApiError::bad_request(
+                    "duplicate_id",
+                    "ids must not contain duplicates.",
+                ));
+            }
+            if item.expect_generation == Some(0) {
+                return Err(ApiError::bad_request(
+                    "invalid_generation",
+                    "expect_generation must be a positive integer.",
+                ));
+            }
+            Ok((id, item.expect_generation))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (re_encoded, skipped, failures) = process_re_render_items(state, items).await;
+    Ok(ReRenderResponse {
+        count: re_encoded.len(),
+        re_encoded,
+        skipped,
+        failures,
+        next: None,
+        remaining: 0,
+    })
+}
+
+async fn process_re_render_items(
+    state: &AppState,
+    items: Vec<(AssetId, Option<u32>)>,
+) -> (Vec<ReEncodedImage>, Vec<SkippedImage>, Vec<ReRenderFailure>) {
+    let concurrency = state.config.conversion_concurrency;
+    let mut outcomes = futures_util::stream::iter(items)
+        .map(|(id, expect_generation)| async move {
+            let result = re_encode_conditionally(state, &id, expect_generation).await;
+            (id, result)
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    outcomes.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+
+    let mut re_encoded = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failures = Vec::new();
+    for (id, outcome) in outcomes {
+        match outcome {
+            Ok(ReEncodeOutcome::ReEncoded(response)) => {
+                tracing::info!(asset = %id, generation = response.generation, "re-encoded an image");
+                re_encoded.push(ReEncodedImage {
+                    id: id.to_string(),
+                    generation: response.generation,
+                });
+            }
+            Ok(ReEncodeOutcome::Skipped(generation)) => {
+                tracing::info!(asset = %id, generation, "skipped an image already at the requested generation");
+                skipped.push(SkippedImage {
+                    id: id.to_string(),
+                    generation,
+                });
+            }
+            Err(error) => {
+                tracing::error!(asset = %id, code = error.code(), error = error.detail(), "could not re-encode an image");
+                failures.push(ReRenderFailure {
+                    id: id.to_string(),
+                    error: ReRenderErrorDetail {
+                        code: error.code(),
+                        message: error.detail().to_owned(),
+                    },
+                });
+            }
+        }
+    }
+    (re_encoded, skipped, failures)
 }
 
 /// The widths a configuration implies, and the width each one produces.
@@ -2874,8 +3020,18 @@ mod tests {
             magick_bin: "magick".to_owned(),
             magick_timeout: Duration::from_secs(45),
             image_processing_timeout: Duration::from_secs(120),
+            conversion_concurrency: 1,
             trash_retention_days: 30,
         }
+    }
+
+    #[tokio::test]
+    async fn app_state_uses_configured_conversion_concurrency() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.conversion_concurrency = 3;
+        let state = AppState::new(config).await.unwrap();
+        assert_eq!(state.conversion_slots.available_permits(), 3);
     }
 
     /// Which collection a content type belongs in. A client makes this choice;
@@ -5498,15 +5654,18 @@ mod tests {
             json!([{"id": live[0], "generation": 2}])
         );
         assert_eq!(page["failures"], json!([]));
+        assert_eq!(page["skipped"], json!([]));
         assert_eq!(page["remaining"], 1);
-        assert_eq!(page["next"], live[0].as_str());
+        let cursor = page["next"].as_str().unwrap().to_owned();
+        assert!(cursor.starts_with("v1_"));
+        assert_ne!(cursor, live[0]);
 
         let (status, page) = send(
             &router,
             json_request(
                 "POST",
                 "/api/v1/images/re-render",
-                &json!({"limit": 1, "after": live[0]}),
+                &json!({"limit": 1, "after": cursor}),
             ),
         )
         .await;
@@ -5539,7 +5698,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error["error"]["code"], "invalid_cursor");
-        assert!(error["error"]["message"].as_str().unwrap().contains("../x"));
 
         let response = router
             .clone()
@@ -5553,6 +5711,143 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn explicit_re_render_batches_are_retry_safe_and_report_item_outcomes() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        let first = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("first.png"), "400x300"),
+        )
+        .await;
+        let second = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("second.png"), "500x300"),
+        )
+        .await;
+        let missing = AssetId::generate(18).unwrap().to_string();
+        let body = json!({
+            "ids": [
+                {"id": first.clone(), "expect_generation": 2},
+                {"id": second.clone(), "expect_generation": 1},
+                {"id": missing.clone(), "expect_generation": 2}
+            ]
+        });
+
+        let (status, result) = send(
+            &router,
+            json_request("POST", "/api/v1/images/re-render", &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["re_encoded"][0]["id"], first);
+        assert_eq!(result["re_encoded"][0]["generation"], 2);
+        assert!(
+            result["skipped"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["id"] == second && item["generation"] == 1 })
+        );
+        assert_eq!(
+            result["failures"],
+            json!([{
+                "id": missing.clone(),
+                "error": {"code": "asset_not_found", "message": "The asset was not found."}
+            }])
+        );
+        assert!(result["next"].is_null());
+        assert_eq!(result["remaining"], 0);
+
+        // Retrying after losing the first response reports the generation but
+        // does not create another generation or spend another conversion.
+        let (status, retry) = send(
+            &router,
+            json_request("POST", "/api/v1/images/re-render", &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{retry}");
+        assert_eq!(retry["count"], 0);
+        assert_eq!(retry["re_encoded"], json!([]));
+        assert!(
+            retry["skipped"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["id"] == first && item["generation"] == 2 })
+        );
+        assert!(
+            retry["skipped"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["id"] == second && item["generation"] == 1 })
+        );
+        assert_eq!(retry["failures"].as_array().unwrap().len(), 1);
+
+        // Two concurrent requests for the same expected generation serialize
+        // per asset: exactly one converts and the other observes the result.
+        let racing = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("racing.png"), "600x300"),
+        )
+        .await;
+        let racing_body = json!({
+            "ids": [{"id": racing, "expect_generation": 2}]
+        });
+        let (left, right) = tokio::join!(
+            send(
+                &router,
+                json_request("POST", "/api/v1/images/re-render", &racing_body)
+            ),
+            send(
+                &router,
+                json_request("POST", "/api/v1/images/re-render", &racing_body)
+            )
+        );
+        assert_eq!(left.0, StatusCode::OK, "{}", left.1);
+        assert_eq!(right.0, StatusCode::OK, "{}", right.1);
+        let encoded_count = left.1["count"].as_u64().unwrap() + right.1["count"].as_u64().unwrap();
+        let skipped_count = left.1["skipped"].as_array().unwrap().len()
+            + right.1["skipped"].as_array().unwrap().len();
+        assert_eq!(encoded_count, 1);
+        assert_eq!(skipped_count, 1);
+
+        // The batch cap is enforced before anything is validated for real,
+        // over bodies of 101 well-formed unique ids.
+        let oversized: Vec<_> = (0..101)
+            .map(|_| json!({"id": AssetId::generate(18).unwrap().to_string()}))
+            .collect();
+        let (status, error) = send(
+            &router,
+            json_request(
+                "POST",
+                "/api/v1/images/re-render",
+                &json!({"ids": oversized}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["error"]["code"], "too_many_ids");
+
+        for invalid in [
+            json!({"ids": [{"id": first.clone()}, {"id": first.clone()}]}),
+            json!({"ids": [{"id": first.clone()}], "limit": 1}),
+            json!({"ids": [{"id": first.clone()}], "after": "v1_00"}),
+            json!({"ids": [{"id": first.clone(), "expect_generation": 0}]}),
+        ] {
+            let (status, error) = send(
+                &router,
+                json_request("POST", "/api/v1/images/re-render", &invalid),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        }
     }
 
     /// A caller can ask for a rendition format by name.

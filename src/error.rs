@@ -155,6 +155,10 @@ impl ApiError {
         &self.detail
     }
 
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
     pub fn internal(error: impl std::fmt::Display) -> Self {
         tracing::error!(%error, "request failed");
         Self::new(

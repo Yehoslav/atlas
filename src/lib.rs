@@ -8,9 +8,10 @@ mod model;
 mod store;
 
 use std::{
+    collections::HashMap,
     error::Error,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,7 +20,7 @@ use ident::AssetId;
 use media::ImageProcessor;
 use model::AssetState;
 use store::Store;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
 
 include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
@@ -37,6 +38,7 @@ pub struct AppState {
     pub(crate) image_processor: ImageProcessor,
     pub(crate) upload_slots: Arc<Semaphore>,
     pub(crate) conversion_slots: Arc<Semaphore>,
+    asset_conversion_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     pub(crate) last_purge: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -63,12 +65,14 @@ impl AppState {
         image_processor.verify_formats().await?;
         image_processor.verify_colour_management().await?;
 
+        let conversion_concurrency = config.conversion_concurrency;
         let state = Self {
             config: Arc::new(config),
             store,
             image_processor,
             upload_slots: Arc::new(Semaphore::new(2)),
-            conversion_slots: Arc::new(Semaphore::new(1)),
+            conversion_slots: Arc::new(Semaphore::new(conversion_concurrency)),
+            asset_conversion_locks: Arc::new(Mutex::new(HashMap::new())),
             last_purge: Arc::new(Mutex::new(None)),
         };
 
@@ -91,6 +95,24 @@ impl AppState {
 
     pub(crate) fn trash_dir(&self, id: &AssetId) -> PathBuf {
         self.config.data_dir.join("trash").join(id.as_str())
+    }
+
+    /// Serialize conversions of the same asset while allowing distinct assets
+    /// to use the configured global conversion capacity concurrently.
+    pub(crate) async fn lock_asset_conversion(&self, id: &AssetId) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.asset_conversion_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(id.as_str()).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(id.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
     }
 
     /// Discard trashed assets that are past the retention window and that no
