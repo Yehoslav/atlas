@@ -168,10 +168,16 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = self.status;
+        let code = self.code;
+        let detail = self.detail;
+        match status.is_server_error() {
+            true => tracing::error!(%status, code, %detail, "API request failed"),
+            false => tracing::warn!(%status, code, %detail, "API request rejected"),
+        }
         let response = ErrorResponse {
             error: ErrorDetail {
-                code: self.code,
-                message: self.detail,
+                code,
+                message: detail,
             },
         };
         let mut response = (status, Json(response)).into_response();

@@ -538,9 +538,15 @@ impl Store {
         .await?;
         let ids: Vec<AssetId> = rows
             .into_iter()
-            .filter_map(|row| row.try_get::<String, _>("id").ok())
-            .filter_map(|id| AssetId::parse(&id).ok())
-            .collect();
+            .map(|row| {
+                let id: String = row.try_get("id").map_err(|error| {
+                    StoreError::Corrupt(format!("live image has a non-text asset id: {error}"))
+                })?;
+                AssetId::parse(&id).map_err(|error| {
+                    StoreError::Corrupt(format!("live image has invalid asset id {id:?}: {error}"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         let last = ids.last().map(AssetId::as_str).unwrap_or(after);
         let remaining: i64 = sqlx::query(
@@ -1572,5 +1578,24 @@ mod tests {
         let (page, remaining) = store.live_images_after(Some(&ids[1]), 2).await.unwrap();
         assert_eq!(page, ids[2..]);
         assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn live_image_walk_fails_on_an_unparseable_stored_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+        let id = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        store.insert_asset(&record(&id), &[]).await.unwrap();
+        sqlx::query("UPDATE assets SET id = 'bad-id' WHERE id = ?")
+            .bind(id.as_str())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let error = store.live_images_after(None, 10).await.unwrap_err();
+        assert!(matches!(error, StoreError::Corrupt(_)));
+        assert!(error.to_string().contains("bad-id"));
     }
 }
