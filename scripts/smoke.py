@@ -663,6 +663,45 @@ def check_api(checks: Checks) -> None:
     )
     checks.ok("the modes cannot be mixed", status, 400)
 
+    print("\n== async re-render job ==", flush=True)
+    # The job is detached: the start request answers before any conversion
+    # runs, and the handle it returns is all the client keeps — progress
+    # and results come from polling, after every connection to the start
+    # request is gone. The expectation is already met, so this job skips
+    # the asset without spending a conversion.
+    status, started = checks.request(
+        "POST",
+        "/api/v1/images/re-render",
+        {"async": True, "ids": [expectation]},
+    )
+    checks.ok("job accepted", status, 202)
+    job_id = started.get("job_id") or ""
+    checks.true("  with a job id", bool(job_id))
+    job: dict = {}
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        status, job = checks.request("GET", f"/api/v1/images/re-render/{job_id}")
+        if status != 200 or job.get("state") in ("completed", "failed"):
+            break
+        time.sleep(0.2)
+    checks.ok("job completed", job.get("state"), "completed")
+    checks.ok(
+        "  progress reconciles",
+        job.get("progress"),
+        {"total": 1, "processed": 1, "re_encoded": 0, "skipped": 1, "failed": 0},
+    )
+    checks.ok(
+        "  reporting the generation",
+        job["results"][0]["generation"],
+        generation,
+    )
+    checks.ok("  without a job-level error", job.get("error"), None)
+    status, unknown = checks.request(
+        "GET", "/api/v1/images/re-render/000000000000000000"
+    )
+    checks.ok("unknown job is a 404", status, 404)
+    checks.ok("  with the code", unknown["error"]["code"], "job_not_found")
+
     print("\n== heif, in the spelling the desktop sends ==", flush=True)
     # HEIF has two spellings and the desktop decides which one a browser
     # sends: freedesktop.org makes `image/heif` canonical and keeps

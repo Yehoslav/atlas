@@ -50,7 +50,7 @@ useless separately.
 | No nested folders | A media service with a folder tree becomes a document management system. Flat opaque labels stop every project rebuilding label CRUD; the consumer keeps the hierarchy. |
 | Deletion is a lifecycle, not an erasure | A published page must not break because someone deleted a file. Bytes move to a trash directory, are purged after a retention window, and a tombstone remains. |
 | No video, no document rendering, no OCR | Different products. |
-| No object storage, no multi-tenancy, no job queues | One site, one host, occasional administrator uploads. |
+| No object storage, no multi-tenancy, no distributed job queues | One site, one host, occasional administrator uploads. Re-render jobs run in-process with their state in SQLite; a multi-instance scheduler would be a different design. |
 | No animations yet | The rendition model is one frame per width. A multi-frame kind needs a multi-frame model. |
 
 ## Try it
@@ -278,6 +278,25 @@ as an attachment instead of being re-encoded into a picture.
   IDs with expected generations when a lost response must be safely retried
   without re-encoding completed assets.
 
+  With `"async": true` the same selection runs as a job instead of holding the
+  request open: the answer is `202` with a `job_id`, returned as soon as the
+  selection is validated and stored, and processing continues with no connection
+  attached — a disconnect, timeout or reload cannot cancel it. Async accepts
+  the same `ids` batch (up to 1000 items) or a whole-collection walk (with an
+  optional `after`; `limit` does not apply, because a job processes its whole
+  selection). Poll `GET /api/v1/images/re-render/{job_id}` for `state`
+  (`queued`, `running`, `completed`, `failed`), `progress` (`total`,
+  `processed`, `re_encoded`, `skipped`, `failed`) and `results`: one entry per
+  selected asset with its `outcome`, its `generation` when known, and a
+  structured `error` for failures. Job rows are SQLite state, so results
+  survive an Atlas restart; a job interrupted mid-run is picked up at startup
+  from its pending items; finished jobs are pruned after the trash retention
+  window. A job-level `error` is set only in the `failed` state — per-image
+  failures are results, not job failures.
+- `GET /api/v1/images/re-render/{job_id}` — authenticated status of one
+  re-render job, as described above. An unknown or malformed id is `404
+  job_not_found`.
+
 Uploads are content-addressed within their collection. If the exact bytes are
 already live there, nothing is written or converted and the response is `200`
 with the existing asset and `"deduplicated": true`. A duplicate is not an
@@ -402,6 +421,13 @@ A page may re-encode several images concurrently, bounded by
 enough that the page finishes inside the proxy's read timeout (nginx waits 60
 seconds by default): a page may have re-encoded some images when the proxy
 gives up. Use explicit IDs and expected generations to retry safely.
+
+For a run too large for any proxy to wait through — a browser-driven
+regeneration of a few hundred assets — start it as a job: send the same body
+with `"async": true`, get `202` and a `job_id` in milliseconds, and poll
+progress instead of holding a request open. The connection that asked for the
+job has no further say over it; only `GET /api/v1/images/re-render/{job_id}`
+does.
 
 ## Asset IDs
 
@@ -757,7 +783,7 @@ Environment variables override the file, which is useful for per-host values:
 | `ATLAS_MAGICK_TIMEOUT_SECS` | 45 | Per ImageMagick invocation limit |
 | `ATLAS_IMAGE_PROCESSING_TIMEOUT_SECS` | 120 | Total processing limit per image |
 | `ATLAS_CONVERSION_CONCURRENCY` | `1` | Concurrent image conversions (1–8) |
-| `ATLAS_TRASH_RETENTION_DAYS` | 30 | Days a trashed asset is kept before purge |
+| `ATLAS_TRASH_RETENTION_DAYS` | 30 | Days a trashed asset and a finished re-render job are kept before purge |
 
 Uploads are streamed to staging files; at most two uploads and the configured
 number of conversions run concurrently. ImageMagick receives explicit

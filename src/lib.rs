@@ -82,6 +82,11 @@ impl AppState {
             Err(error) => tracing::error!(%error, "startup trash purge failed"),
         }
 
+        // Jobs the previous process left queued or running continue here,
+        // before the service answers requests: the connection that started
+        // them is long gone, which is the point of a job.
+        api::resume_re_render_jobs(state.clone()).await;
+
         Ok(state)
     }
 
@@ -332,10 +337,15 @@ pub fn app(state: AppState) -> Router {
             "/api/v1/images/{id}/renditions",
             axum::routing::post(api::refresh_renditions),
         )
-        // Every live image, re-encoded a page at a time.
+        // Every live image, re-encoded a page at a time — or, with `async`,
+        // as a detached job whose progress and results are polled by id.
         .route(
             "/api/v1/images/re-render",
             axum::routing::post(api::re_render_images),
+        )
+        .route(
+            "/api/v1/images/re-render/{job_id}",
+            get(api::get_re_render_job),
         )
         // Uniform reads: a caller naturally asks about a mixed set of ids, and
         // reading is harmless when the caller's classification is wrong.

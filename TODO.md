@@ -181,6 +181,10 @@ Placed at `examples/family-album/`.
       stamp) could make a walk automatically skip assets already rendered by
       the current encoder. This needs a migration and remains a separate
       decision.
+- [ ] **Push re-render job progress over SSE.** Jobs are polled today; an SSE
+      endpoint on the same lifecycle would give a consumer live progress
+      without changing job state. The issue deferred this deliberately — add
+      it when polling proves insufficient, not before.
 
 ## Things that got through, and why
 

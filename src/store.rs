@@ -87,6 +87,92 @@ pub enum Sort {
     Filename,
 }
 
+/// The lifecycle of an asynchronous re-render job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReRenderJobState {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl ReRenderJobState {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// What happened to one asset inside a job.
+///
+/// `Pending` means not yet attempted, including items a restart left
+/// untouched; anything else is final for that item.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReRenderJobOutcome {
+    Pending,
+    ReEncoded,
+    Skipped,
+    Failed,
+}
+
+impl ReRenderJobOutcome {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::ReEncoded => "re_encoded",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "re_encoded" => Some(Self::ReEncoded),
+            "skipped" => Some(Self::Skipped),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One re-render job as stored: lifecycle only. Progress is derived from the
+/// items so counters cannot drift away from outcomes.
+#[derive(Debug)]
+pub struct ReRenderJobRow {
+    pub id: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub state: ReRenderJobState,
+    pub error: Option<String>,
+}
+
+/// One asset's slot in a job, in selection order.
+#[derive(Debug)]
+pub struct ReRenderJobItemRow {
+    pub position: i64,
+    pub id: String,
+    pub expect_generation: Option<i64>,
+    pub outcome: ReRenderJobOutcome,
+    pub generation: Option<i64>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Order {
     Asc,
@@ -557,6 +643,206 @@ impl Store {
         .await?
         .try_get(0)?;
         Ok((ids, remaining))
+    }
+
+    /// Persist an asynchronous re-render job: one row for the lifecycle and
+    /// one row per selected asset, written in a single transaction so a job
+    /// is never half-created. The items are the durable record of progress;
+    /// the job row carries only state and the job-level error.
+    pub async fn create_re_render_job(
+        &self,
+        id: &str,
+        created_at: i64,
+        items: &[(AssetId, Option<u32>)],
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO re_render_jobs (id, created_at, updated_at, state)
+             VALUES (?, ?, ?, 'queued')",
+        )
+        .bind(id)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await?;
+        for (position, (asset_id, expect_generation)) in items.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO re_render_job_items
+                     (job_id, position, id, expect_generation, outcome)
+                 VALUES (?, ?, ?, ?, 'pending')",
+            )
+            .bind(id)
+            .bind(i64::try_from(position).unwrap_or(i64::MAX))
+            .bind(asset_id.as_str())
+            .bind(expect_generation.map(i64::from))
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// A job and its items in selection order, or `None` if Atlas has never
+    /// heard of the id.
+    pub async fn re_render_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<(ReRenderJobRow, Vec<ReRenderJobItemRow>)>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, created_at, updated_at, state, error
+             FROM re_render_jobs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let state = row.try_get::<String, _>("state")?;
+        let job = ReRenderJobRow {
+            id: row.try_get("id")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            state: ReRenderJobState::from_key(&state).ok_or_else(|| {
+                StoreError::Corrupt(format!("re-render job has unknown state {state:?}"))
+            })?,
+            error: row.try_get("error")?,
+        };
+
+        let rows = sqlx::query(
+            "SELECT position, id, expect_generation, outcome, generation,
+                    error_code, error_message
+             FROM re_render_job_items WHERE job_id = ? ORDER BY position ASC",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        let items = rows
+            .into_iter()
+            .map(|row| {
+                let outcome = row.try_get::<String, _>("outcome")?;
+                Ok(ReRenderJobItemRow {
+                    position: row.try_get("position")?,
+                    id: row.try_get("id")?,
+                    expect_generation: row.try_get("expect_generation")?,
+                    outcome: ReRenderJobOutcome::from_key(&outcome).ok_or_else(|| {
+                        StoreError::Corrupt(format!(
+                            "re-render job item has unknown outcome {outcome:?}"
+                        ))
+                    })?,
+                    generation: row.try_get("generation")?,
+                    error_code: row.try_get("error_code")?,
+                    error_message: row.try_get("error_message")?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(Some((job, items)))
+    }
+
+    /// Jobs a restarted process should pick up again: the ones that were
+    /// queued or running when the previous process stopped.
+    pub async fn resumable_re_render_jobs(&self) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id FROM re_render_jobs
+             WHERE state IN ('queued', 'running') ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row.try_get::<String, _>("id").map_err(StoreError::Database))
+            .collect()
+    }
+
+    /// Claim a job for processing. Returns how many rows the claim moved, so
+    /// a caller can tell a real claim from a job that is already terminal
+    /// (finished, or pruned) and must not run twice.
+    pub async fn mark_re_render_job_running(
+        &self,
+        id: &str,
+        updated_at: i64,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "UPDATE re_render_jobs SET state = 'running', updated_at = ?
+             WHERE id = ? AND state IN ('queued', 'running')",
+        )
+        .bind(updated_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Record one item's outcome. Items only ever move off `pending`, so a
+    /// completed outcome is written once; the job's `updated_at` moves with
+    /// it so status polling has a freshness signal.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_re_render_job_item(
+        &self,
+        job_id: &str,
+        position: i64,
+        updated_at: i64,
+        outcome: ReRenderJobOutcome,
+        generation: Option<u32>,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE re_render_job_items
+             SET outcome = ?, generation = ?, error_code = ?, error_message = ?
+             WHERE job_id = ? AND position = ?",
+        )
+        .bind(outcome.key())
+        .bind(generation.map(i64::from))
+        .bind(error_code)
+        .bind(error_message)
+        .bind(job_id)
+        .bind(position)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("UPDATE re_render_jobs SET updated_at = ? WHERE id = ?")
+            .bind(updated_at)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Move a job to a terminal state. Only queued/running jobs move, so a
+    /// late writer cannot resurrect a finished or pruned job.
+    pub async fn finish_re_render_job(
+        &self,
+        id: &str,
+        updated_at: i64,
+        state: ReRenderJobState,
+        error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE re_render_jobs SET state = ?, error = ?, updated_at = ?
+             WHERE id = ? AND state IN ('queued', 'running')",
+        )
+        .bind(state.key())
+        .bind(error)
+        .bind(updated_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Drop terminal jobs last touched before `before`.
+    ///
+    /// Results are durable while they matter and bounded afterwards, the same
+    /// bargain the trash retention window makes: a job row is metadata, and
+    /// unbounded metadata is its own leak. Running jobs are never touched.
+    pub async fn prune_re_render_jobs(&self, before: i64) -> Result<usize, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM re_render_jobs
+             WHERE state IN ('completed', 'failed') AND updated_at < ?",
+        )
+        .bind(before)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() as usize)
     }
 
     /// SQLite extended result codes for a primary-key or unique constraint failure.
@@ -1098,9 +1384,9 @@ fn state_from(row: &sqlx::sqlite::SqliteRow) -> AssetState {
 
 #[cfg(test)]
 mod tests {
-    use sqlx::Acquire;
+    use sqlx::{Acquire, Row};
 
-    use super::{InsertOutcome, Store, StoreError};
+    use super::{InsertOutcome, ReRenderJobOutcome, ReRenderJobState, Store, StoreError};
     use crate::{
         MIGRATION_FILES,
         ident::{AssetId, DEFAULT_LENGTH},
@@ -1597,5 +1883,127 @@ mod tests {
         let error = store.live_images_after(None, 10).await.unwrap_err();
         assert!(matches!(error, StoreError::Corrupt(_)));
         assert!(error.to_string().contains("bad-id"));
+    }
+
+    #[tokio::test]
+    async fn re_render_jobs_track_items_and_prune_only_terminal_jobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+        let first = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        let second = AssetId::generate(DEFAULT_LENGTH).unwrap();
+
+        store
+            .create_re_render_job(
+                "jobone",
+                1_000,
+                &[(first.clone(), Some(2)), (second.clone(), None)],
+            )
+            .await
+            .unwrap();
+        let (job, items) = store.re_render_job("jobone").await.unwrap().unwrap();
+        assert_eq!(job.state, ReRenderJobState::Queued);
+        assert_eq!(job.created_at, 1_000);
+        assert!(job.error.is_none());
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, first.to_string());
+        assert_eq!(items[0].expect_generation, Some(2));
+        assert_eq!(items[0].outcome, ReRenderJobOutcome::Pending);
+        assert_eq!(items[1].id, second.to_string());
+        assert_eq!(items[1].expect_generation, None);
+
+        // A claim moves queued jobs forward, and running jobs stay
+        // claimable — that second case is what a restarted process does.
+        assert_eq!(
+            store
+                .mark_re_render_job_running("jobone", 1_001)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .mark_re_render_job_running("jobone", 1_002)
+                .await
+                .unwrap(),
+            1
+        );
+        let (job, _) = store.re_render_job("jobone").await.unwrap().unwrap();
+        assert_eq!(job.state, ReRenderJobState::Running);
+
+        store
+            .update_re_render_job_item(
+                "jobone",
+                0,
+                1_003,
+                ReRenderJobOutcome::ReEncoded,
+                Some(3),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .update_re_render_job_item(
+                "jobone",
+                1,
+                1_004,
+                ReRenderJobOutcome::Failed,
+                None,
+                Some("asset_not_found"),
+                Some("The asset was not found."),
+            )
+            .await
+            .unwrap();
+        let (job, items) = store.re_render_job("jobone").await.unwrap().unwrap();
+        assert_eq!(job.updated_at, 1_004, "the item write moves updated_at");
+        assert_eq!(items[0].outcome, ReRenderJobOutcome::ReEncoded);
+        assert_eq!(items[0].generation, Some(3));
+        assert_eq!(items[1].outcome, ReRenderJobOutcome::Failed);
+        assert_eq!(items[1].generation, None);
+        assert_eq!(items[1].error_code.as_deref(), Some("asset_not_found"));
+
+        store
+            .finish_re_render_job("jobone", 1_005, ReRenderJobState::Completed, None)
+            .await
+            .unwrap();
+        // Terminal jobs are not resumable, and a late writer cannot move
+        // one: the WHERE guard makes finish idempotent in spirit.
+        assert!(store.resumable_re_render_jobs().await.unwrap().is_empty());
+        store
+            .finish_re_render_job("jobone", 1_006, ReRenderJobState::Failed, Some("late"))
+            .await
+            .unwrap();
+        let (job, _) = store.re_render_job("jobone").await.unwrap().unwrap();
+        assert_eq!(job.state, ReRenderJobState::Completed);
+        assert!(job.error.is_none());
+
+        // Pruning removes terminal jobs past the cutoff — and only those.
+        // A queued job with old timestamps must survive: it has not run.
+        store
+            .create_re_render_job("jobtwo", 100, &[(first, None)])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE re_render_jobs SET updated_at = 500 WHERE id = 'jobone'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(store.prune_re_render_jobs(600).await.unwrap(), 1);
+        assert!(store.re_render_job("jobone").await.unwrap().is_none());
+        assert!(store.re_render_job("jobtwo").await.unwrap().is_some());
+        assert_eq!(
+            store.resumable_re_render_jobs().await.unwrap(),
+            vec!["jobtwo".to_string()]
+        );
+        // The pruned job's items went with it through the cascade.
+        let orphans: i64 =
+            sqlx::query("SELECT COUNT(*) FROM re_render_job_items WHERE job_id = 'jobone'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap()
+                .try_get(0)
+                .unwrap();
+        assert_eq!(orphans, 0);
     }
 }
