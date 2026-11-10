@@ -926,6 +926,26 @@ pub(super) struct ListParams {
     offset: Option<i64>,
 }
 
+/// A rejected value as it may appear in a log line or an error message.
+///
+/// The value is arbitrary client input — no longer even guaranteed to be the
+/// asset id it once was — so it is quoted with Rust's string escaping: a
+/// newline or control character cannot break a log line or forge one. It is
+/// also bounded, because a client may send a megabyte where a diagnosis needs
+/// a glance.
+fn echoed(value: &str) -> String {
+    const MAX: usize = 96;
+    let mut end = value.len().min(MAX);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut text = format!("{:?}", &value[..end]);
+    if end < value.len() {
+        text.push('…');
+    }
+    text
+}
+
 /// Turn a `mime` filter into the format keys it selects.
 ///
 /// Two failures, one error code, because a caller who gets either of them
@@ -940,14 +960,14 @@ fn parse_mime(value: &str, kind: Kind) -> Result<Vec<&'static str>, ApiError> {
                 .filter(|format| format.mime_type().starts_with(&format!("{group}/")))
                 .collect::<Vec<_>>();
             if wanted.is_empty() {
-                return Err(invalid_mime());
+                return Err(invalid_mime(value));
             }
             wanted
         }
-        Some(_) => return Err(invalid_mime()),
+        Some(_) => return Err(invalid_mime(value)),
         None => match SourceFormat::parse_content_type(value) {
             Some(format) => vec![format],
-            None => return Err(invalid_mime()),
+            None => return Err(invalid_mime(value)),
         },
     };
 
@@ -965,7 +985,8 @@ fn parse_mime(value: &str, kind: Kind) -> Result<Vec<&'static str>, ApiError> {
         return Err(ApiError::bad_request(
             "invalid_mime",
             format!(
-                "{value} cannot match the {} collection. GET /api/v1/formats lists what it holds.",
+                "{} cannot match the {} collection. GET /api/v1/formats lists what it holds.",
+                echoed(value),
                 kind.slug(),
             ),
         ));
@@ -974,11 +995,14 @@ fn parse_mime(value: &str, kind: Kind) -> Result<Vec<&'static str>, ApiError> {
     Ok(selectable.iter().map(|format| format.key()).collect())
 }
 
-fn invalid_mime() -> ApiError {
+fn invalid_mime(value: &str) -> ApiError {
     ApiError::bad_request(
         "invalid_mime",
-        "mime must be an accepted media type, such as image/png, or a group such \
-         as image/*. GET /api/v1/formats lists them.",
+        format!(
+            "mime value {} is not an accepted media type, such as image/png, or a group such \
+             as image/*. GET /api/v1/formats lists them.",
+            echoed(value)
+        ),
     )
 }
 
@@ -1024,10 +1048,13 @@ impl ListParams {
             Some("deleted") => StateFilter::Deleted,
             Some("purged") => StateFilter::Purged,
             Some("all") => StateFilter::All,
-            Some(_) => {
+            Some(raw) => {
                 return Err(ApiError::bad_request(
                     "invalid_state",
-                    "state must be active, deleted, purged or all.",
+                    format!(
+                        "state value {} must be active, deleted, purged or all.",
+                        echoed(raw)
+                    ),
                 ));
             }
         };
@@ -1037,20 +1064,23 @@ impl ListParams {
             Some("bytes") => Sort::Bytes,
             Some("width") => Sort::Width,
             Some("filename") => Sort::Filename,
-            Some(_) => {
+            Some(raw) => {
                 return Err(ApiError::bad_request(
                     "invalid_sort",
-                    "sort must be created_at, bytes, width or filename.",
+                    format!(
+                        "sort value {} must be created_at, bytes, width or filename.",
+                        echoed(raw)
+                    ),
                 ));
             }
         };
         let order = match self.order.as_deref() {
             None | Some("desc") => Order::Desc,
             Some("asc") => Order::Asc,
-            Some(_) => {
+            Some(raw) => {
                 return Err(ApiError::bad_request(
                     "invalid_order",
-                    "order must be asc or desc.",
+                    format!("order value {} must be asc or desc.", echoed(raw)),
                 ));
             }
         };
@@ -1803,13 +1833,15 @@ async fn re_encode_conditionally(
     id: &AssetId,
     expect_generation: Option<u32>,
 ) -> Result<ReEncodeOutcome, ApiError> {
+    // The asset guard is held from this load through the promotion below, so
+    // nothing about this asset can interleave: the generation read here
+    // cannot go stale while this task decides, and waiting for a conversion
+    // permit afterwards changes nothing this task can see. Verdicts — skip,
+    // not found, retired — therefore resolve on the guard and a database
+    // read alone; only an actual conversion takes a permit. Without this,
+    // one long conversion at the default concurrency of one would stall an
+    // entire retry batch of already-done assets behind it.
     let _asset_guard = state.lock_asset_conversion(id).await;
-    let _permit = state
-        .conversion_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(ApiError::internal)?;
     let asset = load_asset(state, id, Some(Kind::Image)).await?;
     if asset.asset.state() != AssetState::Active {
         return Err(ApiError::conflict(
@@ -1821,6 +1853,15 @@ async fn re_encode_conditionally(
         return Ok(ReEncodeOutcome::Skipped(asset.asset.generation));
     }
 
+    let _permit = state
+        .conversion_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(ApiError::internal)?;
+    // Nothing about this asset changed while waiting for the permit: every
+    // operation on it needs the guard this task has held all along, so the
+    // loaded state is still current.
     let staging = fresh_staging_dir(state, id).await?;
     let result = re_encode_staged(state, &asset, &staging).await;
     // Startup sweeps staging too, but there is no reason to leave it behind.
@@ -2201,18 +2242,22 @@ fn encode_re_render_cursor(id: &str) -> String {
 }
 
 fn decode_re_render_cursor(value: &str) -> Result<AssetId, ApiError> {
-    let encoded = value.strip_prefix("v1_").ok_or_else(|| {
-        ApiError::bad_request("invalid_cursor", "after must be a cursor returned in next.")
-    })?;
-    let bytes = hex::decode(encoded).map_err(|_| {
-        ApiError::bad_request("invalid_cursor", "after must be a cursor returned in next.")
-    })?;
-    let id = std::str::from_utf8(&bytes).map_err(|_| {
-        ApiError::bad_request("invalid_cursor", "after must be a cursor returned in next.")
-    })?;
-    AssetId::parse(id).map_err(|_| {
-        ApiError::bad_request("invalid_cursor", "after must be a cursor returned in next.")
-    })
+    // Every rejection answers with the value it refused: this is the
+    // diagnostic issue #11 asked for, and the value travels in the detail
+    // where both the log and the client can see it.
+    let invalid = || {
+        ApiError::bad_request(
+            "invalid_cursor",
+            format!(
+                "after value {} is not a cursor returned in next.",
+                echoed(value)
+            ),
+        )
+    };
+    let encoded = value.strip_prefix("v1_").ok_or_else(invalid)?;
+    let bytes = hex::decode(encoded).map_err(|_| invalid())?;
+    let id = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+    AssetId::parse(id).map_err(|_| invalid())
 }
 
 async fn re_render_ids(
@@ -2843,7 +2888,12 @@ fn parse_generation(value: &str) -> Result<u32, ApiError> {
         .parse::<u32>()
         .ok()
         .filter(|generation| *generation > 0)
-        .ok_or_else(|| ApiError::bad_request("invalid_generation", "g must be a positive integer."))
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_generation",
+                format!("g value {} must be a positive integer.", echoed(value)),
+            )
+        })
 }
 
 /// A format name a caller may ask for.
@@ -2851,7 +2901,10 @@ fn parse_rendition_format(value: &str) -> Result<RenditionFormat, ApiError> {
     RenditionFormat::from_key(&value.trim().to_ascii_lowercase()).ok_or_else(|| {
         ApiError::bad_request(
             "invalid_format",
-            "format must be one of jxl, avif, webp, jpeg or png.",
+            format!(
+                "format value {} must be one of jxl, avif, webp, jpeg or png.",
+                echoed(value)
+            ),
         )
     })
 }
@@ -3365,7 +3418,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{ByteRange, ORIGINAL_FILENAME_HEADER, PLACEHOLDER_PNG, parse_range, select_format};
+    use super::{
+        ByteRange, ORIGINAL_FILENAME_HEADER, PLACEHOLDER_PNG, echoed, parse_range, select_format,
+    };
 
     fn rendition(format: RenditionFormat) -> RenditionRecord {
         RenditionRecord {
@@ -6146,6 +6201,9 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error["error"]["code"], "invalid_cursor");
+        // The rejected value travels with the error, so the log line this
+        // detail is traced with says which cursor was refused (#11).
+        assert!(error["error"]["message"].as_str().unwrap().contains("../x"));
 
         let response = router
             .clone()
@@ -6575,6 +6633,109 @@ mod tests {
         );
         assert_eq!(job["results"][0]["outcome"], "re_encoded");
         assert_eq!(job["results"][0]["generation"], 2);
+    }
+
+    /// Rejected values are quoted, escaped and bounded: they are arbitrary
+    /// client input, and a log line or error message must survive whatever a
+    /// client chooses to send (#11's offending-value diagnostic).
+    #[test]
+    fn echoed_values_are_quoted_escaped_and_bounded() {
+        assert_eq!(echoed("plain"), r#""plain""#);
+        assert_eq!(echoed(""), r#""""#);
+        assert_eq!(echoed("a\"b"), r#""a\"b""#);
+
+        let escaped = echoed("line\nbreak\r\t\"");
+        assert!(!escaped.contains('\n'), "no raw newline: {escaped}");
+        assert!(!escaped.contains('\r'), "no raw carriage return: {escaped}");
+        assert!(
+            escaped.contains("\\n"),
+            "the newline stays visible: {escaped}"
+        );
+
+        let bounded = echoed(&"x".repeat(500));
+        assert!(bounded.starts_with('"'), "{bounded}");
+        assert!(bounded.ends_with('…'), "truncation is marked: {bounded}");
+        assert!(bounded.len() < 120, "bounded: {bounded}");
+        assert!(!bounded.contains('\n'));
+
+        // A multi-byte character under the boundary is cut on a character
+        // boundary, never mid-code-unit.
+        let emoji = format!("a{}", "🎉".repeat(25));
+        let cut = echoed(&emoji);
+        assert!(cut.starts_with('"') && cut.ends_with('…'), "{cut}");
+    }
+
+    /// Only an actual conversion takes a permit. Verdicts — a skip, an
+    /// unknown id — and lifecycle actions resolve without one, so a busy
+    /// conversion queue can stall neither a retry batch nor a delete.
+    #[tokio::test]
+    async fn verdicts_and_deletes_do_not_wait_for_a_conversion_permit() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let router = app(state.clone());
+        // Uploads come first: they need conversion permits of their own.
+        let done = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("done.png"), "400x300"),
+        )
+        .await;
+        let doomed = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("doomed.png"), "500x300"),
+        )
+        .await;
+        let missing = AssetId::generate(18).unwrap().to_string();
+
+        // The test now owns the instance's only conversion permit: every
+        // real conversion is queued behind it for as long as it is held.
+        let permit = state
+            .conversion_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        // A delete of an unrelated asset takes only that asset's own lock,
+        // never the conversion queue.
+        let delete = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send(&router, authorized("DELETE", &asset_uri("images", &doomed))),
+        )
+        .await
+        .expect("the delete waited behind the conversion queue");
+        assert_eq!(delete.0, StatusCode::NO_CONTENT, "{}", delete.1);
+
+        // Verdicts resolve without a permit as well: the already-done asset
+        // skips and the unknown one fails while every permit is spoken for.
+        // If either needed the permit, this would hang and the timeout would
+        // say so instead of the assertion below failing mysteriously.
+        let batch = json!({"ids": [
+            {"id": done.clone(), "expect_generation": 1},
+            {"id": missing}
+        ]});
+        let verdicts = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send(
+                &router,
+                json_request("POST", "/api/v1/images/re-render", &batch),
+            ),
+        )
+        .await
+        .expect("the batch waited behind the conversion queue");
+        assert_eq!(verdicts.0, StatusCode::OK, "{}", verdicts.1);
+        assert_eq!(verdicts.1["count"], 0);
+        assert_eq!(
+            verdicts.1["skipped"],
+            json!([{"id": done, "generation": 1}])
+        );
+        assert_eq!(
+            verdicts.1["failures"][0]["error"]["code"],
+            "asset_not_found"
+        );
+
+        drop(permit);
     }
 
     /// A caller can ask for a rendition format by name.
