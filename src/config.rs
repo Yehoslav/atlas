@@ -21,6 +21,7 @@ pub struct Config {
     pub magick_bin: String,
     pub magick_timeout: Duration,
     pub image_processing_timeout: Duration,
+    pub conversion_concurrency: usize,
     pub trash_retention_days: u32,
 }
 
@@ -163,6 +164,20 @@ impl Config {
                 )?,
                 "ATLAS_IMAGE_PROCESSING_TIMEOUT_SECS",
             )?),
+            conversion_concurrency: {
+                let concurrency = setting(
+                    &file.conversion_concurrency,
+                    "ATLAS_CONVERSION_CONCURRENCY",
+                    1,
+                    parse_usize,
+                )?;
+                if !(1..=MAX_CONVERSION_CONCURRENCY).contains(&concurrency) {
+                    return Err(format!(
+                        "ATLAS_CONVERSION_CONCURRENCY must be between 1 and {MAX_CONVERSION_CONCURRENCY}"
+                    ));
+                }
+                concurrency
+            },
             trash_retention_days: u32::try_from(positive(
                 setting(
                     &file.trash_retention_days,
@@ -192,8 +207,11 @@ struct FileConfig {
     magick_bin: Option<String>,
     magick_timeout_secs: Option<u64>,
     image_processing_timeout_secs: Option<u64>,
+    conversion_concurrency: Option<usize>,
     trash_retention_days: Option<u64>,
 }
+
+const MAX_CONVERSION_CONCURRENCY: usize = 8;
 
 impl FileConfig {
     fn load(path: &Path) -> Result<Self, String> {
@@ -402,6 +420,7 @@ mod tests {
             "ATLAS_MAGICK_BIN",
             "ATLAS_MAGICK_TIMEOUT_SECS",
             "ATLAS_IMAGE_PROCESSING_TIMEOUT_SECS",
+            "ATLAS_CONVERSION_CONCURRENCY",
             "ATLAS_TRASH_RETENTION_DAYS",
         ] {
             remove_var(name);
@@ -426,6 +445,7 @@ mod tests {
         assert_eq!(config.id_length, super::DEFAULT_LENGTH);
         assert_eq!(config.max_consumer_data_bytes, 64 * 1024);
         assert_eq!(config.variant_widths, vec![320, 640, 960, 1280]);
+        assert_eq!(config.conversion_concurrency, 1);
     }
 
     #[test]
@@ -441,6 +461,7 @@ mod tests {
             variant_widths = [400, 800]
             max_image_bytes = 1234
             max_consumer_data_bytes = 8192
+            conversion_concurrency = 3
             "#,
         );
         set_var("ATLAS_CONFIG", &path.display().to_string());
@@ -451,6 +472,7 @@ mod tests {
         assert_eq!(config.variant_widths, vec![400, 800]);
         assert_eq!(config.max_image_bytes, 1234);
         assert_eq!(config.max_consumer_data_bytes, 8192);
+        assert_eq!(config.conversion_concurrency, 3);
     }
 
     #[test]
@@ -500,6 +522,25 @@ mod tests {
         base_env();
         set_var("ATLAS_MAX_IMAGE_BYTES", "0");
         assert!(Config::from_env().is_err());
+    }
+
+    #[test]
+    fn conversion_concurrency_is_bounded_and_environment_overrides_file() {
+        let _guard = env_lock();
+        base_env();
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_config(directory.path(), "conversion_concurrency = 3\n");
+        set_var("ATLAS_CONFIG", &path.display().to_string());
+        set_var("ATLAS_CONVERSION_CONCURRENCY", "2");
+        assert_eq!(Config::from_env().unwrap().conversion_concurrency, 2);
+
+        for value in ["0", "9", "many"] {
+            set_var("ATLAS_CONVERSION_CONCURRENCY", value);
+            assert!(
+                Config::from_env().is_err(),
+                "accepted invalid concurrency {value}"
+            );
+        }
     }
 
     #[test]

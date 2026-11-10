@@ -259,14 +259,24 @@ as an attachment instead of being re-encoded into a picture.
   consumer that stores a srcset learns the new URLs in the same call. This is
   the way out of an encoding that turned out to be bad. A trashed image is a
   `409`, and an unknown option in the body is a `400`.
-- `POST /api/v1/images/re-render` — authenticated re-encode of every live
-  image, one at a time and each under the conversion slot, a page per call.
-  Body `{"limit": 10, "after": "…"}`, both optional (`limit` max 100). The
-  answer has the `count` re-encoded, the `re_encoded` ids with their new
-  generation, the `failures`, how many images are `remaining`, and `next`, the
-  `after` for the following page, `null` once the walk is done. The cursor
-  moves past a failure, so collect the `failures` as you go. Trashed images
-  are skipped; re-encode one after restoring it.
+- `POST /api/v1/images/re-render` — authenticated re-encode of selected images
+  or a page of every live image. For a retry-safe targeted batch, send
+  `{"ids":[{"id":"…","expect_generation":2}]}` (max 100 unique IDs).
+  `expect_generation` is optional; when the current generation is already at
+  least that value, the item is returned in `skipped` with its current
+  generation. Otherwise Atlas re-encodes it once. To make a retry safe, set it
+  to the listed generation plus one. Omit the expectation to always re-encode.
+  Each item is independently reported in `re_encoded`,
+  `skipped`, or `failures`; failure entries include an error code and message.
+  The batch response has `next: null` and `remaining: 0`.
+
+  To walk the whole live collection, send `{"limit":10,"after":"…"}`;
+  both fields are optional and `limit` is capped at 100. `next` is an opaque,
+  versioned cursor token to pass back as `after`, and is `null` when the walk is
+  done. The cursor advances past failures, so collect them as you go. Trashed
+  images fail as individual items; restore one before retrying it. Use explicit
+  IDs with expected generations when a lost response must be safely retried
+  without re-encoding completed assets.
 
 Uploads are content-addressed within their collection. If the exact bytes are
 already live there, nothing is written or converted and the response is `200`
@@ -372,25 +382,26 @@ curl -X POST -H "Authorization: Bearer $ATLAS_API_TOKEN" \
 ```
 
 After an encoder change — a newer ImageMagick, a corrected flag — every image
-needs it. `POST /api/v1/images/re-render` walks the live images a page per
-call; pass `next` back as `after` until it is `null`. The cursor moves past an
-image that failed, so `null` means every live image was tried, not that every
-one was re-encoded. Keep the `failures` of each page: every entry names its
-image, and once the cause is fixed each one is re-encoded on its own with
-`{"re_encode": true}`.
+needs it. `POST /api/v1/images/re-render` walks live images a page per call;
+pass the opaque `next` token back as `after` until it is `null`. The cursor
+moves past an image that failed, so `null` means every live image was tried,
+not that every one was re-encoded. Keep the `failures` of each page and retry
+failed IDs after fixing the cause.
 
-A re-encode is not free and not idempotent. Every one writes a new copy of
-the asset's renditions and keeps every older copy until the asset is purged,
-so the disk an image's renditions take grows by one copy per re-encode, and
-the consumer's stored srcsets change each time. A page retried from the same
-`after` re-encodes the images it already did; keep pages small and resume from
-the last `next` that came back.
+An unconditional re-encode is not free or idempotent. Every one writes a new
+copy of the asset's renditions and keeps every older copy until the asset is
+purged, so the disk an image's renditions take grows by one copy per re-encode,
+and the consumer's stored srcsets change each time. For retry safety, send
+explicit IDs with `expect_generation` set to the desired next generation. If the
+response is lost, retry that batch: assets already at or above that generation
+are returned in `skipped` with their current generation instead of being
+re-encoded again.
 
-A page re-encodes its images one after another inside the request, so it holds
-the request open for one conversion per image. Behind a proxy, keep `limit`
-small enough that a page finishes inside the proxy's read timeout (nginx waits
-60 seconds by default): a page the proxy gives up on may already have
-re-encoded some of its images, and retrying it re-encodes those again.
+A page may re-encode several images concurrently, bounded by
+`ATLAS_CONVERSION_CONCURRENCY` (default 1). Behind a proxy, keep `limit` small
+enough that the page finishes inside the proxy's read timeout (nginx waits 60
+seconds by default): a page may have re-encoded some images when the proxy
+gives up. Use explicit IDs and expected generations to retry safely.
 
 ## Asset IDs
 
@@ -719,6 +730,7 @@ max_image_dimension = 12000
 magick_bin = "magick"
 magick_timeout_secs = 45
 image_processing_timeout_secs = 120
+conversion_concurrency = 1
 
 trash_retention_days = 30
 ```
@@ -744,11 +756,13 @@ Environment variables override the file, which is useful for per-host values:
 | `ATLAS_MAGICK_BIN` | `magick` | ImageMagick executable |
 | `ATLAS_MAGICK_TIMEOUT_SECS` | 45 | Per ImageMagick invocation limit |
 | `ATLAS_IMAGE_PROCESSING_TIMEOUT_SECS` | 120 | Total processing limit per image |
+| `ATLAS_CONVERSION_CONCURRENCY` | `1` | Concurrent image conversions (1–8) |
 | `ATLAS_TRASH_RETENTION_DAYS` | 30 | Days a trashed asset is kept before purge |
 
-Uploads are streamed to staging files; at most two uploads and one conversion
-run concurrently. ImageMagick receives explicit input/output formats and
-resource limits. Failed requests do not publish partial assets. On startup,
+Uploads are streamed to staging files; at most two uploads and the configured
+number of conversions run concurrently. ImageMagick receives explicit
+input/output formats and resource limits. Failed requests do not publish
+partial assets. On startup,
 Atlas applies any pending schema migrations, runs `PRAGMA integrity_check` and
 `PRAGMA foreign_key_check` (refusing to start if either reports a problem),
 removes incomplete staging data, and returns any interrupted delete or restore

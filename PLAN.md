@@ -105,14 +105,17 @@ media files and media metadata only.
   the change is additive and the current generation stays in `renditions`.
   The cost is disk: every generation's files are kept until the asset is
   purged.
-  A bulk re-render walks the live images a page per request, each under the
-  conversion slot; there is no job queue, so the caller drives the walk.
-  Nothing records what produced a generation, so "re-render after the libjxl
-  fix" and "re-render again because the cursor was lost" are the same request,
-  and each adds a full copy of every image's renditions. The lever is data,
-  not machinery: an encoder stamp beside the generation (the ImageMagick and
-  libjxl versions, or a build stamp) would let the walk skip the images the
-  current encoder already produced. It is left open in `TODO.md`.
+  A bulk re-render walks the live images a page per request; there is no job
+  queue, so the caller drives the walk. The endpoint also accepts explicit ID
+  batches with an optional expected generation. If an asset is already at or
+  above that generation it is reported as skipped, making a repeated request
+  safe after a lost response and returning the generation the consumer needs
+  for its URLs. A generation still does not record which encoder produced it,
+  so Atlas cannot automatically decide which assets need a new encoder; an
+  encoder stamp remains a separate possible improvement in `TODO.md`. Walk
+  cursors are opaque, versioned tokens. Conversion concurrency is configurable
+  per instance (default one, bounded at eight), with per-asset serialization
+  to keep staging and generation promotion safe.
 - Renditions are converted to sRGB through the source's embedded ICC profile
   before metadata is stripped, so a Display P3 phone photo keeps its colours
   instead of being relabelled. The target is a compact sRGB profile embedded in
@@ -305,9 +308,10 @@ collections.
 - `POST /api/v1/images/{id}/renditions` — authenticated generation of the
   renditions an asset is missing, under the same asset id; with
   `{"re_encode": true}`, a re-encode of every rendition as a new generation.
-- `POST /api/v1/images/re-render` — authenticated re-encode of every live
-  image, a page per call, answering with the count, the failures and the
-  cursor for the next page.
+- `POST /api/v1/images/re-render` — authenticated explicit-ID batches with
+  optional expected generations for retry-safe re-encoding, or a cursor walk of
+  all live images. Per-item outcomes report re-encoded, skipped and failed
+  assets; walk cursors are opaque and versioned.
 - `GET /media/{id}/original` — public, unmodified original.
 - `GET /media/{id}/w{max_width}` — public rendition with format selected from
   `Accept`; JXL, AVIF, WebP, then an acceptable JPEG/PNG fallback. A `format`
@@ -345,9 +349,10 @@ uploads, or arbitrary URL transformations.
   formats, and per-process memory/map/disk/thread/time limits. Startup verifies
   read/write support for JPEG, PNG, WebP, AVIF, and JXL, and that LCMS is built
   in.
-- Bound uploads to two concurrent requests, image conversions to one at a time,
-  each ImageMagick invocation to 45 seconds, and all processing for one image
-  to 120 seconds. No persistent job queue is needed for occasional uploads.
+- Bound uploads to two concurrent requests, image conversions to the configured
+  concurrency (default one, maximum eight), each ImageMagick invocation to 45
+  seconds, and all processing for one image to 120 seconds. No persistent job
+  queue is needed for occasional uploads.
 - Originals and generated renditions are staged together, then atomically
   promoted before metadata is committed. Startup removes incomplete staging
   data and unindexed asset directories after a crash.
