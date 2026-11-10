@@ -18,7 +18,7 @@ use axum::{
             VARY, X_CONTENT_TYPE_OPTIONS,
         },
     },
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,8 @@ use crate::{
         AssetRecord, AssetState, Kind, RenditionFormat, RenditionRecord, SourceFormat, StoredAsset,
     },
     store::{
-        DEFAULT_LIST_LIMIT, InsertOutcome, ListQuery, MAX_LIST_LIMIT, Order, Sort, StateFilter,
+        DEFAULT_LIST_LIMIT, InsertOutcome, ListQuery, MAX_LIST_LIMIT, Order, ReRenderJobOutcome,
+        ReRenderJobState, Sort, StateFilter, StoreError,
     },
 };
 
@@ -1968,15 +1969,31 @@ fn optional_json<T: serde::de::DeserializeOwned + Default>(body: &[u8]) -> Resul
 const DEFAULT_RE_RENDER_LIMIT: i64 = 10;
 const MAX_RE_RENDER_LIMIT: i64 = 100;
 const MAX_RE_RENDER_IDS: usize = 100;
+/// How many assets one asynchronous job may cover.
+///
+/// A job snapshots its selection into durable rows at creation, so the cap
+/// bounds the work one accepted job can ever ask for. A consumer with more
+/// images shards the walk with `after`, starting one job per shard.
+const MAX_ASYNC_RE_RENDER_IDS: usize = 1000;
 
-/// Re-encode selected images or walk every live image a page at a time.
+/// Re-encode selected images, synchronously or as a detached job.
+///
+/// Without `async`, the request stays open for its page and answers with the
+/// outcomes — right for small batches. With `async: true`, the selection is
+/// validated and persisted first, the answer is `202` with a `job_id`, and
+/// processing runs in a task that no longer has anything to do with the
+/// connection: a client that disconnects, times out or reloads polls
+/// `GET /api/v1/images/re-render/{job_id}` for progress and results.
 pub(super) async fn re_render_images(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<ReRenderResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     authorize(&state, &headers)?;
     let request: ReRenderRequest = optional_json(&body)?;
+    if request.asynchronous.unwrap_or(false) {
+        return start_re_render_job(&state, request).await;
+    }
     if let Some(items) = request.ids {
         if request.limit.is_some() || request.after.is_some() {
             return Err(ApiError::bad_request(
@@ -1984,7 +2001,10 @@ pub(super) async fn re_render_images(
                 "ids cannot be combined with limit or after.",
             ));
         }
-        return re_render_ids(&state, items).await.map(Json);
+        return re_render_ids(&state, items)
+            .await
+            .map(Json)
+            .map(IntoResponse::into_response);
     }
 
     let limit = request
@@ -2033,7 +2053,8 @@ pub(super) async fn re_render_images(
         failures,
         next,
         remaining,
-    }))
+    })
+    .into_response())
 }
 
 #[derive(Default, Deserialize)]
@@ -2043,6 +2064,10 @@ pub(super) struct ReRenderRequest {
     limit: Option<i64>,
     /// The `next` token of the previous page; absent to start from the beginning.
     after: Option<String>,
+    /// Run the selection as a detached job instead of holding the request
+    /// open; the answer is `202` with a `job_id`.
+    #[serde(rename = "async")]
+    asynchronous: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -2050,6 +2075,43 @@ pub(super) struct ReRenderRequest {
 struct ReRenderItem {
     id: String,
     expect_generation: Option<u32>,
+}
+
+/// Check an explicit selection before anything is stored or run: the cap,
+/// unique well-formed ids, and positive expected generations. The same rules
+/// apply to a synchronous page and to a job; only the cap differs.
+fn validate_re_render_items(
+    items: Vec<ReRenderItem>,
+    max: usize,
+) -> Result<Vec<(AssetId, Option<u32>)>, ApiError> {
+    if items.len() > max {
+        return Err(ApiError::bad_request(
+            "too_many_ids",
+            format!("ids may contain at most {max} items."),
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(items.len());
+    items
+        .into_iter()
+        .map(|item| {
+            let id = AssetId::parse(&item.id).map_err(|_| {
+                ApiError::bad_request("invalid_asset_id", "ids must contain valid asset IDs.")
+            })?;
+            if !seen.insert(id.to_string()) {
+                return Err(ApiError::bad_request(
+                    "duplicate_id",
+                    "ids must not contain duplicates.",
+                ));
+            }
+            if item.expect_generation == Some(0) {
+                return Err(ApiError::bad_request(
+                    "invalid_generation",
+                    "expect_generation must be a positive integer.",
+                ));
+            }
+            Ok((id, item.expect_generation))
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -2085,8 +2147,53 @@ struct ReRenderFailure {
 
 #[derive(Serialize)]
 struct ReRenderErrorDetail {
-    code: &'static str,
+    code: String,
     message: String,
+}
+
+/// The answer to starting an asynchronous job: nothing but the handle the
+/// caller polls. The work itself is already durable in the job rows.
+#[derive(Serialize)]
+pub(super) struct ReRenderStartResponse {
+    job_id: String,
+}
+
+/// A job's lifecycle, progress, and per-asset results.
+#[derive(Serialize)]
+pub(super) struct ReRenderJobResponse {
+    job_id: String,
+    /// `queued`, `running`, `completed` or `failed`.
+    state: String,
+    created_at: i64,
+    updated_at: i64,
+    /// A job-level failure, set only in the `failed` state. Per-image
+    /// failures live in `results`; they do not fail the job.
+    error: Option<String>,
+    progress: ReRenderJobProgress,
+    results: Vec<ReRenderJobItemResponse>,
+}
+
+#[derive(Serialize)]
+struct ReRenderJobProgress {
+    /// Assets the job selected, frozen at creation.
+    total: usize,
+    /// Items no longer `pending`.
+    processed: usize,
+    re_encoded: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+#[derive(Serialize)]
+struct ReRenderJobItemResponse {
+    id: String,
+    /// `pending`, `re_encoded`, `skipped` or `failed`.
+    outcome: String,
+    /// The generation the item was written at, or the one it already had
+    /// when it was skipped. Absent while pending and on failure.
+    generation: Option<u32>,
+    /// Present only for a failed item.
+    error: Option<ReRenderErrorDetail>,
 }
 
 fn encode_re_render_cursor(id: &str) -> String {
@@ -2112,34 +2219,7 @@ async fn re_render_ids(
     state: &AppState,
     items: Vec<ReRenderItem>,
 ) -> Result<ReRenderResponse, ApiError> {
-    if items.len() > MAX_RE_RENDER_IDS {
-        return Err(ApiError::bad_request(
-            "too_many_ids",
-            format!("ids may contain at most {MAX_RE_RENDER_IDS} items."),
-        ));
-    }
-    let mut seen = std::collections::HashSet::with_capacity(items.len());
-    let items = items
-        .into_iter()
-        .map(|item| {
-            let id = AssetId::parse(&item.id).map_err(|_| {
-                ApiError::bad_request("invalid_asset_id", "ids must contain valid asset IDs.")
-            })?;
-            if !seen.insert(id.to_string()) {
-                return Err(ApiError::bad_request(
-                    "duplicate_id",
-                    "ids must not contain duplicates.",
-                ));
-            }
-            if item.expect_generation == Some(0) {
-                return Err(ApiError::bad_request(
-                    "invalid_generation",
-                    "expect_generation must be a positive integer.",
-                ));
-            }
-            Ok((id, item.expect_generation))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let items = validate_re_render_items(items, MAX_RE_RENDER_IDS)?;
     let (re_encoded, skipped, failures) = process_re_render_items(state, items).await;
     Ok(ReRenderResponse {
         count: re_encoded.len(),
@@ -2190,7 +2270,7 @@ async fn process_re_render_items(
                 failures.push(ReRenderFailure {
                     id: id.to_string(),
                     error: ReRenderErrorDetail {
-                        code: error.code(),
+                        code: error.code().to_owned(),
                         message: error.detail().to_owned(),
                     },
                 });
@@ -2198,6 +2278,358 @@ async fn process_re_render_items(
         }
     }
     (re_encoded, skipped, failures)
+}
+
+/// Validate and persist an asynchronous job, then answer `202` at once.
+///
+/// Everything durable is written before the response: by the time the caller
+/// has a `job_id`, the job and every item row exist, so a lost connection
+/// after the answer changes nothing and a crash before the answer leaves a
+/// job a restarted process picks up. Processing runs in a detached task that
+/// holds its own `AppState` clone — nothing about it is tied to the request
+/// that started it.
+async fn start_re_render_job(
+    state: &AppState,
+    request: ReRenderRequest,
+) -> Result<Response, ApiError> {
+    if request.limit.is_some() {
+        return Err(ApiError::bad_request(
+            "limit_in_async_mode",
+            "limit applies to synchronous pages only; an async job processes its whole selection.",
+        ));
+    }
+    let items = if let Some(items) = request.ids {
+        if request.after.is_some() {
+            return Err(ApiError::bad_request(
+                "conflicting_re_render_modes",
+                "ids cannot be combined with after.",
+            ));
+        }
+        validate_re_render_items(items, MAX_ASYNC_RE_RENDER_IDS)?
+    } else {
+        // The walk is snapshotted into items: the selection a job was
+        // accepted for does not shift underneath it while it runs, so
+        // `total` is exact and every selected asset has a results row
+        // whether or not it still exists by the time the job reaches it.
+        let after = request
+            .after
+            .as_deref()
+            .map(decode_re_render_cursor)
+            .transpose()?;
+        let (ids, _) = state
+            .store
+            .live_images_after(
+                after.as_ref(),
+                i64::try_from(MAX_ASYNC_RE_RENDER_IDS).unwrap_or(i64::MAX) + 1,
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        if ids.len() > MAX_ASYNC_RE_RENDER_IDS {
+            return Err(ApiError::bad_request(
+                "too_many_ids",
+                format!(
+                    "a job may cover at most {MAX_ASYNC_RE_RENDER_IDS} live images; \
+                     start another job with after to continue."
+                ),
+            ));
+        }
+        ids.into_iter().map(|id| (id, None)).collect::<Vec<_>>()
+    };
+
+    let job_id = AssetId::generate(state.config.id_length)
+        .map_err(ApiError::internal)?
+        .to_string();
+    let now = crate::unix_now().map_err(ApiError::internal)?;
+    state
+        .store
+        .create_re_render_job(&job_id, now, &items)
+        .await
+        .map_err(ApiError::internal)?;
+    prune_old_re_render_jobs(state, now).await;
+    tracing::info!(job = %job_id, items = items.len(), "started an async re-render job");
+    tokio::spawn(run_re_render_job(state.clone(), job_id.clone()));
+    Ok((StatusCode::ACCEPTED, Json(ReRenderStartResponse { job_id })).into_response())
+}
+
+/// Process one job to completion, detached from every connection.
+///
+/// Each item's outcome is written as it finishes, so a status poll sees
+/// progress grow and a crash loses at most the conversion in flight — the
+/// item stays `pending`, a restart claims the job again, and
+/// `expect_generation` makes re-doing an interrupted conversion harmless.
+/// A store failure mid-job fails the job with the reason recorded; failed
+/// jobs are terminal and the caller starts a new one, which is cheap for
+/// exactly the same reason.
+async fn run_re_render_job(state: AppState, job_id: String) {
+    let now = match crate::unix_now() {
+        Ok(now) => now,
+        Err(error) => {
+            tracing::error!(job = %job_id, %error, "cannot timestamp the re-render job claim");
+            return;
+        }
+    };
+    match state.store.mark_re_render_job_running(&job_id, now).await {
+        // Already terminal (finished, or pruned): never run it twice.
+        Ok(0) => {
+            tracing::debug!(job = %job_id, "re-render job is not runnable; not starting it");
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(job = %job_id, %error, "could not claim the re-render job");
+            return;
+        }
+    }
+
+    let items = match state.store.re_render_job(&job_id).await {
+        Ok(Some((_, items))) => items,
+        Ok(None) => {
+            tracing::warn!(job = %job_id, "re-render job disappeared before it ran");
+            return;
+        }
+        Err(error) => {
+            fail_re_render_job(
+                &state,
+                &job_id,
+                &format!("could not read job items: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
+    let pending = match items
+        .into_iter()
+        .filter(|item| item.outcome == ReRenderJobOutcome::Pending)
+        .map(|item| -> Result<_, StoreError> {
+            let id = AssetId::parse(&item.id).map_err(|error| {
+                StoreError::Corrupt(format!(
+                    "re-render job item has invalid asset id {:?}: {error}",
+                    item.id
+                ))
+            })?;
+            let expect_generation = item
+                .expect_generation
+                .map(|generation| {
+                    u32::try_from(generation).map_err(|_| {
+                        StoreError::Corrupt(format!(
+                            "re-render job item has invalid expect_generation {generation}"
+                        ))
+                    })
+                })
+                .transpose()?;
+            Ok((item.position, id, expect_generation))
+        })
+        .collect::<Result<Vec<_>, StoreError>>()
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            fail_re_render_job(
+                &state,
+                &job_id,
+                &format!("job items are unreadable: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
+
+    tracing::info!(job = %job_id, pending = pending.len(), "re-render job running");
+    let concurrency = state.config.conversion_concurrency;
+    let mut stream = futures_util::stream::iter(pending)
+        .map(|(position, id, expect_generation)| {
+            let state = state.clone();
+            async move {
+                let outcome = re_encode_conditionally(&state, &id, expect_generation).await;
+                (position, id, outcome)
+            }
+        })
+        .buffer_unordered(concurrency);
+
+    while let Some((position, id, outcome)) = stream.next().await {
+        let (outcome, generation, code, message) = match outcome {
+            Ok(ReEncodeOutcome::ReEncoded(response)) => {
+                tracing::info!(job = %job_id, asset = %id, generation = response.generation, "job item re-encoded");
+                (
+                    ReRenderJobOutcome::ReEncoded,
+                    Some(response.generation),
+                    None,
+                    None,
+                )
+            }
+            Ok(ReEncodeOutcome::Skipped(generation)) => {
+                tracing::info!(job = %job_id, asset = %id, generation, "job item skipped");
+                (ReRenderJobOutcome::Skipped, Some(generation), None, None)
+            }
+            Err(error) => {
+                tracing::error!(job = %job_id, asset = %id, code = error.code(), error = error.detail(), "job item failed");
+                (
+                    ReRenderJobOutcome::Failed,
+                    None,
+                    Some(error.code()),
+                    Some(error.detail().to_owned()),
+                )
+            }
+        };
+        let now = match crate::unix_now() {
+            Ok(now) => now,
+            Err(error) => {
+                fail_re_render_job(
+                    &state,
+                    &job_id,
+                    &format!("cannot timestamp an item outcome: {error}"),
+                )
+                .await;
+                return;
+            }
+        };
+        if let Err(error) = state
+            .store
+            .update_re_render_job_item(
+                &job_id,
+                position,
+                now,
+                outcome,
+                generation,
+                code,
+                message.as_deref(),
+            )
+            .await
+        {
+            fail_re_render_job(
+                &state,
+                &job_id,
+                &format!("could not record an item outcome: {error}"),
+            )
+            .await;
+            return;
+        }
+    }
+
+    let now = match crate::unix_now() {
+        Ok(now) => now,
+        Err(error) => {
+            tracing::error!(job = %job_id, %error, "cannot timestamp the re-render job finish");
+            return;
+        }
+    };
+    if let Err(error) = state
+        .store
+        .finish_re_render_job(&job_id, now, ReRenderJobState::Completed, None)
+        .await
+    {
+        tracing::error!(job = %job_id, %error, "could not finish the re-render job");
+        return;
+    }
+    tracing::info!(job = %job_id, "re-render job completed");
+}
+
+/// Record a job-level failure. Best effort by design: if even this cannot be
+/// written, the job simply stays `running`, and a restart re-claims it — the
+/// failure is loud in the log either way.
+async fn fail_re_render_job(state: &AppState, job_id: &str, message: &str) {
+    tracing::error!(job = %job_id, error = %message, "re-render job failed");
+    let now = match crate::unix_now() {
+        Ok(now) => now,
+        Err(error) => {
+            tracing::error!(job = %job_id, %error, "cannot timestamp the re-render job failure");
+            return;
+        }
+    };
+    if let Err(error) = state
+        .store
+        .finish_re_render_job(job_id, now, ReRenderJobState::Failed, Some(message))
+        .await
+    {
+        tracing::error!(job = %job_id, %error, "could not record the re-render job failure");
+    }
+}
+
+/// Bound how long finished jobs are kept: the trash-retention bargain again,
+/// metadata bounded by an existing window rather than growing forever.
+async fn prune_old_re_render_jobs(state: &AppState, now: i64) {
+    let retention = i64::from(state.config.trash_retention_days) * 86_400;
+    match state.store.prune_re_render_jobs(now - retention).await {
+        Ok(0) => {}
+        Ok(pruned) => tracing::info!(pruned, "pruned old re-render jobs"),
+        Err(error) => tracing::error!(%error, "re-render job prune failed"),
+    }
+}
+
+/// Claim the jobs the previous process left behind, called once from
+/// `AppState::new` before the service answers requests. Items already final
+/// are not redone; pending ones continue under the same conversion bounds.
+pub(crate) async fn resume_re_render_jobs(state: AppState) {
+    if let Ok(now) = crate::unix_now() {
+        prune_old_re_render_jobs(&state, now).await;
+    }
+    match state.store.resumable_re_render_jobs().await {
+        Ok(ids) => {
+            for id in ids {
+                tracing::info!(job = %id, "resuming re-render job");
+                tokio::spawn(run_re_render_job(state.clone(), id));
+            }
+        }
+        Err(error) => tracing::error!(%error, "could not list re-render jobs to resume"),
+    }
+}
+
+/// Progress and per-asset results for one job, by id.
+pub(super) async fn get_re_render_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> Result<Json<ReRenderJobResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    // A job id is opaque; anything Atlas has not heard of is a 404, the
+    // rule asset ids already get on public media paths.
+    let not_found = || {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            "The re-render job was not found.",
+        )
+    };
+    let id = AssetId::parse(&job_id).map_err(|_| not_found())?;
+    let (job, items) = state
+        .store
+        .re_render_job(id.as_str())
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(not_found)?;
+
+    // The items are the source of truth: progress is counted from the
+    // outcomes themselves, so no counter can drift away from what happened.
+    let count =
+        |outcome: ReRenderJobOutcome| items.iter().filter(|item| item.outcome == outcome).count();
+    let progress = ReRenderJobProgress {
+        total: items.len(),
+        processed: items.len() - count(ReRenderJobOutcome::Pending),
+        re_encoded: count(ReRenderJobOutcome::ReEncoded),
+        skipped: count(ReRenderJobOutcome::Skipped),
+        failed: count(ReRenderJobOutcome::Failed),
+    };
+    let results = items
+        .into_iter()
+        .map(|item| ReRenderJobItemResponse {
+            id: item.id,
+            outcome: item.outcome.key().to_owned(),
+            generation: item.generation.and_then(|value| u32::try_from(value).ok()),
+            error: match (item.error_code, item.error_message) {
+                (Some(code), Some(message)) => Some(ReRenderErrorDetail { code, message }),
+                _ => None,
+            },
+        })
+        .collect();
+
+    Ok(Json(ReRenderJobResponse {
+        job_id: job.id,
+        state: job.state.key().to_owned(),
+        created_at: job.created_at,
+        updated_at: job.updated_at,
+        error: job.error,
+        progress,
+        results,
+    }))
 }
 
 /// The widths a configuration implies, and the width each one produces.
@@ -3098,6 +3530,22 @@ mod tests {
             serde_json::from_slice(&body).unwrap()
         };
         (status, value)
+    }
+
+    /// Poll a job by id until it reaches a terminal state, the way a consumer
+    /// drives one: the start request is long gone, and each poll is a fresh
+    /// authenticated read.
+    async fn wait_for_re_render_job(router: &Router, job_id: &str) -> serde_json::Value {
+        let uri = format!("/api/v1/images/re-render/{job_id}");
+        for _ in 0..600 {
+            let (status, job) = send(router, authorized("GET", &uri)).await;
+            assert_eq!(status, StatusCode::OK, "{job}");
+            if matches!(job["state"].as_str(), Some("completed" | "failed")) {
+                return job;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("re-render job {job_id} did not reach a terminal state in 30s");
     }
 
     /// Upload a document and return its id. Documents live in their own
@@ -5848,6 +6296,285 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
         }
+    }
+
+    /// The asynchronous path: `202` with a handle, the work detached from the
+    /// request that started it, and results still queryable after every
+    /// connection to the start request is gone.
+    #[tokio::test]
+    async fn async_re_render_jobs_answer_at_once_and_keep_results_queryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        let first = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("a.png"), "400x300"),
+        )
+        .await;
+        let second = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("b.png"), "500x300"),
+        )
+        .await;
+        let missing = AssetId::generate(18).unwrap().to_string();
+        let body = json!({
+            "async": true,
+            "ids": [
+                {"id": first.clone(), "expect_generation": 2},
+                {"id": second.clone(), "expect_generation": 1},
+                {"id": missing.clone(), "expect_generation": 2}
+            ]
+        });
+
+        // The accepted answer carries no work — by the time the client has a
+        // handle, the durable rows exist but no conversion has been promised
+        // to this connection, and none will be tied to it.
+        let (status, started) = send(
+            &router,
+            json_request("POST", "/api/v1/images/re-render", &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        let job_id = started["job_id"].as_str().unwrap().to_owned();
+        assert!(AssetId::parse(&job_id).is_ok());
+        assert!(started.get("results").is_none());
+        assert!(started.get("progress").is_none());
+
+        let job = wait_for_re_render_job(&router, &job_id).await;
+        assert_eq!(job["state"], "completed");
+        assert!(job["error"].is_null());
+        assert_eq!(
+            job["progress"],
+            json!({"total": 3, "processed": 3, "re_encoded": 1, "skipped": 1, "failed": 1})
+        );
+        let results = job["results"].as_array().unwrap();
+        let outcome_of = |id: &str| results.iter().find(|item| item["id"] == id).unwrap();
+        assert_eq!(outcome_of(&first)["outcome"], "re_encoded");
+        assert_eq!(outcome_of(&first)["generation"], 2);
+        assert_eq!(outcome_of(&second)["outcome"], "skipped");
+        assert_eq!(outcome_of(&second)["generation"], 1);
+        assert_eq!(outcome_of(&missing)["outcome"], "failed");
+        assert_eq!(outcome_of(&missing)["error"]["code"], "asset_not_found");
+        assert!(outcome_of(&missing)["generation"].is_null());
+
+        // Retrying the same selection as a second job spends no conversions:
+        // the lost-response guarantee, now with a durable handle to prove it.
+        let (status, started) = send(
+            &router,
+            json_request("POST", "/api/v1/images/re-render", &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        let retry = wait_for_re_render_job(&router, started["job_id"].as_str().unwrap()).await;
+        assert_eq!(retry["state"], "completed");
+        assert_eq!(
+            retry["progress"],
+            json!({"total": 3, "processed": 3, "re_encoded": 0, "skipped": 2, "failed": 1})
+        );
+
+        // An unknown or malformed job id is a 404, and the status endpoint
+        // needs the token like every other authenticated read.
+        let (status, error) = send(
+            &router,
+            authorized("GET", "/api/v1/images/re-render/000000000000000000"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+        assert_eq!(error["error"]["code"], "job_not_found");
+        let (status, error) = send(
+            &router,
+            authorized("GET", "/api/v1/images/re-render/not-a-job"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+        assert_eq!(error["error"]["code"], "job_not_found");
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/images/re-render/000000000000000000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A walk job snapshots the whole live collection: the trashed asset and
+    /// the document are not selected, and every selected asset gets a row.
+    #[tokio::test]
+    async fn an_async_walk_job_covers_the_whole_live_collection() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        let mut live = Vec::new();
+        for size in ["400x300", "500x300"] {
+            let image = write_test_image(&directory.path().join(format!("{size}.png")), size);
+            live.push(upload_image(&router, &image).await);
+        }
+        let trashed = upload_image(
+            &router,
+            &write_test_image(&directory.path().join("trashed.png"), "600x300"),
+        )
+        .await;
+        place_in_trash(&router, "images", &trashed).await;
+        upload_document(&router, b"%PDF-1.7\nnot an image").await;
+        live.sort();
+
+        let (status, started) = send(
+            &router,
+            json_request("POST", "/api/v1/images/re-render", &json!({"async": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        let job = wait_for_re_render_job(&router, started["job_id"].as_str().unwrap()).await;
+        assert_eq!(job["state"], "completed");
+        assert_eq!(
+            job["progress"],
+            json!({"total": 2, "processed": 2, "re_encoded": 2, "skipped": 0, "failed": 0})
+        );
+        let ids: Vec<_> = job["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ids, live, "selection order is id order");
+        assert!(!ids.contains(&trashed), "the trash is not re-rendered");
+    }
+
+    /// A job's shape is validated before anything is stored: the mode rules,
+    /// the larger job cap, and the same item rules the sync path applies.
+    #[tokio::test]
+    async fn async_jobs_validate_their_selection_and_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        let id = AssetId::generate(18).unwrap().to_string();
+        let too_many: Vec<_> = (0..1001)
+            .map(|_| json!({"id": AssetId::generate(18).unwrap().to_string()}))
+            .collect();
+        for (body, code) in [
+            (json!({"async": true, "limit": 1}), "limit_in_async_mode"),
+            (
+                json!({"async": true, "ids": [{"id": id.clone()}], "after": "v1_00"}),
+                "conflicting_re_render_modes",
+            ),
+            (
+                json!({"async": true, "ids": [{"id": id.clone(), "expect_generation": 0}]}),
+                "invalid_generation",
+            ),
+            (json!({"async": true, "ids": too_many}), "too_many_ids"),
+        ] {
+            let (status, error) = send(
+                &router,
+                json_request("POST", "/api/v1/images/re-render", &body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert_eq!(error["error"]["code"], code, "{error}");
+        }
+    }
+
+    /// A finished job's state and results outlive the process that produced
+    /// them: the next process answers with the same rows.
+    #[tokio::test]
+    async fn a_finished_job_survives_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = test_config(directory.path().join("atlas"));
+        let finished = {
+            let router = app(AppState::new(config.clone()).await.unwrap());
+            let image = upload_image(
+                &router,
+                &write_test_image(&directory.path().join("restart.png"), "400x300"),
+            )
+            .await;
+            let (status, started) = send(
+                &router,
+                json_request(
+                    "POST",
+                    "/api/v1/images/re-render",
+                    &json!({"async": true, "ids": [{"id": image, "expect_generation": 2}]}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+            let job = wait_for_re_render_job(&router, started["job_id"].as_str().unwrap()).await;
+            assert_eq!(job["state"], "completed");
+            job
+            // The router — and with it the state and every connection — is
+            // dropped here: the process that ran the job is gone.
+        };
+        let job_id = finished["job_id"].as_str().unwrap().to_owned();
+
+        let state = AppState::new(config).await.unwrap();
+        let router = app(state);
+        let (status, job) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/images/re-render/{job_id}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{job}");
+        assert_eq!(
+            job, finished,
+            "state, progress and results did not survive the restart"
+        );
+    }
+
+    /// A job interrupted mid-run is picked up by the next process and
+    /// continues from its pending items — the client that started it polls
+    /// the same id across the restart.
+    #[tokio::test]
+    async fn an_interrupted_job_is_picked_up_by_the_next_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = test_config(directory.path().join("atlas"));
+        let image = {
+            let router = app(AppState::new(config.clone()).await.unwrap());
+            // The process that accepted the job "dies" when this block ends:
+            // the router and its state are dropped before any job response
+            // was ever polled.
+            upload_image(
+                &router,
+                &write_test_image(&directory.path().join("resume.png"), "400x300"),
+            )
+            .await
+        };
+
+        // The dead process had claimed the job but recorded no item outcome;
+        // that is the state a crash leaves behind.
+        let store = crate::store::Store::connect(&config.data_dir.join("atlas.sqlite3"))
+            .await
+            .unwrap();
+        let job_id = AssetId::generate(18).unwrap().to_string();
+        let now = crate::unix_now().unwrap();
+        store
+            .create_re_render_job(&job_id, now, &[(AssetId::parse(&image).unwrap(), Some(2))])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .mark_re_render_job_running(&job_id, now)
+                .await
+                .unwrap(),
+            1
+        );
+        drop(store);
+
+        let state = AppState::new(config).await.unwrap();
+        let router = app(state);
+        let job = wait_for_re_render_job(&router, &job_id).await;
+        assert_eq!(job["state"], "completed");
+        assert_eq!(
+            job["progress"],
+            json!({"total": 1, "processed": 1, "re_encoded": 1, "skipped": 0, "failed": 0})
+        );
+        assert_eq!(job["results"][0]["outcome"], "re_encoded");
+        assert_eq!(job["results"][0]["generation"], 2);
     }
 
     /// A caller can ask for a rendition format by name.

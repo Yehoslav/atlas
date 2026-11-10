@@ -105,17 +105,29 @@ media files and media metadata only.
   the change is additive and the current generation stays in `renditions`.
   The cost is disk: every generation's files are kept until the asset is
   purged.
-  A bulk re-render walks the live images a page per request; there is no job
-  queue, so the caller drives the walk. The endpoint also accepts explicit ID
-  batches with an optional expected generation. If an asset is already at or
-  above that generation it is reported as skipped, making a repeated request
-  safe after a lost response and returning the generation the consumer needs
-  for its URLs. A generation still does not record which encoder produced it,
-  so Atlas cannot automatically decide which assets need a new encoder; an
+  A bulk re-render walks the live images a page per request; the endpoint also
+  accepts explicit ID batches with an optional expected generation, and the
+  same selection may be accepted as an asynchronous job. If an asset is already
+  at or above that generation it is reported as skipped, making a repeated
+  request safe after a lost response and returning the generation the consumer
+  needs for its URLs. A generation still does not record which encoder produced
+  it, so Atlas cannot automatically decide which assets need a new encoder; an
   encoder stamp remains a separate possible improvement in `TODO.md`. Walk
   cursors are opaque, versioned tokens. Conversion concurrency is configurable
   per instance (default one, bounded at eight), with per-asset serialization
   to keep staging and generation promotion safe.
+
+  A job answers `202` with its id once the selection is validated and written
+  to SQLite, then runs detached from the connection that asked for it: a
+  disconnect or timeout cannot cancel accepted work. Status and per-asset
+  results are polled by id and survive a restart; jobs interrupted mid-run are
+  claimed again at startup and continue from their pending items, with
+  `expect_generation` making an interrupted conversion harmless to redo. Job
+  rows are pruned on the trash retention window, the same bounded-metadata
+  bargain. This is deliberately not a job queue in the scheduler sense: one
+  process runs its own accepted work under the same conversion bounds as
+  everything else, with no external queue and no multi-instance coordination —
+  those remain deferred.
 - Renditions are converted to sRGB through the source's embedded ICC profile
   before metadata is stripped, so a Display P3 phone photo keeps its colours
   instead of being relabelled. The target is a compact sRGB profile embedded in
@@ -311,7 +323,10 @@ collections.
 - `POST /api/v1/images/re-render` — authenticated explicit-ID batches with
   optional expected generations for retry-safe re-encoding, or a cursor walk of
   all live images. Per-item outcomes report re-encoded, skipped and failed
-  assets; walk cursors are opaque and versioned.
+  assets; walk cursors are opaque and versioned. With `async: true` the same
+  selection is accepted as a job: `202` with a `job_id` (up to 1000 items),
+  polled at `GET /api/v1/images/re-render/{job_id}` for state, progress and
+  per-asset results, surviving restarts and resuming from pending items.
 - `GET /media/{id}/original` — public, unmodified original.
 - `GET /media/{id}/w{max_width}` — public rendition with format selected from
   `Accept`; JXL, AVIF, WebP, then an acceptable JPEG/PNG fallback. A `format`
@@ -351,8 +366,9 @@ uploads, or arbitrary URL transformations.
   in.
 - Bound uploads to two concurrent requests, image conversions to the configured
   concurrency (default one, maximum eight), each ImageMagick invocation to 45
-  seconds, and all processing for one image to 120 seconds. No persistent job
-  queue is needed for occasional uploads.
+  seconds, and all processing for one image to 120 seconds. Asynchronous
+  re-render jobs run under exactly those bounds — there is no separate pool
+  and no persistent job queue beyond the accepted work's own SQLite rows.
 - Originals and generated renditions are staged together, then atomically
   promoted before metadata is committed. Startup removes incomplete staging
   data and unindexed asset directories after a crash.
@@ -368,7 +384,8 @@ large, `415` unsupported/mismatched media type, `422` invalid or
 unprocessable media, and `406` when no stored format matches the request's
 `Accept` header. Two `404` codes separate "no such asset"
 (`asset_not_found`) from "that asset holds no rendition this narrow"
-(`rendition_not_found`, which lists the stored widths). Metadata that records a
+(`rendition_not_found`, which lists the stored widths); a third
+(`job_not_found`) covers an unknown re-render job id. Metadata that records a
 file that is not on disk is a `500`, not a `404`: the request was valid and
 storage is damaged.
 
@@ -465,7 +482,8 @@ do with media, and only a consumer with its own content database can answer.
 - PDF/office rendering, OCR, and document conversion
 - Video transcoding and thumbnail pipelines
 - Remote object storage, multiple service instances, multi-tenancy, and
-  distributed job queues
+  distributed job queues. In-process re-render jobs with SQLite state are
+  implemented; a scheduler that coordinates across instances is not.
 - An `animations` kind. Nothing multi-frame can be uploaded today, and the
   reason is structural rather than a missing check: `inspect` reads the first
   line of ImageMagick's per-frame report, and `generate` writes one file per
