@@ -66,8 +66,26 @@ cargo run
 ```
 
 Or export the variables yourself; a real environment variable always wins over
-`.env`. The settings and their precedence are in the README's configuration
-section.
+`.env`. The settings and their precedence are in
+[`docs/configuration.md`](docs/configuration.md).
+
+> **Migrating from the UUID prototype:** asset IDs changed from UUIDs to short
+> base36 strings. Assets created by an earlier prototype build keep their UUID
+> in the database and become unreachable. Delete the development data directory
+> and start fresh: `rm -rf ./data`
+
+The default listener is `127.0.0.1:3000`. Example PDF upload from another
+terminal:
+
+```sh
+export ATLAS_API_TOKEN='same-secret-as-the-running-server'
+
+curl -X POST \
+  -H "Authorization: Bearer $ATLAS_API_TOKEN" \
+  -H 'Content-Type: application/pdf' \
+  --data-binary @report.pdf \
+  http://127.0.0.1:3000/api/v1/documents
+```
 
 ## The checks
 
@@ -94,7 +112,10 @@ cd ../..
 ```
 
 And the end-to-end check, which starts the real binary and drives the real
-examples over HTTP:
+examples over HTTP. The test suite drives the router in process, and the
+example's tests replace Atlas with an in-memory fake; neither can notice when
+the two disagree about the API, which is a real risk when one side is written
+by the same hand as the other:
 
 ```sh
 cargo build
@@ -102,9 +123,23 @@ cargo build --manifest-path examples/cms-admin/Cargo.toml
 python scripts/smoke.py
 ```
 
-`scripts/smoke.py` needs `requests` for the album's client check. It reports a
-check it could not run as *skipped* rather than as a pass, so read the summary
-line rather than the exit code alone.
+`scripts/smoke.py` starts the built binary on a throwaway data directory,
+checks the HTTP contract over a real socket with real conversions, points the
+example consumers' own clients at it, and always stops the servers afterwards.
+It needs no arguments: the port, binary and data directory all have defaults
+that `--port`, `--bin` and `--data` can override. It exits non-zero on the
+first failed expectation, and needs `requests` for the album's client check.
+It reports a check it could not run as *skipped* rather than as a pass, so
+read the summary line rather than the exit code alone.
+
+`cargo test` runs the real ImageMagick: one test converts
+`tests/fixtures/reference.jpg` and measures how far each rendition is from
+the source, in decibels, with a floor per format. A change to the encoder
+settings that quietly degrades every image the service has ever produced
+passes every other test in the suite — they check that a rendition exists,
+that it has the right width, that it has the right signature, and none of
+them can see that the picture got worse. Run the tests inside `nix develop`,
+where the ImageMagick is the one the floors were measured against.
 
 ## Making a change
 
