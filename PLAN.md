@@ -484,12 +484,13 @@ do with media, and only a consumer with its own content database can answer.
 - Remote object storage, multiple service instances, multi-tenancy, and
   distributed job queues. In-process re-render jobs with SQLite state are
   implemented; a scheduler that coordinates across instances is not.
-- An `animations` kind. Nothing multi-frame can be uploaded today, and the
-  reason is structural rather than a missing check: `inspect` reads the first
-  line of ImageMagick's per-frame report, and `generate` writes one file per
-  `-write` target, so an animated input would be silently flattened *and* burn
-  the conversion timeout. A kind that owns frames needs a rendition model that
-  does too, not a special case in this one.
+- An `animations` kind. Multi-frame input is refused today, and the refusal is
+  now deliberate: animated WebP, APNG, animated AVIF and HEIC sequences are
+  turned away with `422 multi_frame_unsupported` by a container scan that reads
+  frame counts without decoding, and ImageMagick's per-frame report, read to
+  the end, answers the same question again as the authoritative check. Nothing
+  animated is stored, so nothing is flattened. A kind that owns frames needs a
+  rendition model that does too, not a special case in this one.
 - Emitting the JPEG XL ISOBMFF container instead of the bare codestream
   ImageMagick writes. Progressive rendering does not depend on it — that is a
   codestream property — but the container carries Exif and XMP, and its `jxlp`
@@ -501,6 +502,14 @@ do with media, and only a consumer with its own content database can answer.
   sniffed, because AVIF and HEIC are both ISO base media files starting with
   an `ftyp` box; the whole brand list is searched, since a file may declare
   `mif1` and list `heic` among its compatible brands.
+- Multi-frame input is refused before anything decodes it. Frame counts are
+  read straight out of the containers — WebP `ANMF` chunks, PNG `acTL` and
+  `fcTL` chunks, the sample counts of an ISOBMFF movie track — the same
+  pre-decode discipline as the brand checks, and ImageMagick's per-frame
+  report is read to the end as the authoritative second check. The refusal is
+  `422 multi_frame_unsupported`, distinct from `invalid_media`: the file is
+  not broken, and flattening an animation would confirm the upload while
+  delivering its first frame.
 - A format may have more than one accepted media type. HEIF has two spellings
   and the desktop picks the one that goes on the wire: freedesktop.org makes
   `image/heif` the canonical type for a `.heic` file and keeps `image/heic` as

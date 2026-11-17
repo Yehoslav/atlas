@@ -162,15 +162,16 @@ Placed at `examples/family-album/`.
 
 ### HEIC image sequences
 
-- [ ] **Refuse the HEVC sequence brands.** The byte check accepts the brands
-      `hevc`, `hevx`, `hevm` and `hevs`, and IANA maps exactly those four to
-      `image/heic-sequence` — the media type Atlas already refuses at the
-      door. A sequence is a grid of pictures, not a picture, and Atlas keeps
-      one original and generates renditions from one frame of it. Drop those
-      four brands, keep `heic`, `heix`, `heim` and `heis`, add a test that a
-      sequence-branded file is refused, and say in the README and the plan
-      that a sequence is a `415` now. It turns a `201` into a `415`, so it
-      wants a decision of its own rather than riding along with a fix.
+- [x] **Refuse the HEVC sequence brands.** Decided with the whole multi-frame
+      question rather than on its own: every temporal multi-frame input —
+      animated WebP, APNG, animated AVIF, HEIC sequences — is refused with
+      `422 multi_frame_unsupported`, detected from the containers without
+      decoding, with ImageMagick's per-frame report as the authoritative
+      check. The four `hev*` brands stay in the byte check, where format
+      identity belongs — an `avis` or `hevc` file really is AVIF/HEIC-family —
+      and what they carry is refused by the frame rule every other format
+      follows. Already-stored originals keep their bytes; a fix is a re-upload
+      as a new asset. README, plan and `docs/api.md` say so.
 
 ### Rendition generations
 

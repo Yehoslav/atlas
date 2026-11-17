@@ -20,6 +20,11 @@ pub(crate) const SRGB_PROFILE: &[u8] = include_bytes!("../assets/sRGB-v4.icc");
 #[derive(Debug)]
 pub enum MediaError {
     Invalid(String),
+    /// The input carries more than one frame. `generate` writes one file per
+    /// `-write` target, so converting an animation would silently reduce it
+    /// to its first frame while the upload was confirmed with a `201`.
+    /// Refusing says so instead.
+    MultiFrame(String),
     LimitExceeded,
     TimedOut,
     ProcessUnavailable(std::io::Error),
@@ -31,6 +36,7 @@ impl fmt::Display for MediaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) => formatter.write_str(message),
+            Self::MultiFrame(detail) => formatter.write_str(detail),
             Self::LimitExceeded => formatter.write_str("image dimensions exceed configured limits"),
             Self::TimedOut => formatter.write_str("ImageMagick exceeded the configured time limit"),
             Self::ProcessUnavailable(error) | Self::Io(error) => error.fmt(formatter),
@@ -96,7 +102,7 @@ impl ImageProcessor {
                     input,
                     "-auto-orient".to_owned(),
                     "-format".to_owned(),
-                    "%w %h %[opaque]".to_owned(),
+                    "%w %h %[opaque]\n".to_owned(),
                     "info:".to_owned(),
                 ],
                 staging_dir,
@@ -492,6 +498,185 @@ fn iso_brand(prefix: &[u8], brands: &[&str]) -> bool {
         .any(|brand| brands.iter().any(|wanted| brand == wanted.as_bytes()))
 }
 
+/// Whether `bytes` carry more than one frame, with the evidence that says so.
+///
+/// Multi-frame input is refused, not flattened: [`ImageProcessor::generate`]
+/// writes one file per `-write` target, so an animation would be silently
+/// reduced to its first frame while the upload was confirmed with a `201`.
+/// The frame counts are read straight out of the containers without decoding
+/// a pixel — the same pre-decode discipline as [`validate_signature`] — so a
+/// thousand-frame animation is told no for the cost of a scan, never the
+/// conversion budget.
+///
+/// The scan is not the last word: [`ImageProcessor::inspect`] reads
+/// ImageMagick's per-frame report to the end and refuses again on its
+/// authority, which covers anything this container walk cannot see. JPEG has
+/// no multi-frame serialisation in scope and JPEG XL's animation lives in a
+/// codestream rather than a container, so neither is scanned here and both
+/// lean on that report. GIF never reaches this: it is not an accepted format
+/// at all, and stays out until a kind owns frames.
+pub fn detect_multiframe(format: SourceFormat, bytes: &[u8]) -> Option<String> {
+    match format {
+        SourceFormat::Webp => webp_animation(bytes),
+        SourceFormat::Png => apng_frames(bytes),
+        SourceFormat::Avif | SourceFormat::Heic => isobmff_frames(bytes),
+        SourceFormat::Jpeg
+        | SourceFormat::Jxl
+        | SourceFormat::Pdf
+        | SourceFormat::Doc
+        | SourceFormat::Docx => None,
+    }
+}
+
+/// Whether a WebP file carries `ANMF` chunks, the frames of an animation.
+///
+/// The walk follows the RIFF layout: a four-character id, a little-endian
+/// size, the payload, and a pad byte after an odd-sized payload. A truncated
+/// or lying size ends the walk; whatever the container hides, ImageMagick's
+/// report still sees.
+fn webp_animation(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 12 || &bytes[8..12] != b"WEBP" {
+        return None;
+    }
+    let mut offset = 12;
+    while offset + 8 <= bytes.len() {
+        let id = &bytes[offset..offset + 4];
+        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().ok()?) as usize;
+        let end = offset.saturating_add(8 + size);
+        if end > bytes.len() {
+            return None;
+        }
+        if id == b"ANMF" {
+            return Some("an ANMF chunk declares it an animated WebP".to_owned());
+        }
+        offset = end + (size & 1);
+    }
+    None
+}
+
+/// Whether a PNG file carries an animation.
+///
+/// The `acTL` chunk is the animation header and declares the frame count;
+/// `fcTL` is one frame's header. A single-frame APNG (`num_frames == 1`) is
+/// still one picture and is accepted. More than one `fcTL` counts even when
+/// the declaration says one, because a lying header is exactly what the scan
+/// is for; an `fcTL` without an `acTL` is ignored, as decoders ignore it.
+fn apng_frames(bytes: &[u8]) -> Option<String> {
+    let mut offset = 8; // past the signature
+    let mut declared: Option<u32> = None;
+    let mut fctl_chunks = 0_usize;
+    while offset + 12 <= bytes.len() {
+        let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?) as usize;
+        let kind = &bytes[offset + 4..offset + 8];
+        let end = offset.saturating_add(12 + size); // length, type, payload, CRC
+        if end > bytes.len() {
+            return None;
+        }
+        match kind {
+            b"acTL" if size >= 8 => {
+                declared = Some(u32::from_be_bytes(
+                    bytes[offset + 8..offset + 12].try_into().ok()?,
+                ));
+            }
+            b"fcTL" => fctl_chunks += 1,
+            b"IEND" => break,
+            _ => {}
+        }
+        offset = end;
+    }
+    let declared = declared?;
+    if declared > 1 {
+        return Some(format!(
+            "acTL declares {declared} animation frames (an APNG)"
+        ));
+    }
+    (fctl_chunks > 1)
+        .then(|| format!("{fctl_chunks} fcTL chunks declare animation frames (an APNG)"))
+}
+
+/// Whether an ISOBMFF file (AVIF, HEIC) carries more than one frame.
+///
+/// The cheapest evidence first: `avis` and the four `hev*` brands are the
+/// IANA-registered sequence containers, and a file wearing one has said what
+/// it is. Otherwise the movie track decides: a `moov` box holding a picture
+/// or video track whose `stsz` box counts more than one sample is a sequence
+/// of frames. A still AVIF or HEIC has no movie track at all, and a
+/// one-sample track is one frame, so both pass. Items — a grid, a thumbnail,
+/// an alpha plane — are pictures, not frames, and are never counted.
+fn isobmff_frames(bytes: &[u8]) -> Option<String> {
+    for (brands, declared) in [
+        (&["avis"][..], "an AVIF sequence"),
+        (
+            &["hevc", "hevx", "hevm", "hevs"][..],
+            "an HEIC image sequence",
+        ),
+    ] {
+        if iso_brand(bytes, brands) {
+            return Some(format!("the ftyp brand declares {declared}"));
+        }
+    }
+
+    let moov = box_range(bytes, 0, bytes.len(), b"moov")?;
+    let mut scan = moov.start;
+    while let Some(trak) = box_range(bytes, scan, moov.end, b"trak") {
+        let next = trak.end;
+        if let Some(frames) = track_frames(bytes, trak) {
+            return Some(frames);
+        }
+        scan = next;
+    }
+    None
+}
+
+/// The frame count of one movie track, when that track carries pictures.
+fn track_frames(bytes: &[u8], trak: std::ops::Range<usize>) -> Option<String> {
+    let mdia = box_range(bytes, trak.start, trak.end, b"mdia")?;
+    let minf = box_range(bytes, mdia.start, mdia.end, b"minf")?;
+    // Only pictures count: an audio or metadata track is not a frame, and
+    // refusing a still image because it carries one would be a lie of our own.
+    let hdlr = box_range(bytes, mdia.start, mdia.end, b"hdlr")?;
+    // The handler type sits after the version/flags and pre_defined fields.
+    if hdlr.end - hdlr.start < 12
+        || !matches!(&bytes[hdlr.start + 8..hdlr.start + 12], b"pict" | b"vide")
+    {
+        return None;
+    }
+    let stbl = box_range(bytes, minf.start, minf.end, b"stbl")?;
+    let stsz = box_range(bytes, stbl.start, stbl.end, b"stsz")?;
+    // The count sits after the version/flags and sample_size fields.
+    if stsz.end - stsz.start < 12 {
+        return None;
+    }
+    let samples = u32::from_be_bytes(bytes[stsz.start + 8..stsz.start + 12].try_into().ok()?);
+    (samples > 1).then(|| format!("the movie track holds {samples} frames"))
+}
+
+/// The body of the first box named `wanted` between `start` and `end`.
+///
+/// Sizes are the 32-bit big-endian kind; a size of 0 (a stream) or 1 (a
+/// 64-bit largesize) is not walked, and anything malformed ends the search.
+/// Whatever slips past this walk, ImageMagick's report is the check behind
+/// it.
+fn box_range(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    wanted: &[u8],
+) -> Option<std::ops::Range<usize>> {
+    let mut offset = start;
+    while offset + 8 <= end {
+        let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?) as usize;
+        if size < 8 || offset + size > end {
+            return None;
+        }
+        if &bytes[offset + 4..offset + 8] == wanted {
+            return Some(offset + 8..offset + size);
+        }
+        offset += size;
+    }
+    None
+}
+
 pub async fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut hasher = Sha256::new();
@@ -512,32 +697,55 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// The report ImageMagick prints for `-format "%w %h %[opaque]\n" info:`.
+///
+/// The report is one width, height and opacity triple per frame, one line
+/// each, so the number of lines is the number of frames. The whole report is
+/// read, not just its first line — the authoritative check behind the
+/// container scan, because it sees what the decoder sees.
 fn parse_dimensions(bytes: &[u8]) -> Result<ImageDimensions, MediaError> {
     let output = std::str::from_utf8(bytes)
         .map_err(|_| MediaError::Invalid("Image dimensions could not be read.".to_owned()))?;
-    let mut parts = output.split_whitespace();
-    let width = parts
-        .next()
-        .and_then(|value| value.parse().ok())
-        .ok_or_else(|| MediaError::Invalid("Image dimensions could not be read.".to_owned()))?;
-    let height = parts
-        .next()
-        .and_then(|value| value.parse().ok())
-        .ok_or_else(|| MediaError::Invalid("Image dimensions could not be read.".to_owned()))?;
-    let opaque = parts
-        .next()
-        .map(|value| value.eq_ignore_ascii_case("true"))
-        .ok_or_else(|| MediaError::Invalid("Image opacity could not be read.".to_owned()))?;
-    if width == 0 || height == 0 {
-        return Err(MediaError::Invalid(
-            "The image has invalid dimensions.".to_owned(),
-        ));
+    let unreadable = || MediaError::Invalid("Image dimensions could not be read.".to_owned());
+    let mut dimensions: Option<ImageDimensions> = None;
+    let mut frames = 0_usize;
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let mut parts = line.split_whitespace();
+        let width: u32 = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(unreadable)?;
+        let height: u32 = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(unreadable)?;
+        let opaque = match parts.next() {
+            Some(value) if value.eq_ignore_ascii_case("true") => true,
+            Some(value) if value.eq_ignore_ascii_case("false") => false,
+            _ => {
+                return Err(MediaError::Invalid(
+                    "Image opacity could not be read.".to_owned(),
+                ));
+            }
+        };
+        if width == 0 || height == 0 {
+            return Err(MediaError::Invalid(
+                "The image has invalid dimensions.".to_owned(),
+            ));
+        }
+        frames += 1;
+        dimensions.get_or_insert(ImageDimensions {
+            width,
+            height,
+            opaque,
+        });
     }
-    Ok(ImageDimensions {
-        width,
-        height,
-        opaque,
-    })
+    if frames > 1 {
+        return Err(MediaError::MultiFrame(format!(
+            "ImageMagick reports {frames} frames; Atlas accepts single-frame images only."
+        )));
+    }
+    dimensions.ok_or_else(unreadable)
 }
 
 /// Whether `magick -list configure` names `wanted` among the delegates.
@@ -552,8 +760,8 @@ fn has_delegate(configure: &str, wanted: &str) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        ImageProcessor, SRGB_PROFILE, has_delegate, parse_dimensions, read_write_formats,
-        validate_signature,
+        ImageProcessor, MediaError, SRGB_PROFILE, detect_multiframe, has_delegate,
+        parse_dimensions, read_write_formats, validate_signature,
     };
     use crate::model::{RenditionFormat, RenditionRecord, SourceFormat};
     use std::path::Path;
@@ -627,6 +835,176 @@ pub(crate) mod tests {
         assert_eq!(dimensions.width, 640);
         assert_eq!(dimensions.height, 480);
         assert!(dimensions.opaque);
+    }
+
+    /// ImageMagick prints one width, height and opacity line per frame, so
+    /// the number of lines is the number of frames. Reading only the first
+    /// line would confirm the upload while the rendition quietly held the
+    /// first frame alone.
+    #[test]
+    fn a_multi_frame_report_is_refused() {
+        for report in ["60 40 True\n60 40 False", "60 40 True\n1 1 False"] {
+            let error = parse_dimensions(report.as_bytes()).unwrap_err();
+            assert!(
+                matches!(error, MediaError::MultiFrame(_)),
+                "{report} should read as more than one frame, said {error}"
+            );
+        }
+        let dimensions = parse_dimensions(b"640 480 false").unwrap();
+        assert!(!dimensions.opaque);
+        assert!(matches!(
+            parse_dimensions(b"640 480 banana").unwrap_err(),
+            MediaError::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_dimensions(b"").unwrap_err(),
+            MediaError::Invalid(_)
+        ));
+    }
+
+    /// A `RIFF`/`WEBP` container with chunks of the given kinds.
+    fn webp_with(chunks: &[(&'static [u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut bytes = b"RIFF\0\0\0\0WEBP".to_vec();
+        for (kind, body) in chunks.iter() {
+            bytes.extend_from_slice(kind.as_slice());
+            bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(body);
+            if body.len() % 2 == 1 {
+                bytes.push(0);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn an_animated_webp_is_refused_by_its_anmf_chunk() {
+        let still = webp_with(&[(b"VP8X", vec![0_u8; 10]), (b"VP8 ", vec![0_u8; 32])]);
+        assert!(detect_multiframe(SourceFormat::Webp, &still).is_none());
+
+        let animated = webp_with(&[
+            (b"VP8X", vec![0_u8; 10]),
+            (b"ANMF", vec![0_u8; 32]),
+            (b"ANMF", vec![0_u8; 8]),
+        ]);
+        let evidence = detect_multiframe(SourceFormat::Webp, &animated).unwrap();
+        assert!(evidence.contains("ANMF"), "said: {evidence}");
+    }
+
+    /// A PNG with chunks of the given kinds, CRCs left as zeroes: the scan
+    /// walks chunk headers, not checksums.
+    fn png_with(chunks: &[(&'static [u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        for (kind, body) in chunks.iter() {
+            bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(kind.as_slice());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        bytes
+    }
+
+    fn apng(num_frames: u32, fctl_chunks: usize) -> Vec<(&'static [u8; 4], Vec<u8>)> {
+        // acTL declares the frame count first, then the play count.
+        let mut header = num_frames.to_be_bytes().to_vec();
+        header.extend_from_slice(&0_u32.to_be_bytes());
+        let mut chunks: Vec<(&[u8; 4], Vec<u8>)> =
+            vec![(b"IHDR", vec![0_u8; 13]), (b"acTL", header.to_vec())];
+        for _ in 0..fctl_chunks {
+            chunks.push((b"fcTL", vec![0_u8; 26]));
+        }
+        chunks.push((b"IDAT", vec![0_u8; 4]));
+        chunks.push((b"IEND", Vec::new()));
+        chunks
+    }
+
+    #[test]
+    fn an_apng_is_refused_by_its_animation_header() {
+        // A single-frame APNG is still one picture.
+        assert!(detect_multiframe(SourceFormat::Png, &png_with(&apng(1, 1))).is_none());
+        // The declaration decides, and a lying declaration is caught by the
+        // frame headers it cannot hide.
+        let evidence = detect_multiframe(SourceFormat::Png, &png_with(&apng(2, 2))).unwrap();
+        assert!(evidence.contains("acTL"), "said: {evidence}");
+        let evidence = detect_multiframe(SourceFormat::Png, &png_with(&apng(1, 2))).unwrap();
+        assert!(evidence.contains("fcTL"), "said: {evidence}");
+        // An fcTL without an acTL is ignored, the way decoders ignore it.
+        let orphans = vec![
+            (b"IHDR", vec![0_u8; 13]),
+            (b"fcTL", vec![0_u8; 26]),
+            (b"IDAT", vec![0_u8; 4]),
+            (b"IEND", Vec::new()),
+        ];
+        assert!(detect_multiframe(SourceFormat::Png, &png_with(&orphans)).is_none());
+    }
+
+    /// One ISOBMFF box: its size, type and body.
+    fn box_bytes(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut bytes = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    /// An ISOBMFF file with a `ftyp` brand and, optionally, one movie track.
+    fn isobmff(brand: &[u8; 4], handler: Option<&[u8; 4]>, samples: u32) -> Vec<u8> {
+        let mut ftyp_body = brand.to_vec();
+        ftyp_body.extend_from_slice(b"\0\0\0\0");
+        let mut bytes = box_bytes(b"ftyp", &ftyp_body);
+
+        if let Some(handler) = handler {
+            let mut hdlr_body = [0_u8; 12];
+            hdlr_body[8..12].copy_from_slice(handler);
+            let stsz_body: [u8; 12] = [
+                0, 0, 0, 0, // version and flags
+                0, 0, 0, 0, // sample_size
+                0, 0, 0, 0, // overwritten below with the sample count
+            ];
+            let mut stsz_body = stsz_body;
+            stsz_body[8..12].copy_from_slice(&samples.to_be_bytes());
+            let stbl = box_bytes(b"stbl", &box_bytes(b"stsz", &stsz_body));
+            let minf = box_bytes(b"minf", &stbl);
+            let mut mdia_body = box_bytes(b"hdlr", &hdlr_body);
+            mdia_body.extend_from_slice(&minf);
+            let trak = box_bytes(b"trak", &box_bytes(b"mdia", &mdia_body));
+            bytes.extend_from_slice(&box_bytes(b"moov", &trak));
+        }
+        bytes
+    }
+
+    #[test]
+    fn an_isobmff_sequence_is_refused_and_a_still_image_passes() {
+        // A two-frame picture track is an animation, whatever its brand says.
+        let evidence =
+            detect_multiframe(SourceFormat::Avif, &isobmff(b"avif", Some(b"pict"), 2)).unwrap();
+        assert!(evidence.contains("movie track"), "said: {evidence}");
+        // The sequence brands are themselves the evidence, even when no track
+        // is there for the walk to read.
+        for (format, brand) in [(SourceFormat::Avif, b"avis"), (SourceFormat::Heic, b"hevc")] {
+            let evidence = detect_multiframe(format, &isobmff(brand, None, 0)).unwrap();
+            assert!(evidence.contains("brand"), "said: {evidence}");
+        }
+        // A still image: one frame or none, no sequence brand.
+        assert!(
+            detect_multiframe(SourceFormat::Heic, &isobmff(b"heic", Some(b"pict"), 1)).is_none()
+        );
+        assert!(detect_multiframe(SourceFormat::Avif, &isobmff(b"avif", None, 0)).is_none());
+        // An audio or metadata track is not a frame.
+        assert!(
+            detect_multiframe(SourceFormat::Heic, &isobmff(b"heic", Some(b"soun"), 9)).is_none()
+        );
+    }
+
+    #[test]
+    fn formats_without_a_scan_lean_on_the_report() {
+        for format in [
+            SourceFormat::Jpeg,
+            SourceFormat::Jxl,
+            SourceFormat::Pdf,
+            SourceFormat::Doc,
+            SourceFormat::Docx,
+        ] {
+            assert!(detect_multiframe(format, &isobmff(b"hevc", Some(b"pict"), 9)).is_none());
+        }
     }
 
     #[test]
@@ -943,6 +1321,47 @@ pub(crate) mod tests {
                 .iter()
                 .any(|argument| argument.starts_with("jxl:distance=")),
             "JPEG XL should use libjxl's own distance, not an unverified define: {args:?}"
+        );
+    }
+
+    /// The container scan is not the last word: the per-frame report is. A
+    /// file whose container hides its frames is still refused here, on the
+    /// authority of what the decoder reports.
+    #[tokio::test]
+    async fn inspect_refuses_what_the_per_frame_report_counts() {
+        require_image_magick();
+
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().join("sRGB.icc");
+        std::fs::write(&profile, SRGB_PROFILE).unwrap();
+        let processor = ImageProcessor::new(
+            "magick".to_owned(),
+            profile,
+            40_000_000,
+            12_000,
+            Duration::from_secs(45),
+        );
+
+        let animated = directory.path().join("animated.webp");
+        let generated = std::process::Command::new("magick")
+            .args([
+                "-size", "60x40", "xc:red", "-delay", "10", "-size", "60x40", "xc:blue",
+            ])
+            .arg(format!("WEBP:{}", animated.display()))
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "could not generate an animated WebP fixture"
+        );
+
+        let error = processor
+            .inspect(&animated, SourceFormat::Webp, directory.path())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MediaError::MultiFrame(_)),
+            "a two-frame WebP should be refused by its report, said {error:?}"
         );
     }
 

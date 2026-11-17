@@ -51,7 +51,7 @@ useless separately.
 | Deletion is a lifecycle, not an erasure | A published page must not break because someone deleted a file. Bytes move to a trash directory, are purged after a retention window, and a tombstone remains. |
 | No video, no document rendering, no OCR | Different products. |
 | No object storage, no multi-tenancy, no distributed job queues | One site, one host, occasional administrator uploads. Re-render jobs run in-process with their state in SQLite; a multi-instance scheduler would be a different design. |
-| No animations yet | The rendition model is one frame per width. A multi-frame kind needs a multi-frame model. |
+| No animations | The rendition model is one frame per width, so animated WebP, APNG, animated AVIF and HEIC sequences are refused with `422 multi_frame_unsupported` rather than silently flattened to their first frame, and GIF stays outside the format list for the same reason. Already-stored originals keep their bytes and their URLs. |
 
 ## Try it
 
