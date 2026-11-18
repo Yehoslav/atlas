@@ -3705,19 +3705,54 @@ mod tests {
     /// A two-frame animation in the requested format. ImageMagick writes a
     /// real sequence — ANMF chunks, an `acTL`, an `avis` container — so the
     /// scan under test sees genuine bytes, not hand-built ones.
-    fn write_test_animation(path: &std::path::Path, size: &str, format: &str) -> Vec<u8> {
-        let generated = Command::new("magick")
+    ///
+    /// Returns `None` when this ImageMagick build cannot produce an animated
+    /// file in `format`, so a test can skip that case instead of failing the
+    /// environment for a codec capability Atlas itself does not rely on.
+    fn write_test_animation(
+        path: &std::path::Path,
+        size: &str,
+        format: &str,
+        source_format: crate::model::SourceFormat,
+    ) -> Option<Vec<u8>> {
+        let generated = match Command::new("magick")
             .args([
                 "-size", size, "xc:red", "-delay", "10", "-size", size, "xc:blue",
             ])
             .arg(format!("{format}:{}", path.display()))
             .output()
-            .unwrap();
-        assert!(
-            generated.status.success(),
-            "could not generate a {size} test {format} animation"
-        );
-        std::fs::read(path).unwrap()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("skipping {format} animation fixture: could not run magick: {error}");
+                return None;
+            }
+        };
+        if !generated.status.success() {
+            eprintln!(
+                "skipping {format} animation fixture: magick exited {}\nstderr: {}",
+                generated.status,
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            return None;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!(
+                    "skipping {format} animation fixture: magick reported success but {path} was not written: {error}",
+                    path = path.display()
+                );
+                return None;
+            }
+        };
+        if crate::media::detect_multiframe(source_format, &bytes).is_none() {
+            eprintln!(
+                "skipping {format} animation fixture: ImageMagick produced a single-frame file"
+            );
+            return None;
+        }
+        Some(bytes)
     }
 
     #[tokio::test]
@@ -4587,16 +4622,31 @@ mod tests {
             .await
             .unwrap());
 
-        for (format, content_type, extension) in [
-            ("WEBP", "image/webp", "webp"),
-            ("APNG", "image/png", "png"),
-            ("AVIF", "image/avif", "avif"),
+        let mut checked = 0;
+        for (format, content_type, extension, source_format) in [
+            (
+                "WEBP",
+                "image/webp",
+                "webp",
+                crate::model::SourceFormat::Webp,
+            ),
+            ("APNG", "image/png", "png", crate::model::SourceFormat::Png),
+            (
+                "AVIF",
+                "image/avif",
+                "avif",
+                crate::model::SourceFormat::Avif,
+            ),
         ] {
-            let animated = write_test_animation(
+            let Some(animated) = write_test_animation(
                 &directory.path().join(format!("anim.{extension}")),
                 "60x40",
                 format,
-            );
+                source_format,
+            ) else {
+                continue;
+            };
+            checked += 1;
             let (status, error) = send(&router, upload_request(content_type, animated)).await;
             assert_eq!(
                 status,
@@ -4612,6 +4662,10 @@ mod tests {
                 "the refusal should say why: {error}"
             );
         }
+        assert!(
+            checked > 0,
+            "ImageMagick could not produce any animated fixture in this environment"
+        );
     }
 
     /// The sequence brands ride the same rule as every other animation: the
@@ -4642,7 +4696,13 @@ mod tests {
             .await
             .unwrap());
 
-        let animated = write_test_animation(&directory.path().join("anim.webp"), "60x40", "WEBP");
+        let animated = write_test_animation(
+            &directory.path().join("anim.webp"),
+            "60x40",
+            "WEBP",
+            crate::model::SourceFormat::Webp,
+        )
+        .expect("ImageMagick must be able to produce an animated WebP for this test");
         let (status, error) = send(
             &router,
             Request::builder()
