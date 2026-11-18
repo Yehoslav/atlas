@@ -34,7 +34,7 @@ use crate::{
     error::ApiError,
     filename,
     ident::AssetId,
-    media::{MediaError, sha256_bytes, sha256_file, validate_signature},
+    media::{MediaError, detect_multiframe, sha256_bytes, sha256_file, validate_signature},
     model::{
         AssetRecord, AssetState, Kind, RenditionFormat, RenditionRecord, SourceFormat, StoredAsset,
     },
@@ -425,6 +425,19 @@ async fn create_asset(
         return Err(ApiError::unsupported(
             "The file contents do not match the declared media type, or the format is not allowed.",
         ));
+    }
+
+    // Multi-frame input is refused on the bytes, before anything decodes
+    // them: the scan reads frame counts out of the container, so a
+    // thousand-frame animation is told no without spending any of the
+    // conversion budget. ImageMagick's per-frame report answers the same
+    // question again inside `inspect`.
+    let stored = fs::read(&upload_path).await.map_err(ApiError::internal)?;
+    if let Some(evidence) = detect_multiframe(source_format, &stored) {
+        return Err(ApiError::multi_frame(format!(
+            "The file is multi-frame: {evidence}. Atlas refuses multi-frame input \
+             instead of flattening it to the first frame; upload a single-frame image."
+        )));
     }
 
     let original_path = staging_dir.join(format!("original.{}", source_format.extension()));
@@ -3084,6 +3097,7 @@ fn parse_id(value: &str) -> Result<AssetId, ApiError> {
 fn map_media_error(error: MediaError) -> ApiError {
     match error {
         MediaError::Invalid(detail) => ApiError::invalid(detail),
+        MediaError::MultiFrame(detail) => ApiError::multi_frame(detail),
         MediaError::LimitExceeded => ApiError::too_large(),
         MediaError::TimedOut => ApiError::invalid("Image processing exceeded its time limit."),
         MediaError::ProcessUnavailable(error) => {
@@ -3686,6 +3700,59 @@ mod tests {
             "could not generate a {size} test {format}"
         );
         std::fs::read(path).unwrap()
+    }
+
+    /// A two-frame animation in the requested format. ImageMagick writes a
+    /// real sequence — ANMF chunks, an `acTL`, an `avis` container — so the
+    /// scan under test sees genuine bytes, not hand-built ones.
+    ///
+    /// Returns `None` when this ImageMagick build cannot produce an animated
+    /// file in `format`, so a test can skip that case instead of failing the
+    /// environment for a codec capability Atlas itself does not rely on.
+    fn write_test_animation(
+        path: &std::path::Path,
+        size: &str,
+        format: &str,
+        source_format: crate::model::SourceFormat,
+    ) -> Option<Vec<u8>> {
+        let generated = match Command::new("magick")
+            .args([
+                "-size", size, "xc:red", "-delay", "10", "-size", size, "xc:blue",
+            ])
+            .arg(format!("{format}:{}", path.display()))
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("skipping {format} animation fixture: could not run magick: {error}");
+                return None;
+            }
+        };
+        if !generated.status.success() {
+            eprintln!(
+                "skipping {format} animation fixture: magick exited {}\nstderr: {}",
+                generated.status,
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            return None;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!(
+                    "skipping {format} animation fixture: magick reported success but {path} was not written: {error}",
+                    path = path.display()
+                );
+                return None;
+            }
+        };
+        if crate::media::detect_multiframe(source_format, &bytes).is_none() {
+            eprintln!(
+                "skipping {format} animation fixture: ImageMagick produced a single-frame file"
+            );
+            return None;
+        }
+        Some(bytes)
     }
 
     #[tokio::test]
@@ -4541,6 +4608,114 @@ mod tests {
                 "{content_type} is not a picture Atlas can hold"
             );
         }
+    }
+
+    /// A temporal, multi-frame upload is refused on its bytes, before
+    /// anything decodes them: the rendition model is one frame per width, and
+    /// flattening an animation would confirm the upload while delivering
+    /// something other than what was sent. The refusal is its own code, not
+    /// `invalid_media`, because the file is not broken.
+    #[tokio::test]
+    async fn an_animated_upload_is_refused_not_flattened() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let mut checked = 0;
+        for (format, content_type, extension, source_format) in [
+            (
+                "WEBP",
+                "image/webp",
+                "webp",
+                crate::model::SourceFormat::Webp,
+            ),
+            ("APNG", "image/png", "png", crate::model::SourceFormat::Png),
+            (
+                "AVIF",
+                "image/avif",
+                "avif",
+                crate::model::SourceFormat::Avif,
+            ),
+        ] {
+            let Some(animated) = write_test_animation(
+                &directory.path().join(format!("anim.{extension}")),
+                "60x40",
+                format,
+                source_format,
+            ) else {
+                continue;
+            };
+            checked += 1;
+            let (status, error) = send(&router, upload_request(content_type, animated)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{content_type} animation should be refused, not flattened"
+            );
+            assert_eq!(error["error"]["code"], "multi_frame_unsupported", "{error}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("multi-frame"),
+                "the refusal should say why: {error}"
+            );
+        }
+        assert!(
+            checked > 0,
+            "ImageMagick could not produce any animated fixture in this environment"
+        );
+    }
+
+    /// The sequence brands ride the same rule as every other animation: the
+    /// four `hev*` brands are what `image/heic-sequence` is on the wire, and
+    /// no brand turns a sequence into a picture. The bytes are refused before
+    /// anything decodes them.
+    #[tokio::test]
+    async fn a_sequence_branded_file_is_refused_like_any_other_animation() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let mut sequence = b"\x00\x00\x00\x18ftyphevc\x00\x00\x00\x00".to_vec();
+        sequence.extend(b"mdat\0\0\0\0heic sequence payload");
+        let (status, error) = send(&router, upload_request("image/heic", sequence)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["error"]["code"], "multi_frame_unsupported", "{error}");
+    }
+
+    /// The rule is about the bytes, not the collection: a picture stored
+    /// whole in `documents` is not converted, but its media type would still
+    /// promise one image while the original carries an animation.
+    #[tokio::test]
+    async fn the_documents_collection_refuses_animations_too() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let animated = write_test_animation(
+            &directory.path().join("anim.webp"),
+            "60x40",
+            "WEBP",
+            crate::model::SourceFormat::Webp,
+        )
+        .expect("ImageMagick must be able to produce an animated WebP for this test");
+        let (status, error) = send(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/documents")
+                .header("authorization", "Bearer prototype-test-token")
+                .header("content-type", "image/webp")
+                .body(Body::from(animated))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["error"]["code"], "multi_frame_unsupported", "{error}");
     }
 
     /// A consumer building an upload form should be able to ask rather than

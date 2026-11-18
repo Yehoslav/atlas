@@ -150,6 +150,21 @@ impl ApiError {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_media", detail)
     }
 
+    /// A temporal, multi-frame upload: an animation or a sequence.
+    ///
+    /// Its own status and code rather than a reuse of `invalid_media`: the
+    /// file is not broken, and "these frames have no kind that owns them" is
+    /// a different refusal than "these bytes are not an image". Flattening
+    /// instead would confirm a `201` while delivering something other than
+    /// what was uploaded.
+    pub fn multi_frame(detail: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "multi_frame_unsupported",
+            detail,
+        )
+    }
+
     /// The message a client may safely be shown.
     pub fn detail(&self) -> &str {
         &self.detail

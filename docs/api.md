@@ -35,7 +35,14 @@ as an attachment instead of being re-encoded into a picture.
   disagree about which spelling to send. Either is accepted, the bytes decide
   what the file is, and the asset is stored and served as `image/heic`
   whichever spelling it arrived under. `image/heic-sequence` is not a picture
-  and is not accepted.
+  and is not accepted. No multi-frame image is accepted either: animated WebP,
+  APNG, animated AVIF and HEIC sequences are refused with
+  `422 multi_frame_unsupported` instead of being silently flattened to their
+  first frame, and the refusal names the evidence (`ANMF` chunk, `acTL` frame
+  count, movie-track sample count, sequence brand). GIF is not an accepted
+  format at all. An asset whose original is animated and which was stored
+  before this rule fails re-encode with the same code rather than quietly
+  regenerating flattened renditions.
 - `POST /api/v1/documents` — the same upload for `documents`. `Content-Type` may
   be any allowlisted format, images included. The file is stored and served
   untouched, with no renditions.
