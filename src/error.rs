@@ -146,6 +146,22 @@ impl ApiError {
         )
     }
 
+    /// The data volume is below the configured free-space floor.
+    ///
+    /// `507` rather than `503`: the service is running and the request is
+    /// well-formed, but the storage it needs is full. A caller can tell this
+    /// apart from "too many uploads at once" and retry after freeing space
+    /// instead of backing off.
+    pub fn insufficient_storage(free_bytes: u64, min_free_bytes: u64) -> Self {
+        Self::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "insufficient_storage",
+            format!(
+                "The data directory has {free_bytes} bytes free, below the configured minimum of {min_free_bytes}; free space and retry."
+            ),
+        )
+    }
+
     pub fn invalid(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_media", detail)
     }

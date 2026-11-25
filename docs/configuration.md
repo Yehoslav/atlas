@@ -37,6 +37,7 @@ variant_widths = [320, 640, 960, 1280]
 max_image_bytes = 20971520
 max_document_bytes = 52428800
 max_consumer_data_bytes = 65536
+min_free_bytes = 1073741824
 max_image_pixels = 40000000
 max_image_dimension = 12000
 
@@ -63,6 +64,7 @@ Environment variables override the file, which is useful for per-host values:
 | `ATLAS_MAX_IMAGE_BYTES` | 20 MiB | Streaming image-upload limit |
 | `ATLAS_MAX_DOCUMENT_BYTES` | 50 MiB | Streaming document-upload limit |
 | `ATLAS_MAX_CONSUMER_DATA_BYTES` | 64 KiB | Cap on a consumer's opaque `data` |
+| `ATLAS_MIN_FREE_BYTES` | 1 GiB | Free space the data volume must keep before uploads are refused; `0` disables the check |
 | `ATLAS_MAX_IMAGE_PIXELS` | 40,000,000 | Decoded image pixel limit |
 | `ATLAS_MAX_IMAGE_DIMENSION` | 12,000 | Maximum image width or height |
 | `ATLAS_VARIANT_WIDTHS` | `320,640,960,1280` | Fixed maximum-width profiles |
@@ -75,7 +77,14 @@ Environment variables override the file, which is useful for per-host values:
 Uploads are streamed to staging files; at most two uploads and the configured
 number of conversions run concurrently. ImageMagick receives explicit
 input/output formats and resource limits. Failed requests do not publish
-partial assets. On startup,
+partial assets. Before the body is read, an upload checks the data volume's
+free space and is refused with `507 insufficient_storage` when it is below
+`ATLAS_MIN_FREE_BYTES`; the floor is fail-fast rather than a reservation, so a
+disk that fills between the check and the write still produces a clean error.
+The check is a live `statvfs` reading, not a cached figure, and `GET
+/api/v1/summary` reports the same numbers as `data_dir_free_bytes` and
+`data_dir_total_bytes`. Startup warns below the floor but still starts, so a
+restart onto a full disk can serve reads and be purged. On startup,
 Atlas applies any pending schema migrations, runs `PRAGMA integrity_check` and
 `PRAGMA foreign_key_check` (refusing to start if either reports a problem),
 removes incomplete staging data, and returns any interrupted delete or restore
