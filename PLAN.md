@@ -292,7 +292,8 @@ collections.
   rather than an empty page: a filter that quietly matches nothing is worse
   than one that says why.
 - `GET /api/v1/{kind}/{id}` — authenticated asset metadata, including its `kind`,
-  original facts, available width renditions, and lifecycle state.
+  original facts, available width renditions with per-format byte sizes, and
+  lifecycle state.
 - `POST /api/v1/{kind}/actions` — authenticated bulk `pin`, `unpin`, `delete`,
   or `restore` for up to 500 caller-supplied ids, validated all-or-nothing.
 - `GET /api/v1/summary` — authenticated counts and stored bytes, trash included,
@@ -317,7 +318,8 @@ collections.
 - `GET /api/v1/images/{id}/srcset` — authenticated `srcset` for one image, one
   candidate per distinct actual output width, described by the width actually
   produced. Without a `widths` parameter it describes the instance's
-  configured widths.
+  configured widths. Structured `entries` repeat each candidate with the
+  profile width and the per-format sizes behind its negotiated URL.
 - `POST /api/v1/images/{id}/renditions` — authenticated generation of the
   renditions an asset is missing, under the same asset id; with
   `{"re_encode": true}`, a re-encode of every rendition as a new generation.

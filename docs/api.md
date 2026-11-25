@@ -131,9 +131,13 @@ as an attachment instead of being re-encoded into a picture.
   narrower than its largest profile is described honestly without duplicate
   candidates. Without a `widths` parameter it describes the instance's
   configured widths, so it is the answer a consumer gets without knowing the
-  configuration. Errors on an unknown asset (`404`), a non-image, or a width
-  Atlas does not have. Its URLs name the current generation, which the
-  response also reports as `generation`.
+  configuration. The response also carries `entries`, one per candidate, with
+  the profile width, the actual width, and a `bytes` map that gives the stored
+  size of each representation behind the negotiated URL — a string cannot say
+  which format a browser will receive, but a byte budget needs it. Errors on
+  an unknown asset (`404`), a non-image, or a width Atlas does not have. Its
+  URLs name the current generation, which the response also reports as
+  `generation`.
 - `POST /api/v1/images/{id}/renditions` — authenticated generation of the
   renditions an asset is missing. The widths an asset has are fixed when it is
   uploaded, so a deployment that configures the wrong widths leaves assets
@@ -212,6 +216,15 @@ its assets without re-uploading them. Consuming sites can fetch
 index media *content* — it filters on filenames, media types and lifecycle
 state, and leaves meaning to the consumer — and it never converts or
 re-encodes on a read.
+
+Every rendition entry in asset metadata carries `formats` and a `bytes` map
+keyed by those same names. The URL behind the entry negotiates its
+representation from `Accept` (or `?format=`), so one number would describe a
+file a given client may never receive; the map gives the stored size of each
+representation instead. The values are recorded when the rendition is
+generated, not read from the filesystem on demand: a row whose file is missing
+is an internal error, never a plausible `0`. The `entries` in a `srcset`
+response carry the same maps.
 
 ## How a rendition URL resolves
 

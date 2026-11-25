@@ -121,6 +121,14 @@ pub(super) struct RenditionResponse {
     height: u32,
     url: String,
     formats: Vec<&'static str>,
+    /// Stored size of each representation, keyed by format name.
+    ///
+    /// A map rather than one number because the URL negotiates the format:
+    /// the bytes a browser receives depend on its `Accept` header, and a
+    /// consumer estimating transfer cost needs the representation it will
+    /// actually get. The sizes come from the rows written at generation time,
+    /// never from a stat on read.
+    bytes: BTreeMap<&'static str, u64>,
 }
 
 /// A trash listing entry. Purged entries are tombstones: they describe bytes
@@ -215,24 +223,26 @@ impl AssetResponse {
 impl From<&StoredAsset> for AssetResponse {
     fn from(value: &StoredAsset) -> Self {
         let asset = &value.asset;
-        let mut grouped = BTreeMap::<u32, (u32, u32, Vec<&'static str>)>::new();
+        let mut grouped = BTreeMap::<u32, (u32, u32, BTreeMap<&'static str, u64>)>::new();
         for rendition in &value.renditions {
-            let entry = grouped
+            grouped
                 .entry(rendition.max_width)
-                .or_insert_with(|| (rendition.width, rendition.height, Vec::new()));
-            entry.2.push(rendition.format.key());
+                .or_insert_with(|| (rendition.width, rendition.height, BTreeMap::new()))
+                .2
+                .insert(rendition.format.key(), rendition.bytes);
         }
 
         let renditions = grouped
             .into_iter()
-            .map(|(max_width, (width, height, mut formats))| {
-                formats.sort_unstable();
+            .map(|(max_width, (width, height, bytes))| {
+                let formats = bytes.keys().copied().collect();
                 RenditionResponse {
                     max_width,
                     width,
                     height,
                     url: rendition_url(&asset.id, max_width, asset.generation),
                     formats,
+                    bytes,
                 }
             })
             .collect();
@@ -1560,9 +1570,26 @@ fn srcset_for(
             .join(", ")
     });
 
+    let entries = chosen
+        .iter()
+        .map(|(requested, rendition)| SrcsetEntryResponse {
+            max_width: *requested,
+            width: rendition.width,
+            height: rendition.height,
+            url: rendition_url(id, *requested, generation),
+            bytes: asset
+                .renditions
+                .iter()
+                .filter(|stored| stored.max_width == rendition.max_width)
+                .map(|stored| (stored.format.key(), stored.bytes))
+                .collect(),
+        })
+        .collect();
+
     SrcsetResponse {
         src,
         srcset,
+        entries,
         generation,
     }
 }
@@ -1609,8 +1636,24 @@ pub(super) struct SrcsetResponse {
     src: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     srcset: Option<String>,
+    /// One entry per candidate in `srcset`, with the facts the string cannot
+    /// carry. The URL negotiates its format, so sizes are a map rather than a
+    /// number.
+    entries: Vec<SrcsetEntryResponse>,
     /// The generation every URL here names.
     generation: u32,
+}
+
+#[derive(Serialize)]
+pub(super) struct SrcsetEntryResponse {
+    /// The profile width this URL names.
+    max_width: u32,
+    /// The actual width of the stored file the URL resolves to.
+    width: u32,
+    height: u32,
+    url: String,
+    /// Stored size of each representation behind the negotiated URL.
+    bytes: BTreeMap<&'static str, u64>,
 }
 
 /// Generate the renditions an asset is missing.
@@ -4229,6 +4272,58 @@ mod tests {
         );
     }
 
+    /// Every rendition entry reports the size of the file that actually backs
+    /// each format, and the number matches both the stored row and the bytes
+    /// on disk.
+    #[tokio::test]
+    async fn rendition_metadata_reports_the_stored_size_of_every_format() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_test_image(&directory.path().join("sizes.png"), "800x600");
+        let data_dir = directory.path().join("atlas");
+        let mut config = test_config(data_dir);
+        config.variant_widths = vec![320, 640];
+        let state = AppState::new(config).await.unwrap();
+        let router = app(state.clone());
+
+        let (status, body) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = AssetId::parse(body["id"].as_str().unwrap()).unwrap();
+        let stored = state.store.get_asset(&id).await.unwrap().unwrap();
+
+        let entries = body["renditions"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        for entry in entries {
+            let max_width = entry["max_width"].as_u64().unwrap() as u32;
+            let formats: Vec<&str> = entry["formats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|format| format.as_str().unwrap())
+                .collect();
+            let sizes = entry["bytes"].as_object().unwrap();
+            assert_eq!(
+                sizes.len(),
+                formats.len(),
+                "every advertised format has a size"
+            );
+            for format in formats {
+                let reported = sizes.get(format).unwrap().as_u64().unwrap();
+                let record = stored
+                    .renditions
+                    .iter()
+                    .find(|rendition| {
+                        rendition.max_width == max_width && rendition.format.key() == format
+                    })
+                    .unwrap_or_else(|| panic!("no stored {max_width}w {format}"));
+                assert_eq!(reported, record.bytes, "{max_width}w {format} row");
+                let on_disk = std::fs::metadata(state.asset_dir(&id).join(&record.file_name))
+                    .unwrap()
+                    .len();
+                assert_eq!(reported, on_disk, "{max_width}w {format} file");
+            }
+        }
+    }
+
     /// The colour of the first pixel of a PNG, as `[r, g, b]`.
     fn first_pixel(path: &std::path::Path) -> [i32; 3] {
         let output = Command::new("magick")
@@ -5846,6 +5941,29 @@ mod tests {
             format!("/media/{small_id}/w320?g=1 320w, /media/{small_id}/w640?g=1 500w"),
             "descriptors are the widths that were actually produced"
         );
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["max_width"], 320);
+        assert_eq!(entries[0]["width"], 320);
+        assert_eq!(entries[0]["url"], format!("/media/{small_id}/w320?g=1"));
+        assert!(
+            !entries[0]["bytes"].as_object().unwrap().is_empty(),
+            "each entry carries per-format sizes"
+        );
+        let (_, asset) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/images/{small_id}")),
+        )
+        .await;
+        for entry in entries {
+            let metadata = asset["renditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|rendition| rendition["max_width"] == entry["max_width"])
+                .unwrap();
+            assert_eq!(entry["bytes"], metadata["bytes"]);
+        }
 
         // A width that was never generated simply does not appear.
         let (_, body) = send(
@@ -5860,6 +5978,11 @@ mod tests {
         assert!(
             body.get("srcset").is_none(),
             "no srcset key at all rather than an empty one"
+        );
+        assert_eq!(
+            body["entries"].as_array().unwrap().len(),
+            0,
+            "no candidate entries either"
         );
 
         // A document has no srcset route, and a document id is not an image.
