@@ -337,6 +337,10 @@ pub fn app(state: AppState) -> Router {
             axum::routing::post(api::restore_asset),
         )
         .route("/api/v1/{kind}/{id}/pin", axum::routing::put(api::set_pin))
+        .route(
+            "/api/v1/{kind}/{id}/filename",
+            axum::routing::put(api::rename_asset),
+        )
         // A consumer's own opaque note. Typed like the rest: it belongs to an
         // asset, and an asset belongs to a collection.
         .route(

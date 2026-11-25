@@ -105,6 +105,13 @@ as an attachment instead of being re-encoded into a picture.
   Returns `204`, or `409` if the asset was already purged.
 - `PUT /api/v1/{kind}/{id}/pin` — authenticated usage registration. Body
   `{"pinned": true|false}`; purge skips pinned assets.
+- `PUT /api/v1/{kind}/{id}/filename` — authenticated edit of the stored
+  original filename. Body `{"filename": "..."}` runs the same sanitizer as
+  `X-Original-Filename` (raw UTF-8 or percent-encoded, any path stripped,
+  255 characters), and `{"filename": null}` clears it back to the unnamed
+  state. Only active assets can be renamed; a trashed one is `409
+  asset_retired`, a purged one `409 asset_purged`. Public URLs are untouched,
+  because the name was never part of one.
 - `PUT /api/v1/{kind}/{id}/data` — authenticated consumer-owned note. Body
   `{"data": "..."}`, or `{"data": null}` to clear. Atlas stores it, caps it at
   `ATLAS_MAX_CONSUMER_DATA_BYTES` (64 KiB) and hands it back untouched: it does
@@ -426,8 +433,9 @@ percent-encoded, so `Отчет за 2026.pdf`, `Jahresbericht (Ü).pdf` and
 stripped, and a name containing control characters is refused with
 `400 invalid_filename`. Delivery sends it as `Content-Disposition: inline;
 filename="…"; filename*=UTF-8''…`, falling back to `asset.pdf` when the upload
-had no name. Consumers that want a different display name should keep it in
-their own database.
+had no name. The name can be changed later with `PUT
+/api/v1/{kind}/{id}/filename`; consumers that want a separate display name
+should still keep it in their own database.
 
 ## Asking what Atlas can still serve
 

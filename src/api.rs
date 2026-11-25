@@ -176,6 +176,27 @@ pub(super) struct DataRequest {
     data: Option<String>,
 }
 
+/// A rename. A missing key is refused rather than treated as `null`, so a
+/// typo cannot silently clear the name.
+#[derive(Deserialize)]
+pub(super) struct FilenameRequest {
+    #[serde(default, deserialize_with = "present")]
+    filename: Option<serde_json::Value>,
+}
+
+/// Distinguish a missing JSON key from an explicit `null`.
+///
+/// `Option<T>` alone collapses both to `None`; wrapping the deserializer makes
+/// a present key always `Some`, so the handler can tell `{}` from
+/// `{"filename": null}`.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 /// How many ids one state lookup may carry. A page of photos is the use case;
 /// anything larger is a caller bug or an attempt to make Atlas a database.
 const MAX_STATE_IDS: usize = 500;
@@ -840,6 +861,74 @@ async fn set_pinned_inner(state: &AppState, id: &AssetId, pinned: bool) -> Resul
         return Err(ApiError::not_found());
     }
     Ok(())
+}
+
+/// Edit the stored original filename.
+///
+/// The name is metadata, not a location: it reaches `Content-Disposition`, the
+/// metadata response and listing sort, never a filesystem path or a format
+/// decision. The value therefore runs the upload header's sanitizer, so the two
+/// entry points cannot drift. Only an active asset can be renamed; a trashed or
+/// purged one is a `409`, and a rename that races a delete changes nothing.
+pub(super) async fn rename_asset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((kind, id)): Path<(String, String)>,
+    Json(body): Json<FilenameRequest>,
+) -> Result<Json<AssetResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let kind = parse_kind(&kind)?;
+    let id = parse_id(&id)?;
+    let filename = match body.filename {
+        Some(serde_json::Value::String(value)) => Some(
+            filename::from_header_bytes(value.as_bytes())
+                .map_err(|error| ApiError::bad_request("invalid_filename", error.to_string()))?,
+        ),
+        Some(serde_json::Value::Null) => None,
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "invalid_filename",
+                "`filename` must be a string, or null to clear it.",
+            ));
+        }
+        None => {
+            return Err(ApiError::bad_request(
+                "invalid_filename",
+                "Set `filename` to a string, or to null to clear it.",
+            ));
+        }
+    };
+
+    let asset = load_asset(&state, &id, Some(kind)).await?;
+    match asset.asset.state() {
+        AssetState::Active => {}
+        AssetState::Deleted => {
+            return Err(ApiError::conflict(
+                "asset_retired",
+                "The asset is in the trash; restore it before renaming it.",
+            ));
+        }
+        AssetState::Purged | AssetState::Missing => {
+            return Err(ApiError::conflict(
+                "asset_purged",
+                "The asset was purged and cannot be renamed.",
+            ));
+        }
+    }
+    if !state
+        .store
+        .set_original_name(&id, filename.as_deref())
+        .await
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::conflict(
+            "asset_retired",
+            "The asset is no longer active; nothing was renamed.",
+        ));
+    }
+
+    let asset = load_asset(&state, &id, Some(kind)).await?;
+    Ok(Json(AssetResponse::from(&asset)))
 }
 
 /// Answer "which of the ids I already know can you still serve?".
@@ -7917,6 +8006,215 @@ mod tests {
             headers["content-disposition"], "inline; filename=\"asset.pdf\"",
             "an upload without a name keeps Atlas's generic download name"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rename_uses_the_upload_sanitizer_and_updates_headers_and_sort() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let (_, first) = send(
+            &router,
+            upload_named("application/pdf", b"%PDF-1.7\nfirst", "img_4032.pdf"),
+        )
+        .await;
+        let first_id = first["id"].as_str().unwrap().to_owned();
+        let (_, second) = send(
+            &router,
+            upload_named("application/pdf", b"%PDF-1.7\nsecond", "workshop.pdf"),
+        )
+        .await;
+        let second_id = second["id"].as_str().unwrap().to_owned();
+
+        // The same decoding and path-stripping the upload header applies.
+        let (status, renamed) = send(
+            &router,
+            json_request(
+                "PUT",
+                &format!("/api/v1/documents/{first_id}/filename"),
+                &json!({"filename": "..%2F..%2FJahresbericht%20%28%C3%9C%29.pdf"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(renamed["original"]["filename"], "Jahresbericht (Ü).pdf");
+
+        let (_, metadata) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/documents/{first_id}")),
+        )
+        .await;
+        assert_eq!(metadata["original"]["filename"], "Jahresbericht (Ü).pdf");
+
+        let (status, headers, _) = fetch(&router, &format!("/media/{first_id}/original")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            headers["content-disposition"]
+                .to_str()
+                .unwrap()
+                .contains("filename*=UTF-8''Jahresbericht%20%28%C3%9C%29.pdf")
+        );
+
+        // The listing sorts by the field Atlas now owns and has just changed.
+        let (_, page) = send(
+            &router,
+            authorized("GET", "/api/v1/documents?sort=filename&order=asc"),
+        )
+        .await;
+        let ids: Vec<&str> = page["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|asset| asset["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![first_id.as_str(), second_id.as_str()]);
+
+        // Last write wins, and null restores the unnamed state.
+        let (status, renamed) = send(
+            &router,
+            json_request(
+                "PUT",
+                &format!("/api/v1/documents/{first_id}/filename"),
+                &json!({"filename": "renamed.pdf"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(renamed["original"]["filename"], "renamed.pdf");
+
+        let (status, cleared) = send(
+            &router,
+            json_request(
+                "PUT",
+                &format!("/api/v1/documents/{first_id}/filename"),
+                &json!({"filename": null}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cleared["original"]["filename"], serde_json::Value::Null);
+        let (_, headers, _) = fetch(&router, &format!("/media/{first_id}/original")).await;
+        assert_eq!(
+            headers["content-disposition"], "inline; filename=\"asset.pdf\"",
+            "an unnamed document returns to the generic download name"
+        );
+
+        // Truncated by characters, like the header.
+        let long = "я".repeat(300);
+        let (status, truncated) = send(
+            &router,
+            json_request(
+                "PUT",
+                &format!("/api/v1/documents/{first_id}/filename"),
+                &json!({ "filename": long }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            truncated["original"]["filename"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            255
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_refuses_retired_assets_and_malformed_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let router = app(state.clone());
+        let id = upload_document(&router, b"%PDF-1.7\nrename me").await;
+        let uri = format!("/api/v1/documents/{id}/filename");
+
+        for (body, why) in [
+            (json!({}), "a missing filename key"),
+            (json!({"filename": 42}), "a non-string filename"),
+            (
+                json!({"filename": "evil\nbreak.pdf"}),
+                "a control character",
+            ),
+            (json!({"filename": "%FF%FE"}), "bytes that are not text"),
+        ] {
+            let (status, error) = send(&router, json_request("PUT", &uri, &body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{why}");
+            assert_eq!(error["error"]["code"], "invalid_filename", "{why}");
+        }
+
+        // The collection in the path is part of the address.
+        let (status, _) = send(
+            &router,
+            json_request(
+                "PUT",
+                &format!("/api/v1/images/{id}/filename"),
+                &json!({"filename": "wrong.pdf"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, error) = send(
+            &router,
+            json_request(
+                "PUT",
+                "/api/v1/documents/aaaaaaaaaaaaaaaaaaaa/filename",
+                &json!({"filename": "missing.pdf"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error["error"]["code"], "asset_not_found");
+
+        // Retired assets keep the name they had: only active assets rename.
+        place_in_trash(&router, "documents", &id).await;
+        let (status, error) = send(
+            &router,
+            json_request("PUT", &uri, &json!({"filename": "trashed.pdf"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error["error"]["code"], "asset_retired");
+        let (_, asset) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/documents/{id}")),
+        )
+        .await;
+        assert_eq!(asset["original"]["filename"], serde_json::Value::Null);
+
+        // A tombstone is retired for good, and says so differently.
+        state
+            .store
+            .mark_purged(&AssetId::parse(&id).unwrap(), 1_700_000_000)
+            .await
+            .unwrap();
+        let (status, error) = send(
+            &router,
+            json_request("PUT", &uri, &json!({"filename": "purged.pdf"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error["error"]["code"], "asset_purged");
+
+        // Authentication is required like every write.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(&uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"filename":"anonymous.pdf"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

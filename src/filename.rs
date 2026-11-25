@@ -1,4 +1,4 @@
-//! The name an uploader gave its file.
+//! The name an uploader gave its file, or an editor later set.
 //!
 //! This is untrusted input that ends up in a response header, so it is decoded
 //! and sanitized in one place and never reaches a filesystem path: the file on
@@ -40,12 +40,13 @@ pub enum FilenameError {
 impl fmt::Display for FilenameError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotUtf8 => formatter
-                .write_str("X-Original-Filename must be UTF-8 text, optionally percent-encoded"),
-            Self::Control => {
-                formatter.write_str("X-Original-Filename must not contain control characters")
+            Self::NotUtf8 => {
+                formatter.write_str("The filename must be UTF-8 text, optionally percent-encoded")
             }
-            Self::Empty => formatter.write_str("X-Original-Filename did not contain a file name"),
+            Self::Control => {
+                formatter.write_str("The filename must not contain control characters")
+            }
+            Self::Empty => formatter.write_str("The filename did not contain a file name"),
         }
     }
 }
