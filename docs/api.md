@@ -100,6 +100,17 @@ as an attachment instead of being re-encoded into a picture.
   consumer validating a type somebody else declared should read `media_types`.
 - `POST /api/v1/assets/state` — authenticated batch state lookup for ids the
   caller already has, across both collections. Not a listing.
+- `POST /api/v1/assets/by-hash` — authenticated batch lookup of up to 500
+  SHA-256 hashes, answering which byte strings this instance already has.
+  Body `{"hashes":["…"],"kind":"image"}`; `kind` is optional and narrows the
+  question to one collection. Results are per hash and per collection,
+  because dedup keys on `(sha256, kind)`: the same bytes can be present as a
+  document and absent as an image. Each match carries `id`, `kind` and
+  `state`; an empty `matches` list is the `missing` answer, and a `deleted`
+  or `purged` match is not something an upload would deduplicate against.
+  Hashes are 64 hexadecimal characters, compared case-insensitively and
+  echoed in lowercase. A malformed hash is `400 invalid_sha256`, more than
+  500 is `400 too_many_hashes`, and an unknown `kind` is `400 invalid_kind`.
 - `DELETE /api/v1/{kind}/{id}` — authenticated move to the trash. Returns `204`.
 - `POST /api/v1/{kind}/{id}/restore` — authenticated restore from the trash.
   Returns `204`, or `409` if the asset was already purged.
@@ -214,7 +225,8 @@ Uploads are content-addressed within their collection. If the exact bytes are
 already live there, nothing is written or converted and the response is `200`
 with the existing asset and `"deduplicated": true`. A duplicate is not an
 error, and the alternative is paying for a conversion and storing the result
-twice.
+twice. `POST /api/v1/assets/by-hash` asks the same question before the bytes
+are sent.
 
 The default rendition widths are 320, 640, 960, and 1280 pixels. They preserve
 the original aspect ratio and are not upscaled. Configure a different fixed
@@ -477,6 +489,35 @@ One call covers up to 500 ids. Ids Atlas has never heard of come back as
 "deleted" is the whole reason to ask. A malformed id is a `400`, not a silent
 omission. This is not a listing: the caller supplies the ids, so Atlas learns
 nothing about what they are used for and the result cannot be paged through.
+
+A bulk import can ask the same question about *bytes* before sending them:
+
+```sh
+curl -X POST http://127.0.0.1:3000/api/v1/assets/by-hash \
+  -H "Authorization: Bearer $ATLAS_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"hashes":["3b1f0c9a4d2e8f7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a",
+                "0000000000000000000000000000000000000000000000000000000000000000"]}'
+```
+
+```json
+{"hashes":[
+  {"sha256":"3b1f0c9a4d2e8f7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a",
+   "matches":[
+     {"id":"8odfjrxxjxzypa99j6","kind":"image","state":"active"},
+     {"id":"4f2k9xq7m1b8w3z0pd","kind":"document","state":"active"}
+   ]},
+  {"sha256":"0000000000000000000000000000000000000000000000000000000000000000",
+   "matches":[]}
+]}
+```
+
+Dedup keys on `(sha256, kind)`, so one hash can be present in both
+collections or only one; the optional `kind` field narrows the lookup. An
+empty `matches` list is the `missing` answer. Only an `active` match is what an
+upload would deduplicate against: a `deleted` or `purged` match says the bytes
+are here, but a re-upload would create a new asset. A malformed hash is a
+`400 invalid_sha256`, and the same 500-entry ceiling applies.
 
 ## Trash, restore, and purge
 

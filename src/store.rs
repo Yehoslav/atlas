@@ -217,6 +217,15 @@ pub struct ListQuery {
     pub offset: i64,
 }
 
+/// One asset that owns a requested content hash, chosen per `(sha256, kind)`.
+#[derive(Clone, Debug)]
+pub struct HashMatch {
+    pub sha256: String,
+    pub kind: Kind,
+    pub id: AssetId,
+    pub state: AssetState,
+}
+
 impl Default for ListQuery {
     fn default() -> Self {
         Self {
@@ -896,6 +905,65 @@ impl Store {
         Ok(row
             .and_then(|row| row.try_get::<String, _>("id").ok())
             .and_then(|id| AssetId::parse(&id).ok()))
+    }
+
+    /// The best asset for each requested hash, per collection.
+    ///
+    /// Dedup keys on `(sha256, kind)`, so one hash can answer in both
+    /// collections. For each pair this picks the oldest live asset when one
+    /// exists, otherwise the oldest retired one, and reports the state: an
+    /// upload only deduplicates against a live asset, so "only in the trash"
+    /// must not read as "already here". `kind` narrows the lookup for a
+    /// consumer that already knows what it is importing.
+    pub async fn assets_by_sha256(
+        &self,
+        hashes: &[String],
+        kind: Option<Kind>,
+    ) -> Result<Vec<HashMatch>, StoreError> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT sha256, kind, id, deleted_at, purged_at FROM assets WHERE sha256 IN (",
+        );
+        let mut separated = query.separated(", ");
+        for hash in hashes {
+            separated.push_bind(hash);
+        }
+        separated.push_unseparated(")");
+        if let Some(kind) = kind {
+            query.push(" AND kind = ").push_bind(kind.key());
+        }
+        // Best first: a live asset beats a retired one, and the oldest row
+        // wins a tie, matching `find_live_by_sha256`.
+        query.push(" ORDER BY (deleted_at IS NULL AND purged_at IS NULL) DESC, created_at ASC");
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut best: HashMap<(String, &'static str), HashMatch> = HashMap::new();
+        for row in rows {
+            let sha256: String = row.try_get("sha256")?;
+            let Some(kind) = row
+                .try_get::<Option<String>, _>("kind")?
+                .and_then(|value| Kind::from_key(&value))
+            else {
+                continue;
+            };
+            let id = row.try_get::<String, _>("id")?;
+            let Ok(id) = AssetId::parse(&id) else {
+                continue;
+            };
+            // The query's ordering already put the best row first, so the
+            // first entry for a pair is the one to keep.
+            best.entry((sha256.clone(), kind.key()))
+                .or_insert(HashMatch {
+                    sha256,
+                    kind,
+                    id,
+                    state: state_from(&row),
+                });
+        }
+        Ok(best.into_values().collect())
     }
 
     /// A page of one collection, plus the size of the whole filtered set.
@@ -1681,6 +1749,105 @@ mod tests {
             AssetState::Active
         );
         assert!(store.get_asset(&id).await.unwrap().unwrap().asset.pinned);
+    }
+
+    #[tokio::test]
+    async fn hash_lookup_prefers_live_and_separates_collections() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+        let hash = "a".repeat(64);
+
+        // An older trashed image and a newer live one with the same bytes.
+        let trashed_image = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        let mut trashed = record(&trashed_image);
+        trashed.sha256 = hash.clone();
+        trashed.created_at = 1_700_000_000;
+        store.insert_asset(&trashed, &[]).await.unwrap();
+        store
+            .mark_deleted(&trashed_image, 1_700_000_100)
+            .await
+            .unwrap();
+
+        let live_image = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        let mut live = record(&live_image);
+        live.sha256 = hash.clone();
+        live.created_at = 1_700_000_200;
+        store.insert_asset(&live, &[]).await.unwrap();
+
+        // The same bytes as a document are a different answer.
+        let document = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        let mut document_record = record(&document);
+        document_record.sha256 = hash.clone();
+        document_record.kind = Some(Kind::Document);
+        store.insert_asset(&document_record, &[]).await.unwrap();
+
+        let found = store
+            .assets_by_sha256(std::slice::from_ref(&hash), None)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 2, "one answer per collection");
+        let image = found
+            .iter()
+            .find(|matched| matched.kind == Kind::Image)
+            .unwrap();
+        assert_eq!(
+            image.id, live_image,
+            "the live row beats the older trashed one"
+        );
+        assert_eq!(image.state, AssetState::Active);
+        let document_match = found
+            .iter()
+            .find(|matched| matched.kind == Kind::Document)
+            .unwrap();
+        assert_eq!(document_match.id, document);
+
+        let images_only = store
+            .assets_by_sha256(std::slice::from_ref(&hash), Some(Kind::Image))
+            .await
+            .unwrap();
+        assert_eq!(images_only.len(), 1);
+        assert_eq!(images_only[0].kind, Kind::Image);
+
+        assert!(
+            store
+                .assets_by_sha256(&["b".repeat(64)], None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unknown hash has no row"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hash_lookup_uses_the_composite_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+
+        let rows = sqlx::query(
+            "EXPLAIN QUERY PLAN
+             SELECT sha256, kind, id, deleted_at, purged_at FROM assets
+             WHERE sha256 IN (?, ?) AND kind = ?
+             ORDER BY (deleted_at IS NULL AND purged_at IS NULL) DESC, created_at ASC",
+        )
+        .bind("a".repeat(64))
+        .bind("b".repeat(64))
+        .bind("image")
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        let plan: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("detail").unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("assets_by_sha256_kind")),
+            "the lookup must not grow into a table scan: {plan:?}"
+        );
     }
 
     #[tokio::test]

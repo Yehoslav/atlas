@@ -376,6 +376,10 @@ pub fn app(state: AppState) -> Router {
             "/api/v1/assets/state",
             axum::routing::post(api::asset_states),
         )
+        .route(
+            "/api/v1/assets/by-hash",
+            axum::routing::post(api::assets_by_hash),
+        )
         .route("/api/v1/summary", get(api::summary))
         .route("/api/v1/formats", get(api::list_formats))
         .route("/api/v1/trash", get(api::list_trash))

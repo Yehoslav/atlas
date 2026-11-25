@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::SeekFrom,
     path::PathBuf,
     sync::LazyLock,
@@ -207,6 +207,10 @@ where
 /// anything larger is a caller bug or an attempt to make Atlas a database.
 const MAX_STATE_IDS: usize = 500;
 
+/// How many hashes one lookup may carry. The same ceiling as a state batch:
+/// a bulk import asks about a page of files, not its whole catalogue.
+const MAX_HASHES: usize = 500;
+
 #[derive(Deserialize)]
 pub(super) struct TrashQuery {
     limit: Option<i64>,
@@ -216,6 +220,33 @@ pub(super) struct TrashQuery {
 #[derive(Deserialize)]
 pub(super) struct StateRequest {
     ids: Vec<String>,
+}
+
+/// A batch hash lookup. `kind` narrows the question to one collection.
+#[derive(Deserialize)]
+pub(super) struct ByHashRequest {
+    hashes: Vec<String>,
+    kind: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(super) struct ByHashResponse {
+    hashes: Vec<HashEntryResponse>,
+}
+
+#[derive(Serialize)]
+pub(super) struct HashEntryResponse {
+    sha256: String,
+    /// One match per collection, when one exists. Empty is the `missing`
+    /// answer: no live or retired asset on this instance has those bytes.
+    matches: Vec<HashMatchResponse>,
+}
+
+#[derive(Serialize)]
+pub(super) struct HashMatchResponse {
+    id: String,
+    kind: Kind,
+    state: AssetState,
 }
 
 #[derive(Serialize)]
@@ -1006,6 +1037,78 @@ pub(super) async fn asset_states(
         .collect();
 
     Ok(Json(StateResponse { assets }))
+}
+
+/// Answer which of these byte strings Atlas already has, per collection.
+///
+/// The pre-flight twin of deduplication: a bulk import can ask before sending
+/// the bytes. Dedup keys on `(sha256, kind)`, so one hash can answer in both
+/// collections; a live match is what an upload would deduplicate against, and
+/// a retired match says the bytes are here but would not.
+pub(super) async fn assets_by_hash(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ByHashRequest>,
+) -> Result<Json<ByHashResponse>, ApiError> {
+    authorize(&state, &headers)?;
+
+    if body.hashes.len() > MAX_HASHES {
+        return Err(ApiError::bad_request(
+            "too_many_hashes",
+            format!("Ask about at most {MAX_HASHES} hashes at a time."),
+        ));
+    }
+
+    let kind = match body.kind.as_deref() {
+        None => None,
+        Some(value) => Some(Kind::from_slug(value).ok_or_else(|| {
+            ApiError::bad_request("invalid_kind", "kind must be `image` or `document`.")
+        })?),
+    };
+
+    let mut hashes = Vec::with_capacity(body.hashes.len());
+    for raw in &body.hashes {
+        let hash = raw.to_ascii_lowercase();
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ApiError::bad_request(
+                "invalid_sha256",
+                "Every hash must be 64 hexadecimal characters.",
+            ));
+        }
+        hashes.push(hash);
+    }
+
+    let found = state
+        .store
+        .assets_by_sha256(&hashes, kind)
+        .await
+        .map_err(ApiError::internal)?;
+    let found: HashMap<(String, &'static str), _> = found
+        .into_iter()
+        .map(|matched| ((matched.sha256.clone(), matched.kind.key()), matched))
+        .collect();
+
+    let kinds = match kind {
+        Some(kind) => vec![kind],
+        None => vec![Kind::Image, Kind::Document],
+    };
+    let hashes = hashes
+        .into_iter()
+        .map(|sha256| {
+            let matches = kinds
+                .iter()
+                .filter_map(|kind| found.get(&(sha256.clone(), kind.key())))
+                .map(|matched| HashMatchResponse {
+                    id: matched.id.to_string(),
+                    kind: matched.kind,
+                    state: matched.state,
+                })
+                .collect();
+            HashEntryResponse { sha256, matches }
+        })
+        .collect();
+
+    Ok(Json(ByHashResponse { hashes }))
 }
 
 /// A browsable page of one collection.
@@ -4119,6 +4222,28 @@ mod tests {
         send(router, state_request(ids)).await
     }
 
+    fn hash_request(hashes: &[&str], kind: Option<&str>) -> Request<Body> {
+        let mut body = serde_json::json!({ "hashes": hashes });
+        if let Some(kind) = kind {
+            body["kind"] = serde_json::json!(kind);
+        }
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/assets/by-hash")
+            .header("authorization", "Bearer prototype-test-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn hashes_of(
+        router: &Router,
+        hashes: &[&str],
+        kind: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        send(router, hash_request(hashes, kind)).await
+    }
+
     #[tokio::test]
     async fn a_collection_refuses_what_it_cannot_hold() {
         let directory = tempfile::tempdir().unwrap();
@@ -4319,6 +4444,149 @@ mod tests {
                     .uri("/api/v1/assets/state")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"ids":["aaaaaaaaaaaaaaaaaaaa"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_hash_lookup_answers_per_collection_and_prefers_live_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        // One byte string, stored as both an image and a document.
+        let image = write_test_image(&directory.path().join("hash.png"), "320x240");
+        let (status, image_asset) = send(&router, upload_request("image/png", image.clone())).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let hash = image_asset["original"]["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let image_id = image_asset["id"].as_str().unwrap().to_owned();
+
+        let mut as_document = upload_request("image/png", image);
+        *as_document.uri_mut() = "/api/v1/documents".parse().unwrap();
+        let (status, document_asset) = send(&router, as_document).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let document_id = document_asset["id"].as_str().unwrap().to_owned();
+
+        // The same bytes trashed and re-uploaded: the live row is the one an
+        // upload would deduplicate against, so it must be the one reported.
+        let reused = b"%PDF-1.7\nreused bytes";
+        let (status, trashed) =
+            send(&router, upload_request("application/pdf", reused.to_vec())).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let trashed_id = trashed["id"].as_str().unwrap().to_owned();
+        let reused_hash = trashed["original"]["sha256"].as_str().unwrap().to_owned();
+        place_in_trash(&router, "documents", &trashed_id).await;
+        let (status, live) =
+            send(&router, upload_request("application/pdf", reused.to_vec())).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let live_id = live["id"].as_str().unwrap().to_owned();
+
+        let unknown = "0".repeat(64);
+        let (status, body) = hashes_of(&router, &[&hash, &reused_hash, &unknown], None).await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = body["hashes"].as_array().unwrap();
+        assert_eq!(entries.len(), 3, "one entry per requested hash, in order");
+        assert_eq!(entries[0]["sha256"], hash);
+        assert_eq!(entries[1]["sha256"], reused_hash);
+        assert_eq!(
+            entries[2]["matches"].as_array().unwrap().len(),
+            0,
+            "an unknown hash is the empty matches answer"
+        );
+
+        let matches = entries[0]["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 2, "the same bytes live in both collections");
+        assert_eq!(matches[0]["kind"], "image");
+        assert_eq!(matches[0]["id"], image_id);
+        assert_eq!(matches[0]["state"], "active");
+        assert_eq!(matches[1]["kind"], "document");
+        assert_eq!(matches[1]["id"], document_id);
+
+        let reused_matches = entries[1]["matches"].as_array().unwrap();
+        assert_eq!(reused_matches.len(), 1);
+        assert_eq!(
+            reused_matches[0]["id"], live_id,
+            "a trashed copy does not shadow the live one"
+        );
+        assert_eq!(reused_matches[0]["state"], "active");
+
+        // A collection filter asks only the question the caller has.
+        let (status, body) = hashes_of(&router, &[&hash], Some("documents")).await;
+        assert_eq!(status, StatusCode::OK);
+        let matches = body["hashes"][0]["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["kind"], "document");
+
+        // Hashes compare case-insensitively and are echoed in canonical form;
+        // a repeated hash still gets its answer.
+        let upper = hash.to_ascii_uppercase();
+        let (status, body) = hashes_of(&router, &[&upper, &hash], None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["hashes"][0]["sha256"], hash);
+        assert_eq!(body["hashes"][0]["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["hashes"][1]["matches"].as_array().unwrap().len(),
+            2,
+            "duplicates in the request do not consume the answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hash_lookup_refuses_malformed_hashes_and_enormous_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let not_hex = "g".repeat(64);
+        let too_short = "a".repeat(63);
+        let too_long = "a".repeat(65);
+        for bad in [
+            "abc",
+            "g",
+            not_hex.as_str(),
+            too_short.as_str(),
+            too_long.as_str(),
+        ] {
+            let (status, error) = hashes_of(&router, &[bad], None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(error["error"]["code"], "invalid_sha256", "{bad}");
+        }
+
+        let hash = "a".repeat(64);
+        let (status, error) = hashes_of(&router, &[&hash], Some("videos")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "invalid_kind");
+
+        let many = vec![hash; 501];
+        let borrowed: Vec<&str> = many.iter().map(String::as_str).collect();
+        let (status, error) = hashes_of(&router, &borrowed, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["code"], "too_many_hashes");
+
+        let (status, body) = hashes_of(&router, &[], None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["hashes"].as_array().unwrap().len(), 0);
+
+        // Authentication is required like every metadata read.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/assets/by-hash")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"hashes":["{}"]}}"#,
+                        "a".repeat(64)
+                    )))
                     .unwrap(),
             )
             .await
