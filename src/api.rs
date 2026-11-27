@@ -4290,6 +4290,30 @@ mod tests {
         send(router, hash_request(hashes, kind)).await
     }
 
+    /// Write a row the upload path cannot produce, for the states the handler
+    /// has to answer but the API cannot create.
+    ///
+    /// The store's pool is private to the store, so this opens its own
+    /// connection to the same database file; the row is visible to the app's
+    /// pool as soon as it commits.
+    async fn insert_corrupt_row(data_dir: &std::path::Path, hash: &str) {
+        let pool = sqlx::SqlitePool::connect(&format!(
+            "sqlite://{}",
+            data_dir.join("atlas.sqlite3").display()
+        ))
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO assets
+                 (id, source_format, bytes, sha256, width, height, created_at, kind)
+             VALUES ('not-an-asset-id', 'jpeg', 1, ?, 320, 240, 0, 'image')",
+        )
+        .bind(hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn a_collection_refuses_what_it_cannot_hold() {
         let directory = tempfile::tempdir().unwrap();
@@ -4638,6 +4662,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The store reports matches and unreadable hashes separately; the handler
+    /// is what turns that into one answer per requested hash. A mixed batch
+    /// checks all three shapes together, which the store tests cannot.
+    #[tokio::test]
+    async fn a_mixed_batch_answers_matches_missing_and_unreadable_hashes() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
+
+        let image = write_test_image(&directory.path().join("live.png"), "320x240");
+        let (status, uploaded) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let live_hash = uploaded["original"]["sha256"].as_str().unwrap().to_owned();
+        let live_id = uploaded["id"].as_str().unwrap().to_owned();
+
+        let corrupt_hash = "c".repeat(64);
+        insert_corrupt_row(&data_dir, &corrupt_hash).await;
+        let missing_hash = "d".repeat(64);
+
+        let (status, body) =
+            hashes_of(&router, &[&live_hash, &corrupt_hash, &missing_hash], None).await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = body["hashes"].as_array().unwrap();
+        assert_eq!(entries.len(), 3, "one entry per hash, in request order");
+
+        assert_eq!(entries[0]["sha256"], live_hash);
+        assert_eq!(entries[0]["matches"][0]["id"], live_id);
+        assert_eq!(entries[0]["matches"][0]["state"], "active");
+        assert!(
+            entries[0].get("error").is_none(),
+            "a readable hash has no error key"
+        );
+
+        assert_eq!(entries[1]["sha256"], corrupt_hash);
+        assert!(
+            entries[1]["matches"].as_array().unwrap().is_empty(),
+            "an unreadable hash must not carry a match it cannot vouch for"
+        );
+        assert_eq!(
+            entries[1]["error"]["code"], "unreadable_asset",
+            "not an empty matches list, which would read as missing"
+        );
+
+        assert_eq!(entries[2]["sha256"], missing_hash);
+        assert!(entries[2]["matches"].as_array().unwrap().is_empty());
+        assert!(
+            entries[2].get("error").is_none(),
+            "an unknown hash is missing, not unreadable"
+        );
+
+        // The collection filter must not turn the corrupt image row into a miss.
+        let (status, body) = hashes_of(&router, &[&corrupt_hash], Some("image")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["hashes"][0]["error"]["code"], "unreadable_asset");
     }
 
     /// A hash with an unreadable matching row is answered with an error, not an
