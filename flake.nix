@@ -1,9 +1,19 @@
 {
   description = "Atlas media service development environment";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # The development toolchain is pinned to the same version the container
+    # image builds with, so the declared `rust-version` is the compiler a
+    # contributor actually runs. The pinned nixpkgs only carries the newest
+    # Rust, hence the overlay.
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rust-overlay }:
     let
       systems = [
         "x86_64-linux"
@@ -17,15 +27,19 @@
     {
       devShells = forAllSystems (system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ (import rust-overlay) ];
+          };
+          # One toolchain for `nix develop`, CI and the container image.
+          # Bumping it means bumping `rust-version`, the Dockerfile and this
+          # line together; the image job is what proves the floor.
+          rust = pkgs.rust-bin.stable."1.90.0".default;
         in
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              rustc
-              cargo
-              rustfmt
-              clippy
+              rust
               rust-analyzer
               imagemagick
               sqlite

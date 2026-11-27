@@ -37,6 +37,15 @@ jobs:
           bash scripts/check-magick-codecs.sh
           bash scripts/test-codec-check.sh
 
+      - name: Toolchain pins
+        # The MSRV is written in three syntaxes for three consumers. A comment
+        # in each says to keep them together; this makes a partial bump fail
+        # instead of shipping an image built by a compiler the crate does not
+        # claim, or a dev shell that accepts code the image rejects.
+        run: |
+          bash scripts/check-rust-version.sh
+          bash scripts/test-rust-version-check.sh
+
       - name: Service
         run: |
           cargo fmt --check

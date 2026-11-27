@@ -20,6 +20,8 @@
 
 # --- the service ------------------------------------------------------------
 
+# Keep this version in step with `rust-version` in Cargo.toml and the
+# rust-overlay pin in flake.nix: this build is what proves the floor.
 FROM rust:1.90-alpine AS build
 
 # `musl-dev` is the C library the musl target links against, and `pkgconfig`

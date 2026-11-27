@@ -1459,6 +1459,9 @@ mod tests {
         (store, id)
     }
 
+    // The list is a constant, so Clippy can prove this assertion true for the
+    // current build; it is here to fail if `build.rs` ever embeds nothing.
+    #[allow(clippy::const_is_empty)]
     #[test]
     fn every_migration_file_is_embedded_and_ordered() {
         assert!(!MIGRATION_FILES.is_empty());

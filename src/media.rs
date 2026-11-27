@@ -494,7 +494,9 @@ fn iso_brand(prefix: &[u8], brands: &[&str]) -> bool {
     let declared = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
     let end = declared.clamp(12, prefix.len());
     prefix[8..end]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .any(|brand| brands.iter().any(|wanted| brand == wanted.as_bytes()))
 }
 
