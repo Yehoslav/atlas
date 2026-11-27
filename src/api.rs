@@ -97,14 +97,16 @@ pub(crate) async fn health() -> Json<HealthResponse> {
     security(()),
     responses((status = 200, description = "The OpenAPI 3.1 document for this instance."))
 )]
-pub(super) async fn openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {
-    Json(
-        state
-            .openapi
-            .get()
-            .cloned()
-            .expect("app() builds the OpenAPI document before serving"),
-    )
+pub(super) async fn openapi(
+    State(state): State<AppState>,
+) -> Result<Json<utoipa::openapi::OpenApi>, ApiError> {
+    let document = state.openapi.get().ok_or_else(|| {
+        // Only reachable when the route is mounted without `app()`, which is
+        // the one place the document is built. Answering says so; a panic
+        // would only say that something went wrong.
+        ApiError::internal("the OpenAPI document is missing; build the router with app()")
+    })?;
+    Ok(Json(document.clone()))
 }
 
 /// The compatibility marker a consumer's deploy gate reads.
@@ -6814,6 +6816,30 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"status": "ok"}));
+    }
+
+    /// The document is built in `app()`. If the route is mounted without it,
+    /// the answer says so instead of panicking.
+    #[tokio::test]
+    async fn the_openapi_route_answers_when_no_document_was_built() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let router = Router::new()
+            .route("/api/v1/openapi.json", axum::routing::get(super::openapi))
+            .with_state(state);
+
+        let (status, body) = send(
+            &router,
+            Request::builder()
+                .uri("/api/v1/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "internal_error");
     }
 
     #[tokio::test]
