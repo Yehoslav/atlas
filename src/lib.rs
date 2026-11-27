@@ -402,6 +402,10 @@ fn add_live_examples(document: &mut utoipa::openapi::OpenApi, state: &AppState) 
         .iter()
         .map(|format| format.key())
         .collect();
+    let (free_bytes, writable) = api::ready_disk(
+        disk::space(&state.config.data_dir),
+        state.config.min_free_bytes,
+    );
     let Some(item) = document.paths.paths.get_mut("/readyz") else {
         return;
     };
@@ -416,11 +420,11 @@ fn add_live_examples(document: &mut utoipa::openapi::OpenApi, state: &AppState) 
         media.example = Some(serde_json::json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
-            "api": 1,
+            "api": api::API_COMPATIBILITY,
             "rendition_widths": widths,
             "formats": formats,
-            "writable": true,
-            "free_bytes": 0,
+            "writable": writable,
+            "free_bytes": free_bytes,
         }));
     }
 }

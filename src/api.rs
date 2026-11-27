@@ -31,7 +31,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     AppState, disk,
-    error::ApiError,
+    error::{ApiError, ErrorResponse},
     filename,
     ident::AssetId,
     media::{MediaError, detect_multiframe, sha256_bytes, sha256_file, validate_signature},
@@ -107,30 +107,13 @@ pub(super) async fn openapi(State(state): State<AppState>) -> Json<utoipa::opena
     )
 }
 
-/// The JSON envelope every error uses, so the document can reference one
-/// schema instead of repeating the shape on every route.
-#[allow(dead_code)]
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct ErrorResponse {
-    error: ErrorDetail,
-}
-
-#[allow(dead_code)]
-#[derive(Serialize, utoipa::ToSchema)]
-pub(super) struct ErrorDetail {
-    /// A stable machine code, such as `asset_not_found`.
-    code: String,
-    /// A sentence for a human; not a contract to match on.
-    message: String,
-}
-
 /// The compatibility marker a consumer's deploy gate reads.
 ///
 /// It starts at 1 and is incremented when a route, a method, or a
 /// request/response field of a consumer-visible route changes or disappears —
 /// never for an additive field or route. It is a promise to be honest about
 /// breaking changes, not a promise that there are none.
-const API_COMPATIBILITY: u32 = 1;
+pub(crate) const API_COMPATIBILITY: u32 = 1;
 
 /// Readiness plus the contract a consumer gates a deploy on.
 ///
@@ -195,7 +178,10 @@ pub(super) async fn ready(State(state): State<AppState>) -> Response {
 /// the floor is a comparison against a number Atlas does not have, and the
 /// safe answer is that a write cannot be promised. `free_bytes` is zero then,
 /// so the consumer sees both the missing reading and the refusal.
-fn ready_disk(space: std::io::Result<disk::DiskSpace>, min_free_bytes: u64) -> (u64, bool) {
+pub(crate) fn ready_disk(
+    space: std::io::Result<disk::DiskSpace>,
+    min_free_bytes: u64,
+) -> (u64, bool) {
     match space {
         Ok(space) => (space.free_bytes, space.free_bytes >= min_free_bytes),
         Err(_) => (0, false),
@@ -6932,21 +6918,61 @@ mod tests {
             ("AssetResponse", &asset),
             ("RenditionResponse", &asset["renditions"][0]),
         ] {
-            let schema = &document["components"]["schemas"][name];
-            let properties = schema["properties"].as_object().unwrap();
-            for key in value.as_object().unwrap().keys() {
-                assert!(
-                    properties.contains_key(key),
-                    "{name} has an undocumented field: {key}"
-                );
-            }
-            for key in schema["required"].as_array().unwrap() {
-                let key = key.as_str().unwrap();
-                assert!(
-                    value.get(key).is_some(),
-                    "{name} documents {key} as required but the response omits it"
-                );
-            }
+            assert_matches_schema(&document, name, value);
+        }
+
+        // The envelope is the one `src/error.rs` serializes, not a copy, and a
+        // real refusal is checked against it.
+        let (status, error) = send(
+            &router,
+            Request::builder()
+                .uri("/api/v1/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error["error"]["code"], "unauthorized");
+        assert_matches_schema(&document, "ErrorResponse", &error);
+
+        // Readiness is checked against its schema and its live example.
+        let (status, ready) = send(
+            &router,
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_matches_schema(&document, "ReadyResponse", &ready);
+        let example = &document["paths"]["/readyz"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["example"];
+        assert_eq!(example["api"], ready["api"]);
+        assert_eq!(example["rendition_widths"], ready["rendition_widths"]);
+        assert_eq!(example["formats"], ready["formats"]);
+        assert_eq!(example["writable"], ready["writable"]);
+    }
+
+    /// Every field the response carries is a property, and every required
+    /// property is present: a two-way check against the served schema.
+    fn assert_matches_schema(document: &serde_json::Value, name: &str, value: &serde_json::Value) {
+        let schema = &document["components"]["schemas"][name];
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name} is not in the document"));
+        for key in value.as_object().unwrap().keys() {
+            assert!(
+                properties.contains_key(key),
+                "{name} has an undocumented field: {key}"
+            );
+        }
+        for key in schema["required"].as_array().unwrap() {
+            let key = key.as_str().unwrap();
+            assert!(
+                value.get(key).is_some(),
+                "{name} documents {key} as required but the response omits it"
+            );
         }
     }
 

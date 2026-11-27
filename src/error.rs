@@ -8,13 +8,13 @@ pub struct ApiError {
     detail: String,
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct ErrorResponse {
     error: ErrorDetail,
 }
 
-#[derive(Serialize)]
-struct ErrorDetail {
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct ErrorDetail {
     code: &'static str,
     message: String,
 }
