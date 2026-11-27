@@ -3675,14 +3675,14 @@ mod tests {
     use crate::{
         AppState, Config, app, disk,
         ident::AssetId,
-        model::{RenditionFormat, RenditionRecord, SourceFormat},
+        model::{AssetState, RenditionFormat, RenditionRecord, SourceFormat},
     };
 
     use serde_json::json;
 
     use super::{
-        ByteRange, ORIGINAL_FILENAME_HEADER, PLACEHOLDER_PNG, echoed, parse_range, select_format,
-        summary_disk_fields,
+        ByteRange, ORIGINAL_FILENAME_HEADER, PLACEHOLDER_PNG, echoed, parse_range, rename_rejected,
+        select_format, summary_disk_fields,
     };
 
     fn rendition(format: RenditionFormat) -> RenditionRecord {
@@ -8240,7 +8240,10 @@ mod tests {
         .await;
         assert_eq!(asset["original"]["filename"], serde_json::Value::Null);
 
-        // A tombstone is retired for good, and says so differently.
+        // A tombstone is retired for good, and says so differently. With the
+        // pre-check gone, this request is rejected by the UPDATE's state
+        // predicate and the code comes from the row read back afterwards, so
+        // the purge race and this ordinary purge take the same path.
         state
             .store
             .mark_purged(&AssetId::parse(&id).unwrap(), 1_700_000_000)
@@ -8268,6 +8271,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The predicate rejects the write for both a trashed and a purged asset
+    /// and cannot say which, so the row read back afterwards picks the code.
+    /// The integration test above covers both states through the handler; this
+    /// pins the mapping itself, including the state a restore would leave.
+    #[test]
+    fn a_rejected_rename_names_the_state_that_rejected_it() {
+        assert_eq!(rename_rejected(AssetState::Deleted).code(), "asset_retired");
+        assert_eq!(rename_rejected(AssetState::Purged).code(), "asset_purged");
+        assert_eq!(
+            rename_rejected(AssetState::Active).code(),
+            "asset_retired",
+            "a restore that wins the race means nothing was written"
+        );
     }
 
     /// The original's URL is stable, but the name in its `Content-Disposition`
