@@ -953,8 +953,10 @@ impl Store {
             let Ok(id) = AssetId::parse(&id) else {
                 continue;
             };
-            // The query's ordering already put the best row first, so the
-            // first entry for a pair is the one to keep.
+            // `ORDER BY` puts a live row before a retired one and the oldest
+            // before a newer one, so the first row for a pair is the one to
+            // keep. `or_insert` relies on that ordering: changing the
+            // `ORDER BY` means revisiting this loop.
             best.entry((sha256.clone(), kind.key()))
                 .or_insert(HashMatch {
                     sha256,
@@ -1847,6 +1849,29 @@ mod tests {
             plan.iter()
                 .any(|line| line.contains("assets_by_sha256_kind")),
             "the lookup must not grow into a table scan: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_composite_index_replaces_the_single_column_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+
+        let names: Vec<String> = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'assets'",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.try_get::<String, _>("name").unwrap())
+        .collect();
+        assert!(names.iter().any(|name| name == "assets_by_sha256_kind"));
+        assert!(
+            !names.iter().any(|name| name == "assets_by_sha256"),
+            "the single-column index only duplicated the composite's leading column"
         );
     }
 
