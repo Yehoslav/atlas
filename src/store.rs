@@ -42,6 +42,12 @@ pub enum StoreError {
     Migration(sqlx::migrate::MigrateError),
     /// `PRAGMA integrity_check` did not return `ok`.
     Corrupt(String),
+    /// A row matched a read but does not parse back into a model value.
+    ///
+    /// Distinct from [`Self::Corrupt`]: SQLite considers the database sound,
+    /// but a value Atlas wrote (or something else rewrote) cannot be trusted,
+    /// so the read fails instead of returning a partial answer.
+    CorruptRow(String),
     /// `PRAGMA foreign_key_check` reported orphan rows.
     ForeignKeys(Vec<ForeignKeyViolation>),
 }
@@ -53,6 +59,9 @@ impl fmt::Display for StoreError {
             Self::Migration(error) => write!(formatter, "schema migration failed: {error}"),
             Self::Corrupt(report) => {
                 write!(formatter, "SQLite integrity check failed: {report}")
+            }
+            Self::CorruptRow(detail) => {
+                write!(formatter, "database row is unreadable: {detail}")
             }
             Self::ForeignKeys(violations) => {
                 write!(formatter, "SQLite foreign key check failed:")?;
@@ -915,6 +924,10 @@ impl Store {
     /// upload only deduplicates against a live asset, so "only in the trash"
     /// must not read as "already here". `kind` narrows the lookup for a
     /// consumer that already knows what it is importing.
+    ///
+    /// A matching row that does not parse is an error, never a miss: `missing`
+    /// is the answer that tells an importer to upload, so corruption must not
+    /// be able to masquerade as absence.
     pub async fn assets_by_sha256(
         &self,
         hashes: &[String],
@@ -943,16 +956,21 @@ impl Store {
         let mut best: HashMap<(String, &'static str), HashMatch> = HashMap::new();
         for row in rows {
             let sha256: String = row.try_get("sha256")?;
-            let Some(kind) = row
-                .try_get::<Option<String>, _>("kind")?
-                .and_then(|value| Kind::from_key(&value))
-            else {
-                continue;
-            };
-            let id = row.try_get::<String, _>("id")?;
-            let Ok(id) = AssetId::parse(&id) else {
-                continue;
-            };
+            let stored_id: String = row.try_get("id")?;
+            let id = AssetId::parse(&stored_id).map_err(|_| {
+                StoreError::CorruptRow(format!(
+                    "a row with sha256 {sha256} has an id that does not parse: {stored_id:?}"
+                ))
+            })?;
+            let stored_kind = row.try_get::<Option<String>, _>("kind")?;
+            let kind = stored_kind
+                .as_deref()
+                .and_then(Kind::from_key)
+                .ok_or_else(|| {
+                    StoreError::CorruptRow(format!(
+                        "asset {id} with sha256 {sha256} has no readable kind: {stored_kind:?}"
+                    ))
+                })?;
             // `ORDER BY` puts a live row before a retired one and the oldest
             // before a newer one, so the first row for a pair is the one to
             // keep. `or_insert` relies on that ordering: changing the
@@ -1873,6 +1891,44 @@ mod tests {
             !names.iter().any(|name| name == "assets_by_sha256"),
             "the single-column index only duplicated the composite's leading column"
         );
+    }
+
+    #[tokio::test]
+    async fn a_matching_row_that_does_not_parse_is_an_error_not_a_miss() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+
+        let second = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        let third = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        let cases = [
+            ("not-an-asset-id".to_owned(), "a".repeat(64), Some("image")),
+            (second.to_string(), "b".repeat(64), Some("video")),
+            (third.to_string(), "c".repeat(64), None),
+        ];
+        for (id, hash, kind) in cases {
+            sqlx::query(
+                "INSERT INTO assets
+                     (id, source_format, bytes, sha256, width, height, created_at, kind)
+                 VALUES (?, 'jpeg', 1, ?, 1, 1, 0, ?)",
+            )
+            .bind(&id)
+            .bind(&hash)
+            .bind(kind)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+            let error = store
+                .assets_by_sha256(std::slice::from_ref(&hash), None)
+                .await
+                .expect_err("a matching row that cannot be read must not answer missing");
+            assert!(
+                matches!(error, StoreError::CorruptRow(_)),
+                "{id:?} with kind {kind:?}: {error}"
+            );
+        }
     }
 
     #[tokio::test]
