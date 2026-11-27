@@ -84,7 +84,7 @@ impl AppState {
         }
 
         // A restart onto a full disk must still start, serve reads, and let the
-        // operator purge: warning is the whole response here. Uploads refuse
+        // operator purge: warning is the whole response here. Writes refuse
         // themselves when they see the floor, which is the one place refusing
         // is safe.
         match disk::space(&state.config.data_dir) {
@@ -92,7 +92,7 @@ impl AppState {
                 tracing::warn!(
                     free_bytes = space.free_bytes,
                     min_free_bytes = state.config.min_free_bytes,
-                    "data directory is below the configured free-space floor; uploads will be refused"
+                    "data directory is below the configured free-space floor; uploads and re-renders will be refused"
                 );
             }
             Ok(_) => {}

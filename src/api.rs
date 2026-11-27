@@ -410,12 +410,14 @@ async fn upload_into(
     result
 }
 
-/// Refuse an upload when the data volume is below the configured floor.
+/// Refuse a request that writes new files when the data volume is below the
+/// configured floor.
 ///
-/// The status is `507`, and the check happens before the request body is
-/// touched. It is deliberately not a reservation: bytes can arrive between the
-/// check and the write, so a full disk still produces a clean `ENOSPC` error;
-/// the floor just makes that rare. Zero disables the check.
+/// The status is `507`, and the check happens before an upload body is touched
+/// or a re-render starts converting. It is deliberately not a reservation:
+/// bytes can arrive between the check and the write, so a full disk still
+/// produces a clean `ENOSPC` error; the floor just makes that rare. Zero
+/// disables the check.
 fn ensure_free_space(state: &AppState) -> Result<(), ApiError> {
     if state.config.min_free_bytes == 0 {
         return Ok(());
@@ -1169,7 +1171,16 @@ pub(super) async fn summary(
 ) -> Result<Json<SummaryResponse>, ApiError> {
     authorize(&state, &headers)?;
     let rows = state.store.summary().await.map_err(ApiError::internal)?;
-    let space = disk::space(&state.config.data_dir).map_err(ApiError::internal)?;
+    // Free space is advisory, so a filesystem Atlas cannot read must not turn
+    // a counts endpoint into a 500: the disk fields go null and the counts
+    // still answer. The floor is configuration and is always reported.
+    let space = match disk::space(&state.config.data_dir) {
+        Ok(space) => Some(space),
+        Err(error) => {
+            tracing::warn!(%error, "could not read free space for the summary");
+            None
+        }
+    };
     let for_kind = |kind: Kind| -> CollectionSummary {
         rows.iter()
             .find(|(stored, _, _)| *stored == kind)
@@ -1190,8 +1201,8 @@ pub(super) async fn summary(
         documents,
         total,
         rendition_widths: state.config.variant_widths.clone(),
-        data_dir_free_bytes: space.free_bytes,
-        data_dir_total_bytes: space.total_bytes,
+        data_dir_free_bytes: space.map(|space| space.free_bytes),
+        data_dir_total_bytes: space.map(|space| space.total_bytes),
         min_free_bytes: state.config.min_free_bytes,
     }))
 }
@@ -1288,10 +1299,13 @@ pub(super) struct SummaryResponse {
     /// A live `statvfs` reading rather than a stored figure: a dashboard line
     /// that could be an hour stale is not worth having, and this endpoint is
     /// authenticated and cheap. It is advisory — the number moves as files are
-    /// written — and the upload floor is enforced separately at intake.
-    data_dir_free_bytes: u64,
-    /// Total bytes of the volume that holds the data directory.
-    data_dir_total_bytes: u64,
+    /// written — and the upload floor is enforced separately at intake. `null`
+    /// when the filesystem cannot be read, because the counts are still
+    /// useful without it.
+    data_dir_free_bytes: Option<u64>,
+    /// Total bytes of the volume that holds the data directory; `null` when
+    /// the filesystem cannot be read.
+    data_dir_total_bytes: Option<u64>,
     /// Free space below which uploads are refused.
     ///
     /// Reported next to the live figures so a consumer can render headroom —
@@ -1619,6 +1633,10 @@ pub(super) async fn refresh_renditions(
     let id = parse_id(&id)?;
     // Reject an unknown id before waiting behind another conversion.
     load_asset(&state, &id, Some(Kind::Image)).await?;
+    // A re-render writes new rendition files, so it sits behind the same floor
+    // as an upload. Checked once before the conversion starts; a disk that
+    // fills mid-run still produces a clean error per file.
+    ensure_free_space(&state)?;
     if request.re_encode {
         return re_encode(&state, &id).await.map(Json);
     }
@@ -2095,6 +2113,9 @@ pub(super) async fn re_render_images(
 ) -> Result<Response, ApiError> {
     authorize(&state, &headers)?;
     let request: ReRenderRequest = optional_json(&body)?;
+    // Both modes write renditions, so the same floor as an upload applies
+    // before any work is queued or started.
+    ensure_free_space(&state)?;
     if request.asynchronous.unwrap_or(false) {
         return start_re_render_job(&state, request).await;
     }
@@ -5534,10 +5555,11 @@ mod tests {
         assert_eq!(body["documents"]["count"], 2);
         assert_eq!(body["total"]["count"], 3);
         assert!(body["total"]["bytes"].as_i64().unwrap() > 0);
-        assert!(body["data_dir_free_bytes"].as_u64().unwrap() > 0);
+        let free = body["data_dir_free_bytes"].as_u64().unwrap();
+        let total = body["data_dir_total_bytes"].as_u64().unwrap();
         assert!(
-            body["data_dir_total_bytes"].as_u64().unwrap()
-                >= body["data_dir_free_bytes"].as_u64().unwrap()
+            total >= free,
+            "a full volume reports zero free, not a negative or a missing field"
         );
         assert_eq!(
             body["min_free_bytes"],
@@ -5557,6 +5579,8 @@ mod tests {
 
         // These bytes are not a PNG. Reading and validating them first would
         // answer `415`; the storage refusal is the earlier, correct answer.
+        // The body is never read, so a client must not assume it was consumed
+        // or that the connection can carry another request.
         let (status, body) =
             send(&router, upload_request("image/png", b"not a png".to_vec())).await;
         assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
@@ -5564,7 +5588,10 @@ mod tests {
 
         let (status, summary) = send(&router, authorized("GET", "/api/v1/summary")).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(summary["data_dir_free_bytes"].as_u64().unwrap() > 0);
+        assert!(
+            summary["data_dir_free_bytes"].is_u64(),
+            "the counts stay readable while the volume is below the floor"
+        );
 
         // The floor is evaluated per request from the live volume, so a disk
         // that gains space needs no restart. Zero disables the gate outright.
@@ -5576,6 +5603,82 @@ mod tests {
             status,
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "with the floor disabled, the body is read and the signature check answers"
+        );
+    }
+
+    /// A re-render writes new rendition files, so it sits behind the same
+    /// floor as an upload. Both modes answer before any work is queued.
+    #[tokio::test]
+    async fn a_data_volume_below_the_floor_refuses_re_renders_with_507() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+
+        let mut config = test_config(data_dir.clone());
+        config.min_free_bytes = 0;
+        let router = app(AppState::new(config).await.unwrap());
+        let image = write_test_image(&directory.path().join("one.png"), "40x30");
+        let (status, asset) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = asset["id"].as_str().unwrap().to_owned();
+
+        // The same library, now behind a floor nothing can satisfy.
+        let mut config = test_config(data_dir);
+        config.min_free_bytes = u64::MAX;
+        let router = app(AppState::new(config).await.unwrap());
+
+        let (status, body) = send(
+            &router,
+            json_request(
+                "POST",
+                &format!("/api/v1/images/{id}/renditions"),
+                &json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(body["error"]["code"], "insufficient_storage");
+
+        let (status, body) = send(
+            &router,
+            json_request("POST", "/api/v1/images/re-render", &json!({"limit": 1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(body["error"]["code"], "insufficient_storage");
+
+        let (status, body) = send(
+            &router,
+            json_request(
+                "POST",
+                "/api/v1/images/re-render",
+                &json!({"async": true, "ids": [{"id": id}]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(
+            body["error"]["code"], "insufficient_storage",
+            "a job is refused before it is queued, not left to fail per item"
+        );
+    }
+
+    /// Free space is advisory: if the volume cannot be read, the counts still
+    /// answer and the disk fields go null rather than failing the endpoint.
+    #[tokio::test]
+    async fn the_summary_survives_an_unreadable_volume() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("atlas");
+        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
+
+        std::fs::remove_dir_all(&data_dir).unwrap();
+
+        let (status, body) = send(&router, authorized("GET", "/api/v1/summary")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["data_dir_free_bytes"].is_null());
+        assert!(body["data_dir_total_bytes"].is_null());
+        assert_eq!(
+            body["min_free_bytes"], 0,
+            "the floor is configuration, so it is still reported"
         );
     }
 

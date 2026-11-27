@@ -239,6 +239,17 @@ encoding until that copy expires — the very thing the re-encode exists to fix.
 Switch the consumer to the URLs the re-encode answers with, or purge those
 bare URLs from the CDN.
 
+The upgrade that introduces the free-space floor changes what a write does on a
+filling volume. `ATLAS_MIN_FREE_BYTES` defaults to 1 GiB, so an upload — and a
+re-render, which writes new rendition files — is refused with `507
+insufficient_storage` before anything is written when the data volume has less
+free space than that. Reads, deletes, restores and purges keep working below
+the floor, and the service still starts, logging a warning, so a restart onto a
+full disk can be diagnosed and cleaned up. Lower `ATLAS_MIN_FREE_BYTES`, or set
+it to `0` to disable the check, and restart. `GET /api/v1/summary` reports the
+live free and total bytes and the floor itself, so the number the check uses is
+visible before an upload is refused.
+
 ## Backup and restore
 
 Metadata and files are useless separately: a restore that pairs a database with

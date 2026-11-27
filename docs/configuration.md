@@ -79,8 +79,10 @@ number of conversions run concurrently. ImageMagick receives explicit
 input/output formats and resource limits. Failed requests do not publish
 partial assets. Before the body is read, an upload checks the data volume's
 free space and is refused with `507 insufficient_storage` when it is below
-`ATLAS_MIN_FREE_BYTES`; the floor is fail-fast rather than a reservation, so a
-disk that fills between the check and the write still produces a clean error.
+`ATLAS_MIN_FREE_BYTES`; a re-render checks the same floor before converting,
+since it also writes new files. The floor is fail-fast rather than a
+reservation, so a disk that fills between the check and the write still
+produces a clean error.
 The check is a live `statvfs` reading, not a cached figure, and `GET
 /api/v1/summary` reports the same numbers as `data_dir_free_bytes` and
 `data_dir_total_bytes`, with the floor as `min_free_bytes` so a consumer can

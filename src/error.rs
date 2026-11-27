@@ -157,7 +157,7 @@ impl ApiError {
             StatusCode::INSUFFICIENT_STORAGE,
             "insufficient_storage",
             format!(
-                "The data directory has {free_bytes} bytes free, below the configured minimum of {min_free_bytes}; free space and retry."
+                "The data directory has {free_bytes} bytes free, below the configured minimum of {min_free_bytes}; free up space and retry."
             ),
         )
     }

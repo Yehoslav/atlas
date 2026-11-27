@@ -357,11 +357,12 @@ uploads, or arbitrary URL transformations.
 - Stream request bodies to disk; never buffer an entire upload in memory.
 - Before the body is read, refuse an upload with `507 insufficient_storage`
   when the data volume has less than `ATLAS_MIN_FREE_BYTES` free (1 GiB by
-  default; `0` disables). The probe is a live `statvfs`, and the floor is
-  fail-fast, not a reservation: a disk that fills mid-write still produces a
-  clean error. Startup warns below the floor but still starts, so a restart
-  onto a full disk can serve reads and be purged. `summary` reports the same
-  free and total figures.
+  default; `0` disables). A re-render checks the same floor before converting,
+  because it writes new rendition files too. The probe is a live `statvfs`, and
+  the floor is fail-fast, not a reservation: a disk that fills mid-write still
+  produces a clean error. Startup warns below the floor but still starts, so a
+  restart onto a full disk can serve reads and be purged. `summary` reports the
+  same free and total figures and the floor.
 - Defaults: 20 MiB per image, 50 MiB per document, 40 megapixels, and 12,000
   pixels maximum on either image edge. Configure byte/pixel limits with
   environment variables.

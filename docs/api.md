@@ -83,8 +83,9 @@ as an attachment instead of being re-encoded into a picture.
   finds out that every one of its assets is missing a width its site needs.
   The free-space figures are a live reading; `min_free_bytes` is the configured
   floor, reported so a caller can show headroom without duplicating a
-  deployment setting it cannot read. The floor itself is described under
-  [Configuration](configuration.md).
+  deployment setting it cannot read. Both free-space fields are `null` if the
+  filesystem cannot be read: the counts are still useful without them. The
+  floor itself is described under [Configuration](configuration.md).
 - `GET /api/v1/formats` — authenticated list of what each collection accepts,
   the `mime` groups they answer to, and whether they get renditions. Derived
   from the same table the upload path validates against, so it cannot
@@ -399,10 +400,11 @@ timeout gets the same asset instead of a second copy.
 When the data volume has less than `ATLAS_MIN_FREE_BYTES` (1 GiB by default)
 free, an upload is refused with `507 insufficient_storage` before the body is
 read, so a bulk import on a filling disk fails fast instead of streaming into
-staging. The threshold is a guard, not a reservation: a disk that fills during
-a write still produces a clean error. Reads, deletes and restores keep working
-below the floor — an operator needs them to free space. Set the floor to `0`
-to disable it.
+staging. A re-render writes new rendition files, so it is refused the same way
+before it starts converting. The threshold is a guard, not a reservation: a
+disk that fills during a write still produces a clean error. Reads, deletes and
+restores keep working below the floor — an operator needs them to free space.
+Set the floor to `0` to disable it.
 
 The name is optional metadata and is never used as a path: the file on disk is
 named after the asset ID and the detected format. It arrives as raw UTF-8 or
