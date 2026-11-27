@@ -112,8 +112,9 @@ as an attachment instead of being re-encoded into a picture.
   echoed in lowercase. A malformed hash is `400 invalid_sha256`, more than
   500 is `400 too_many_hashes`, and an unknown `kind` is `400 invalid_kind`.
   A hash whose matching row cannot be read comes back with `error` set and no
-  matches; the rest of the batch is answered normally, and the `kind` filter
-  does not hide it.
+  matches; the rest of the batch is answered normally. An unreadable `kind`
+  spoils both collections, while an unreadable `id` spoils only the collection
+  the row names.
 - `DELETE /api/v1/{kind}/{id}` — authenticated move to the trash. Returns `204`.
 - `POST /api/v1/{kind}/{id}/restore` — authenticated restore from the trash.
   Returns `204`, or `409` if the asset was already purged.
@@ -535,11 +536,15 @@ entry carries an `error` object — code `unreadable_asset` — and no matches,
 while the rest of the batch is answered normally; an entry that could be read
 has no `error` field at all. It is deliberately not an empty `matches` list:
 `missing` tells an importer to upload, and the record Atlas cannot read may be
-the live asset that upload would duplicate. The `kind` filter does not hide
-such a record, because it is applied only after the record has been read; a
-NULL kind is unreadable rather than absent. The operator log names the hash and
-what was wrong; the response does not, because the detail is about the database
-rather than the caller.
+the live asset that upload would duplicate.
+
+How far the error reaches depends on what could be read. A record whose `kind`
+is readable but whose `id` is not only spoils the collection it names: dedup
+keys on `(sha256, kind)`, so the same bytes can still be answered for the other
+one. A record whose `kind` itself cannot be read might belong to any
+collection, so it is unreadable whatever `kind` was requested. The operator log
+names the hash and what was wrong; the response does not, because the detail is
+about the database rather than the caller.
 
 ## Trash, restore, and purge
 

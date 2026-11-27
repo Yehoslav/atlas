@@ -969,24 +969,43 @@ impl Store {
         let mut unreadable: HashMap<String, String> = HashMap::new();
         for row in rows {
             let sha256: String = row.try_get("sha256")?;
-            match hash_match_from(&row, sha256.clone()) {
-                Ok(matched) => {
-                    // The filter runs after the readability check, so a row
-                    // that cannot be read still marks its hash as unreadable
-                    // even when the requested collection would not match it.
-                    if kind.is_some_and(|wanted| matched.kind != wanted) {
-                        continue;
-                    }
-                    // `ORDER BY` puts a live row before a retired one and the
-                    // oldest before a newer one, so the first row for a pair
-                    // is the one to keep. `or_insert` relies on that ordering:
-                    // changing the `ORDER BY` means revisiting this loop.
-                    best.entry((sha256, matched.kind.key())).or_insert(matched);
-                }
-                Err(detail) => {
-                    unreadable.entry(sha256).or_insert(detail);
-                }
+            let stored_kind: Option<String> = row.try_get("kind")?;
+            let parsed_kind = stored_kind.as_deref().and_then(Kind::from_key);
+
+            // A row whose kind is readable and outside the requested collection
+            // cannot affect that answer: dedup keys on `(sha256, kind)`. A row
+            // whose kind cannot be read might belong to any collection, so it
+            // is unreadable whatever was asked for.
+            if let (Some(wanted), Some(row_kind)) = (kind, parsed_kind)
+                && row_kind != wanted
+            {
+                continue;
             }
+
+            let Some(row_kind) = parsed_kind else {
+                unreadable
+                    .entry(sha256)
+                    .or_insert_with(|| format!("kind does not parse: {stored_kind:?}"));
+                continue;
+            };
+            let stored_id: String = row.try_get("id")?;
+            let Ok(id) = AssetId::parse(&stored_id) else {
+                unreadable
+                    .entry(sha256)
+                    .or_insert_with(|| format!("id does not parse: {stored_id:?}"));
+                continue;
+            };
+            // `ORDER BY` puts a live row before a retired one and the oldest
+            // before a newer one, so the first row for a pair is the one to
+            // keep. `or_insert` relies on that ordering: changing the
+            // `ORDER BY` means revisiting this loop.
+            best.entry((sha256.clone(), row_kind.key()))
+                .or_insert(HashMatch {
+                    sha256,
+                    kind: row_kind,
+                    id,
+                    state: state_from(&row),
+                });
         }
         // A hash with any unreadable row is answered as an error rather than
         // with the rows that did parse: the unreadable one may be the live row
@@ -1488,28 +1507,6 @@ fn to_rendition(row: sqlx::sqlite::SqliteRow) -> Option<(String, RenditionRecord
     ))
 }
 
-/// Read one matching row into a [`HashMatch`], or say why it cannot be read.
-///
-/// A row Atlas wrote always parses. A failure here means the database no
-/// longer describes the assets it claims to have, so the hash is reported as
-/// unreadable instead of being dropped or answered as missing. The detail is
-/// for the log, not the client.
-fn hash_match_from(row: &sqlx::sqlite::SqliteRow, sha256: String) -> Result<HashMatch, String> {
-    let stored_id: String = row.try_get("id").map_err(|error| error.to_string())?;
-    let id = AssetId::parse(&stored_id).map_err(|_| format!("id does not parse: {stored_id:?}"))?;
-    let stored_kind: Option<String> = row.try_get("kind").map_err(|error| error.to_string())?;
-    let kind = stored_kind
-        .as_deref()
-        .and_then(Kind::from_key)
-        .ok_or_else(|| format!("kind does not parse: {stored_kind:?}"))?;
-    Ok(HashMatch {
-        sha256,
-        kind,
-        id,
-        state: state_from(row),
-    })
-}
-
 fn state_from(row: &sqlx::sqlite::SqliteRow) -> AssetState {
     if row
         .try_get::<Option<i64>, _>("purged_at")
@@ -1996,6 +1993,43 @@ mod tests {
         assert!(lookup.matches.is_empty());
         assert_eq!(lookup.unreadable.len(), 1, "not a miss");
         assert_eq!(lookup.unreadable[0].sha256, hash);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_row_only_affects_the_collection_it_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+
+        // The kind parses, so this row belongs to documents and says nothing
+        // about whether the same bytes are an image.
+        let hash = "9".repeat(64);
+        insert_corrupt_asset(&store, "not-an-asset-id", &hash, Some("document")).await;
+
+        let images = store
+            .assets_by_sha256(std::slice::from_ref(&hash), Some(Kind::Image))
+            .await
+            .unwrap();
+        assert!(images.matches.is_empty());
+        assert!(
+            images.unreadable.is_empty(),
+            "the image answer is well defined"
+        );
+
+        let documents = store
+            .assets_by_sha256(std::slice::from_ref(&hash), Some(Kind::Document))
+            .await
+            .unwrap();
+        assert!(documents.matches.is_empty());
+        assert_eq!(documents.unreadable.len(), 1);
+
+        // Without a filter the document answer is still part of the question.
+        let all = store
+            .assets_by_sha256(std::slice::from_ref(&hash), None)
+            .await
+            .unwrap();
+        assert_eq!(all.unreadable.len(), 1);
     }
 
     #[tokio::test]
