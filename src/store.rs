@@ -933,8 +933,11 @@ impl Store {
     /// collections. For each pair this picks the oldest live asset when one
     /// exists, otherwise the oldest retired one, and reports the state: an
     /// upload only deduplicates against a live asset, so "only in the trash"
-    /// must not read as "already here". `kind` narrows the lookup for a
-    /// consumer that already knows what it is importing.
+    /// must not read as "already here". `kind` narrows the answer to one
+    /// collection for a consumer that already knows what it is importing, but
+    /// it is applied after each row is read: filtering in SQL would hide a row
+    /// whose kind is NULL before it could be reported as unreadable, and a
+    /// NULL kind must not look like a miss.
     ///
     /// A hash with a matching row that does not parse comes back in
     /// [`HashLookup::unreadable`], never as a miss: `missing` is the answer
@@ -957,9 +960,6 @@ impl Store {
             separated.push_bind(hash);
         }
         separated.push_unseparated(")");
-        if let Some(kind) = kind {
-            query.push(" AND kind = ").push_bind(kind.key());
-        }
         // Best first: a live asset beats a retired one, and the oldest row
         // wins a tie, matching `find_live_by_sha256`.
         query.push(" ORDER BY (deleted_at IS NULL AND purged_at IS NULL) DESC, created_at ASC");
@@ -971,6 +971,12 @@ impl Store {
             let sha256: String = row.try_get("sha256")?;
             match hash_match_from(&row, sha256.clone()) {
                 Ok(matched) => {
+                    // The filter runs after the readability check, so a row
+                    // that cannot be read still marks its hash as unreadable
+                    // even when the requested collection would not match it.
+                    if kind.is_some_and(|wanted| matched.kind != wanted) {
+                        continue;
+                    }
                     // `ORDER BY` puts a live row before a retired one and the
                     // oldest before a newer one, so the first row for a pair
                     // is the one to keep. `or_insert` relies on that ordering:
@@ -1887,12 +1893,11 @@ mod tests {
         let rows = sqlx::query(
             "EXPLAIN QUERY PLAN
              SELECT sha256, kind, id, deleted_at, purged_at FROM assets
-             WHERE sha256 IN (?, ?) AND kind = ?
+             WHERE sha256 IN (?, ?)
              ORDER BY (deleted_at IS NULL AND purged_at IS NULL) DESC, created_at ASC",
         )
         .bind("a".repeat(64))
         .bind("b".repeat(64))
-        .bind("image")
         .fetch_all(&store.pool)
         .await
         .unwrap();
@@ -1970,6 +1975,27 @@ mod tests {
             assert_eq!(lookup.unreadable[0].sha256, hash);
             assert!(!lookup.unreadable[0].detail.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn a_kind_filter_does_not_hide_an_unreadable_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+
+        // A NULL kind is invisible to `kind = ?` in SQL, so the filter has to
+        // run after the row is read; otherwise this hash answers `missing`.
+        let hash = "f".repeat(64);
+        insert_corrupt_asset(&store, "not-an-asset-id", &hash, None).await;
+
+        let lookup = store
+            .assets_by_sha256(std::slice::from_ref(&hash), Some(Kind::Image))
+            .await
+            .unwrap();
+        assert!(lookup.matches.is_empty());
+        assert_eq!(lookup.unreadable.len(), 1, "not a miss");
+        assert_eq!(lookup.unreadable[0].sha256, hash);
     }
 
     #[tokio::test]
