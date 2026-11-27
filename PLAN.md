@@ -297,7 +297,7 @@ collections.
   or `restore` for up to 500 caller-supplied ids, validated all-or-nothing.
 - `GET /api/v1/summary` — authenticated counts and stored bytes, trash included,
   the rendition widths the instance generates, and the data volume's free and
-  total bytes.
+  total bytes plus the upload floor.
 - `GET /api/v1/formats` — authenticated accepted media types per collection,
   the `mime` groups they answer to, and whether renditions are generated.
   One media type per format in `formats`, every accepted spelling in

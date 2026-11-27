@@ -1192,6 +1192,7 @@ pub(super) async fn summary(
         rendition_widths: state.config.variant_widths.clone(),
         data_dir_free_bytes: space.free_bytes,
         data_dir_total_bytes: space.total_bytes,
+        min_free_bytes: state.config.min_free_bytes,
     }))
 }
 
@@ -1291,6 +1292,13 @@ pub(super) struct SummaryResponse {
     data_dir_free_bytes: u64,
     /// Total bytes of the volume that holds the data directory.
     data_dir_total_bytes: u64,
+    /// Free space below which uploads are refused.
+    ///
+    /// Reported next to the live figures so a consumer can render headroom —
+    /// "200 MiB above the limit" — without duplicating a deployment setting it
+    /// cannot read. Zero means the floor is disabled, and uploads are then
+    /// refused only by the filesystem itself.
+    min_free_bytes: u64,
 }
 
 /// Apply an action to many assets at once.
@@ -5512,6 +5520,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut config = test_config(directory.path().join("atlas"));
         config.variant_widths = vec![320];
+        config.min_free_bytes = 512 * 1024 * 1024;
         let router = app(AppState::new(config).await.unwrap());
 
         let image = write_test_image(&directory.path().join("one.png"), "40x30");
@@ -5529,6 +5538,11 @@ mod tests {
         assert!(
             body["data_dir_total_bytes"].as_u64().unwrap()
                 >= body["data_dir_free_bytes"].as_u64().unwrap()
+        );
+        assert_eq!(
+            body["min_free_bytes"],
+            512 * 1024 * 1024,
+            "the floor travels with the reading so a caller can render headroom"
         );
     }
 

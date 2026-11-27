@@ -74,13 +74,16 @@ as an attachment instead of being re-encoded into a picture.
   rejects the whole batch with `400` and changes nothing.
 - `GET /api/v1/summary` — authenticated counts and stored bytes for the whole
   instance, including the trash, the `rendition_widths` the instance
-  generates, and the data volume's `data_dir_free_bytes` and
-  `data_dir_total_bytes`. A cheap dashboard number, not a listing. The widths
-  are there because the configuration is otherwise invisible: a consumer can
-  only find them out by listing every asset and reading the renditions of each
-  one, which is how a deployment with the wrong widths finds out that every one
-  of its assets is missing a width its site needs. The free-space figures are a
-  live reading, and the same floor that refuses uploads is described under
+  generates, and the data volume's `data_dir_free_bytes`,
+  `data_dir_total_bytes`, and `min_free_bytes`, the free-space floor below
+  which uploads are refused. A cheap dashboard number, not a listing. The
+  widths are there because the configuration is otherwise invisible: a
+  consumer can only find them out by listing every asset and reading the
+  renditions of each one, which is how a deployment with the wrong widths
+  finds out that every one of its assets is missing a width its site needs.
+  The free-space figures are a live reading; `min_free_bytes` is the configured
+  floor, reported so a caller can show headroom without duplicating a
+  deployment setting it cannot read. The floor itself is described under
   [Configuration](configuration.md).
 - `GET /api/v1/formats` — authenticated list of what each collection accepts,
   the `mime` groups they answer to, and whether they get renditions. Derived

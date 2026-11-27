@@ -83,7 +83,8 @@ free space and is refused with `507 insufficient_storage` when it is below
 disk that fills between the check and the write still produces a clean error.
 The check is a live `statvfs` reading, not a cached figure, and `GET
 /api/v1/summary` reports the same numbers as `data_dir_free_bytes` and
-`data_dir_total_bytes`. Startup warns below the floor but still starts, so a
+`data_dir_total_bytes`, with the floor as `min_free_bytes` so a consumer can
+show headroom. Startup warns below the floor but still starts, so a
 restart onto a full disk can serve reads and be purged. On startup,
 Atlas applies any pending schema migrations, runs `PRAGMA integrity_check` and
 `PRAGMA foreign_key_check` (refusing to start if either reports a problem),
