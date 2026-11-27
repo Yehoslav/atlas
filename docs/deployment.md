@@ -175,6 +175,11 @@ location /media/ {
 Proxy path matching must be case-preserving: asset IDs are lowercase, and a
 proxy that folds case turns a valid ID into a `404`.
 
+The proxy routes `/media/` and nothing else. `/api/v1/…`, `/healthz` and
+`/readyz` stay on the host's loopback, where the consuming backend and the
+deploy gate reach them directly; a catch-all `location /` that forwards
+everything to Atlas would publish them along with the media.
+
 ### The health check
 
 `GET /healthz` answers `{"status":"ok"}` once the service is up. It is worth
@@ -191,6 +196,21 @@ database stops answering after startup, and its body carries `version`, the
 volume has room for writes. `/healthz` stays a pure liveness answer so a
 locked database does not become a restart loop; `/readyz` is what a consumer
 should refuse to roll forward on.
+
+`/readyz` is unauthenticated on purpose: a deploy gate should not need the API
+token, and the payload is contract data — version, `api`, the configured
+widths and formats, free space — not content. It is still not public, and
+Atlas ships no proxy rule that enforces that; keeping it on the loopback is
+the operator's job. If the gate runs on another host, add one deliberate route
+to it, restricted to that host, rather than publishing the port:
+
+```nginx
+location = /readyz {
+    allow 10.0.0.0/8;
+    deny all;
+    proxy_pass http://127.0.0.1:3000;
+}
+```
 
 ### Upgrading
 
