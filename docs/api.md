@@ -519,6 +519,14 @@ upload would deduplicate against: a `deleted` or `purged` match says the bytes
 are here, but a re-upload would create a new asset. A malformed hash is a
 `400 invalid_sha256`, and the same 500-entry ceiling applies.
 
+`by-hash` is the one call that answers a question about bytes rather than ids,
+and it assumes the single-consumer deployment Atlas is built for: the token is
+deployment-wide, so anyone holding it can already list the whole library.
+Learning that specific bytes are present therefore reveals nothing a listing
+would not. A multi-consumer model would need a narrower answer — presence
+without ids, or a permission scoped to a consumer's own assets — and this
+endpoint will change with it.
+
 ## Trash, restore, and purge
 
 Atlas never destroys an asset on request. `DELETE /api/v1/images/{id}` moves
