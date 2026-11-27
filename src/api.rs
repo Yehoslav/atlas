@@ -6977,7 +6977,10 @@ mod tests {
         assert_eq!(example["api"], ready["api"]);
         assert_eq!(example["rendition_widths"], ready["rendition_widths"]);
         assert_eq!(example["formats"], ready["formats"]);
-        assert_eq!(example["writable"], ready["writable"]);
+        // The disk figures are a startup snapshot; comparing them to the live
+        // answer would make the test depend on how full the test host is.
+        assert!(example["writable"].is_boolean());
+        assert!(ready["writable"].is_boolean());
     }
 
     /// Every field the response carries is a property, and every required

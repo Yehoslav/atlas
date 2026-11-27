@@ -492,9 +492,9 @@ The document carries the pre-1.0 instability statement: routes and responses
 may change, and `api` on `/readyz` is the number that marks a breaking change.
 `docs/api.md` remains the prose reference; the served document is the one a
 client generator or an editor plugin reads. The schemas are static and are
-derived from the structs; the `/readyz` response example carries this
-instance's own rendition widths and formats, so a generator sees the values the
-deployment actually uses without the contract describing one host.
+derived from the structs. The `/readyz` example carries this instance's own
+rendition widths and formats as they were when the server started; the
+endpoint itself is the live answer, including the disk figures.
 
 The document is unauthenticated, like `/healthz` and `/readyz`; keep it on the
 loopback with them.

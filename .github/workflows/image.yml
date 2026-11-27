@@ -111,10 +111,17 @@ jobs:
           # The deploy gate's contract, checked in the artifact that ships it:
           # a 503 fails the step through `--fail`, and the body must carry the
           # readiness answer and the api marker the consumer gates on. Parsed,
-          # not grepped: the JSON spelling is not part of the contract.
+          # not grepped: the JSON spelling is not part of the contract. The
+          # expected marker is read from the source, so a bump has one place to
+          # change.
+          expected_api="$(grep -oE 'API_COMPATIBILITY: u32 = [0-9]+' src/api.rs | grep -oE '[0-9]+$')"
+          if [ -z "$expected_api" ]; then
+            echo "cannot read API_COMPATIBILITY from src/api.rs" >&2
+            exit 1
+          fi
           ready="$(curl --silent --fail http://127.0.0.1:3000/readyz)"
           echo "$ready"
-          echo "$ready" | jq --exit-status '.ok == true and .api == 1'
+          echo "$ready" | jq --exit-status --argjson api "$expected_api" '.ok == true and .api == $api'
           docker logs atlas
           docker rm --force atlas
           docker volume rm atlas-image-check
