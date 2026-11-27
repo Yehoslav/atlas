@@ -242,6 +242,8 @@ pub(super) struct HashEntryResponse {
     matches: Vec<HashMatchResponse>,
     /// Set when a matching row exists but cannot be read. The hash is then
     /// neither present nor missing, and an importer must not upload it as new.
+    /// Omitted entirely for a hash that could be read, like `deduplicated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<HashEntryErrorResponse>,
 }
 
@@ -4651,6 +4653,19 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("do not upload")
+        );
+
+        // A readable hash omits the field rather than sending `"error": null`,
+        // the same way `deduplicated` appears only when it is true.
+        let readable = HashEntryResponse {
+            sha256: "b".repeat(64),
+            matches: Vec::new(),
+            error: None,
+        };
+        let json = serde_json::to_value(&readable).unwrap();
+        assert!(
+            json.get("error").is_none(),
+            "a readable entry must not carry an error key: {json}"
         );
     }
 

@@ -531,14 +531,15 @@ without ids, or a permission scoped to a consumer's own assets — and this
 endpoint will change with it.
 
 A hash whose matching row cannot be read is neither present nor missing. That
-entry comes back with `error` set — code `unreadable_asset` — and no matches,
-while the rest of the batch is answered normally. It is deliberately not an
-empty `matches` list: `missing` tells an importer to upload, and the record
-Atlas cannot read may be the live asset that upload would duplicate. The
-`kind` filter does not hide such a record, because it is applied only after the
-record has been read; a NULL kind is unreadable rather than absent. The
-operator log names the hash and what was wrong; the response does not, because
-the detail is about the database rather than the caller.
+entry carries an `error` object — code `unreadable_asset` — and no matches,
+while the rest of the batch is answered normally; an entry that could be read
+has no `error` field at all. It is deliberately not an empty `matches` list:
+`missing` tells an importer to upload, and the record Atlas cannot read may be
+the live asset that upload would duplicate. The `kind` filter does not hide
+such a record, because it is applied only after the record has been read; a
+NULL kind is unreadable rather than absent. The operator log names the hash and
+what was wrong; the response does not, because the detail is about the database
+rather than the caller.
 
 ## Trash, restore, and purge
 
