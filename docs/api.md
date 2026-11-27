@@ -111,6 +111,8 @@ as an attachment instead of being re-encoded into a picture.
   Hashes are 64 hexadecimal characters, compared case-insensitively and
   echoed in lowercase. A malformed hash is `400 invalid_sha256`, more than
   500 is `400 too_many_hashes`, and an unknown `kind` is `400 invalid_kind`.
+  A hash whose matching row cannot be read comes back with `error` set and no
+  matches; the rest of the batch is answered normally.
 - `DELETE /api/v1/{kind}/{id}` — authenticated move to the trash. Returns `204`.
 - `POST /api/v1/{kind}/{id}/restore` — authenticated restore from the trash.
   Returns `204`, or `409` if the asset was already purged.
@@ -526,6 +528,14 @@ Learning that specific bytes are present therefore reveals nothing a listing
 would not. A multi-consumer model would need a narrower answer — presence
 without ids, or a permission scoped to a consumer's own assets — and this
 endpoint will change with it.
+
+A hash whose matching row cannot be read is neither present nor missing. That
+entry comes back with `error` set — code `unreadable_asset` — and no matches,
+while the rest of the batch is answered normally. It is deliberately not an
+empty `matches` list: `missing` tells an importer to upload, and the record
+Atlas cannot read may be the live asset that upload would duplicate. The
+operator log names the hash and what was wrong; the response does not, because
+the detail is about the database rather than the caller.
 
 ## Trash, restore, and purge
 

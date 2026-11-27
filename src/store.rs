@@ -42,12 +42,6 @@ pub enum StoreError {
     Migration(sqlx::migrate::MigrateError),
     /// `PRAGMA integrity_check` did not return `ok`.
     Corrupt(String),
-    /// A row matched a read but does not parse back into a model value.
-    ///
-    /// Distinct from [`Self::Corrupt`]: SQLite considers the database sound,
-    /// but a value Atlas wrote (or something else rewrote) cannot be trusted,
-    /// so the read fails instead of returning a partial answer.
-    CorruptRow(String),
     /// `PRAGMA foreign_key_check` reported orphan rows.
     ForeignKeys(Vec<ForeignKeyViolation>),
 }
@@ -59,9 +53,6 @@ impl fmt::Display for StoreError {
             Self::Migration(error) => write!(formatter, "schema migration failed: {error}"),
             Self::Corrupt(report) => {
                 write!(formatter, "SQLite integrity check failed: {report}")
-            }
-            Self::CorruptRow(detail) => {
-                write!(formatter, "database row is unreadable: {detail}")
             }
             Self::ForeignKeys(violations) => {
                 write!(formatter, "SQLite foreign key check failed:")?;
@@ -233,6 +224,26 @@ pub struct HashMatch {
     pub kind: Kind,
     pub id: AssetId,
     pub state: AssetState,
+}
+
+/// The answer to a batch hash lookup.
+#[derive(Clone, Debug, Default)]
+pub struct HashLookup {
+    /// The best readable asset for each hash and collection.
+    pub matches: Vec<HashMatch>,
+    /// Hashes with a matching row that does not parse.
+    ///
+    /// Such a hash is neither present nor missing: it cannot be answered, and
+    /// an importer must not treat it as absent.
+    pub unreadable: Vec<UnreadableHash>,
+}
+
+/// A matching row that could not be read back into a [`HashMatch`].
+#[derive(Clone, Debug)]
+pub struct UnreadableHash {
+    pub sha256: String,
+    /// What was wrong, for the log. Never sent to a client.
+    pub detail: String,
 }
 
 impl Default for ListQuery {
@@ -925,16 +936,17 @@ impl Store {
     /// must not read as "already here". `kind` narrows the lookup for a
     /// consumer that already knows what it is importing.
     ///
-    /// A matching row that does not parse is an error, never a miss: `missing`
-    /// is the answer that tells an importer to upload, so corruption must not
-    /// be able to masquerade as absence.
+    /// A hash with a matching row that does not parse comes back in
+    /// [`HashLookup::unreadable`], never as a miss: `missing` is the answer
+    /// that tells an importer to upload, so corruption must not be able to
+    /// masquerade as absence.
     pub async fn assets_by_sha256(
         &self,
         hashes: &[String],
         kind: Option<Kind>,
-    ) -> Result<Vec<HashMatch>, StoreError> {
+    ) -> Result<HashLookup, StoreError> {
         if hashes.is_empty() {
-            return Ok(Vec::new());
+            return Ok(HashLookup::default());
         }
 
         let mut query = QueryBuilder::<Sqlite>::new(
@@ -954,36 +966,35 @@ impl Store {
 
         let rows = query.build().fetch_all(&self.pool).await?;
         let mut best: HashMap<(String, &'static str), HashMatch> = HashMap::new();
+        let mut unreadable: HashMap<String, String> = HashMap::new();
         for row in rows {
             let sha256: String = row.try_get("sha256")?;
-            let stored_id: String = row.try_get("id")?;
-            let id = AssetId::parse(&stored_id).map_err(|_| {
-                StoreError::CorruptRow(format!(
-                    "a row with sha256 {sha256} has an id that does not parse: {stored_id:?}"
-                ))
-            })?;
-            let stored_kind = row.try_get::<Option<String>, _>("kind")?;
-            let kind = stored_kind
-                .as_deref()
-                .and_then(Kind::from_key)
-                .ok_or_else(|| {
-                    StoreError::CorruptRow(format!(
-                        "asset {id} with sha256 {sha256} has no readable kind: {stored_kind:?}"
-                    ))
-                })?;
-            // `ORDER BY` puts a live row before a retired one and the oldest
-            // before a newer one, so the first row for a pair is the one to
-            // keep. `or_insert` relies on that ordering: changing the
-            // `ORDER BY` means revisiting this loop.
-            best.entry((sha256.clone(), kind.key()))
-                .or_insert(HashMatch {
-                    sha256,
-                    kind,
-                    id,
-                    state: state_from(&row),
-                });
+            match hash_match_from(&row, sha256.clone()) {
+                Ok(matched) => {
+                    // `ORDER BY` puts a live row before a retired one and the
+                    // oldest before a newer one, so the first row for a pair
+                    // is the one to keep. `or_insert` relies on that ordering:
+                    // changing the `ORDER BY` means revisiting this loop.
+                    best.entry((sha256, matched.kind.key())).or_insert(matched);
+                }
+                Err(detail) => {
+                    unreadable.entry(sha256).or_insert(detail);
+                }
+            }
         }
-        Ok(best.into_values().collect())
+        // A hash with any unreadable row is answered as an error rather than
+        // with the rows that did parse: the unreadable one may be the live row
+        // an upload would deduplicate against.
+        for hash in unreadable.keys() {
+            best.retain(|(candidate, _), _| candidate != hash);
+        }
+        Ok(HashLookup {
+            matches: best.into_values().collect(),
+            unreadable: unreadable
+                .into_iter()
+                .map(|(sha256, detail)| UnreadableHash { sha256, detail })
+                .collect(),
+        })
     }
 
     /// A page of one collection, plus the size of the whole filtered set.
@@ -1471,6 +1482,28 @@ fn to_rendition(row: sqlx::sqlite::SqliteRow) -> Option<(String, RenditionRecord
     ))
 }
 
+/// Read one matching row into a [`HashMatch`], or say why it cannot be read.
+///
+/// A row Atlas wrote always parses. A failure here means the database no
+/// longer describes the assets it claims to have, so the hash is reported as
+/// unreadable instead of being dropped or answered as missing. The detail is
+/// for the log, not the client.
+fn hash_match_from(row: &sqlx::sqlite::SqliteRow, sha256: String) -> Result<HashMatch, String> {
+    let stored_id: String = row.try_get("id").map_err(|error| error.to_string())?;
+    let id = AssetId::parse(&stored_id).map_err(|_| format!("id does not parse: {stored_id:?}"))?;
+    let stored_kind: Option<String> = row.try_get("kind").map_err(|error| error.to_string())?;
+    let kind = stored_kind
+        .as_deref()
+        .and_then(Kind::from_key)
+        .ok_or_else(|| format!("kind does not parse: {stored_kind:?}"))?;
+    Ok(HashMatch {
+        sha256,
+        kind,
+        id,
+        state: state_from(row),
+    })
+}
+
 fn state_from(row: &sqlx::sqlite::SqliteRow) -> AssetState {
     if row
         .try_get::<Option<i64>, _>("purged_at")
@@ -1807,6 +1840,8 @@ mod tests {
             .assets_by_sha256(std::slice::from_ref(&hash), None)
             .await
             .unwrap();
+        assert!(found.unreadable.is_empty());
+        let found = found.matches;
         assert_eq!(found.len(), 2, "one answer per collection");
         let image = found
             .iter()
@@ -1826,7 +1861,8 @@ mod tests {
         let images_only = store
             .assets_by_sha256(std::slice::from_ref(&hash), Some(Kind::Image))
             .await
-            .unwrap();
+            .unwrap()
+            .matches;
         assert_eq!(images_only.len(), 1);
         assert_eq!(images_only[0].kind, Kind::Image);
 
@@ -1835,6 +1871,7 @@ mod tests {
                 .assets_by_sha256(&["b".repeat(64)], None)
                 .await
                 .unwrap()
+                .matches
                 .is_empty(),
             "an unknown hash has no row"
         );
@@ -1893,8 +1930,22 @@ mod tests {
         );
     }
 
+    async fn insert_corrupt_asset(store: &Store, id: &str, hash: &str, kind: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO assets
+                 (id, source_format, bytes, sha256, width, height, created_at, kind)
+             VALUES (?, 'jpeg', 1, ?, 1, 1, 0, ?)",
+        )
+        .bind(id)
+        .bind(hash)
+        .bind(kind)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
-    async fn a_matching_row_that_does_not_parse_is_an_error_not_a_miss() {
+    async fn a_matching_row_that_does_not_parse_is_reported_not_dropped() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::connect(&directory.path().join("atlas.sqlite3"))
             .await
@@ -1908,27 +1959,42 @@ mod tests {
             (third.to_string(), "c".repeat(64), None),
         ];
         for (id, hash, kind) in cases {
-            sqlx::query(
-                "INSERT INTO assets
-                     (id, source_format, bytes, sha256, width, height, created_at, kind)
-                 VALUES (?, 'jpeg', 1, ?, 1, 1, 0, ?)",
-            )
-            .bind(&id)
-            .bind(&hash)
-            .bind(kind)
-            .execute(&store.pool)
+            insert_corrupt_asset(&store, &id, &hash, kind).await;
+
+            let lookup = store
+                .assets_by_sha256(std::slice::from_ref(&hash), None)
+                .await
+                .expect("a bad row is reported, not fatal");
+            assert!(lookup.matches.is_empty(), "{id:?} must not look present");
+            assert_eq!(lookup.unreadable.len(), 1, "{id:?}");
+            assert_eq!(lookup.unreadable[0].sha256, hash);
+            assert!(!lookup.unreadable[0].detail.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_hash_does_not_spoil_the_rest_of_the_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
             .await
             .unwrap();
 
-            let error = store
-                .assets_by_sha256(std::slice::from_ref(&hash), None)
-                .await
-                .expect_err("a matching row that cannot be read must not answer missing");
-            assert!(
-                matches!(error, StoreError::CorruptRow(_)),
-                "{id:?} with kind {kind:?}: {error}"
-            );
-        }
+        let good_hash = "d".repeat(64);
+        let mut good = record(&AssetId::generate(DEFAULT_LENGTH).unwrap());
+        good.sha256 = good_hash.clone();
+        store.insert_asset(&good, &[]).await.unwrap();
+
+        let bad_hash = "e".repeat(64);
+        insert_corrupt_asset(&store, "not-an-asset-id", &bad_hash, Some("image")).await;
+
+        let lookup = store
+            .assets_by_sha256(&[good_hash.clone(), bad_hash.clone()], None)
+            .await
+            .unwrap();
+        assert_eq!(lookup.matches.len(), 1, "the readable hash still answers");
+        assert_eq!(lookup.matches[0].sha256, good_hash);
+        assert_eq!(lookup.unreadable.len(), 1);
+        assert_eq!(lookup.unreadable[0].sha256, bad_hash);
     }
 
     #[tokio::test]

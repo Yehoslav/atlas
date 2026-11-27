@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     io::SeekFrom,
     path::PathBuf,
     sync::LazyLock,
@@ -240,6 +240,30 @@ pub(super) struct HashEntryResponse {
     /// One match per collection, when one exists. Empty is the `missing`
     /// answer: no live or retired asset on this instance has those bytes.
     matches: Vec<HashMatchResponse>,
+    /// Set when a matching row exists but cannot be read. The hash is then
+    /// neither present nor missing, and an importer must not upload it as new.
+    error: Option<HashEntryErrorResponse>,
+}
+
+impl HashEntryResponse {
+    /// The answer for a hash with an unreadable matching row.
+    fn unreadable(sha256: String) -> Self {
+        Self {
+            sha256,
+            matches: Vec::new(),
+            error: Some(HashEntryErrorResponse {
+                code: "unreadable_asset",
+                message: "Atlas has a matching asset whose record cannot be read; \
+                          do not upload these bytes as new.",
+            }),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct HashEntryErrorResponse {
+    code: &'static str,
+    message: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1078,12 +1102,25 @@ pub(super) async fn assets_by_hash(
         hashes.push(hash);
     }
 
-    let found = state
+    let lookup = state
         .store
         .assets_by_sha256(&hashes, kind)
         .await
         .map_err(ApiError::internal)?;
-    let found: HashMap<(String, &'static str), _> = found
+    for unreadable in &lookup.unreadable {
+        tracing::error!(
+            sha256 = %unreadable.sha256,
+            detail = %unreadable.detail,
+            "a matching asset row is unreadable; answering that hash with an error"
+        );
+    }
+    let unreadable: HashSet<String> = lookup
+        .unreadable
+        .iter()
+        .map(|entry| entry.sha256.clone())
+        .collect();
+    let found: HashMap<(String, &'static str), _> = lookup
+        .matches
         .into_iter()
         .map(|matched| ((matched.sha256.clone(), matched.kind.key()), matched))
         .collect();
@@ -1095,6 +1132,9 @@ pub(super) async fn assets_by_hash(
     let hashes = hashes
         .into_iter()
         .map(|sha256| {
+            if unreadable.contains(&sha256) {
+                return HashEntryResponse::unreadable(sha256);
+            }
             let matches = kinds
                 .iter()
                 .filter_map(|kind| found.get(&(sha256.clone(), kind.key())))
@@ -1104,7 +1144,11 @@ pub(super) async fn assets_by_hash(
                     state: matched.state,
                 })
                 .collect();
-            HashEntryResponse { sha256, matches }
+            HashEntryResponse {
+                sha256,
+                matches,
+                error: None,
+            }
         })
         .collect();
 
@@ -3784,8 +3828,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ByteRange, ORIGINAL_FILENAME_HEADER, PLACEHOLDER_PNG, echoed, parse_range, rename_rejected,
-        select_format, summary_disk_fields,
+        ByteRange, HashEntryResponse, ORIGINAL_FILENAME_HEADER, PLACEHOLDER_PNG, echoed,
+        parse_range, rename_rejected, select_format, summary_disk_fields,
     };
 
     fn rendition(format: RenditionFormat) -> RenditionRecord {
@@ -4592,6 +4636,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A hash with an unreadable matching row is answered with an error, not an
+    /// empty match list: an importer must not upload bytes Atlas cannot check.
+    #[test]
+    fn an_unreadable_hash_is_an_error_not_a_miss() {
+        let entry = HashEntryResponse::unreadable("a".repeat(64));
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["matches"].as_array().unwrap().len(), 0);
+        assert_eq!(json["error"]["code"], "unreadable_asset");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("do not upload")
+        );
     }
 
     #[tokio::test]
