@@ -2,7 +2,10 @@
 name = "atlas"
 version = "0.1.0-alpha.3"
 edition = "2024"
-rust-version = "1.85"
+# Let-chains, used in the code, need 1.88; 1.90 is the toolchain the container
+# image is built with, so it is the oldest compiler CI actually proves. The
+# flake pins a newer one for development.
+rust-version = "1.90"
 description = "An API-first media service for small sites"
 license = "GPL-3.0-only"
 readme = "README.md"

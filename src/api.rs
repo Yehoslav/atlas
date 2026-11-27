@@ -830,17 +830,17 @@ pub(super) async fn set_data(
     authorize(&state, &headers)?;
     let kind = parse_kind(&kind)?;
     let id = parse_id(&id)?;
-    if let Some(data) = body.data.as_deref() {
-        if data.len() > state.config.max_consumer_data_bytes as usize {
-            return Err(ApiError::bad_request(
-                "data_too_large",
-                format!(
-                    "data is {} bytes; the limit is {}.",
-                    data.len(),
-                    state.config.max_consumer_data_bytes
-                ),
-            ));
-        }
+    if let Some(data) = body.data.as_deref()
+        && data.len() > state.config.max_consumer_data_bytes as usize
+    {
+        return Err(ApiError::bad_request(
+            "data_too_large",
+            format!(
+                "data is {} bytes; the limit is {}.",
+                data.len(),
+                state.config.max_consumer_data_bytes
+            ),
+        ));
     }
     load_asset(&state, &id, Some(kind)).await?;
     if !state
