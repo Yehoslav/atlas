@@ -6465,9 +6465,17 @@ mod tests {
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["api"], 1);
         assert_eq!(body["rendition_widths"], json!([320, 640]));
+        let mut formats: Vec<&str> = body["formats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|format| format.as_str().unwrap())
+            .collect();
+        formats.sort_unstable();
         assert_eq!(
-            body["formats"],
-            json!(["jpeg", "png", "webp", "avif", "jxl"])
+            formats,
+            vec!["avif", "jpeg", "jxl", "png", "webp"],
+            "a set, so order is not part of the contract"
         );
         assert_eq!(body["writable"], true);
         assert!(body["free_bytes"].is_u64());
