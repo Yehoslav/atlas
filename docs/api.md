@@ -5,8 +5,9 @@ URL resolves, how uploads and lifecycle work, and what a consumer asks to
 find out whether Atlas can still serve an asset. Atlas is a prototype, so
 this contract is pre-1.0 and may change in ways that break a consumer; the
 schema only ever moves forward, additively, but the routes and the responses
-are not frozen. For what Atlas is and how to run it, see the
-[`README`](../README.md).
+are not frozen. `GET /readyz` publishes the `api` number that marks a
+breaking change, so a deploy gate can see one coming. For what Atlas is and
+how to run it, see the [`README`](../README.md).
 
 ## Implemented prototype API
 
@@ -22,7 +23,14 @@ PDF. The two are independent. `POST /api/v1/documents` accepts any allowlisted
 format, images included, so a diagram or a scan can be stored whole and served
 as an attachment instead of being re-encoded into a picture.
 
-- `GET /healthz` — local process health.
+- `GET /healthz` — local process health. Answers `{"status":"ok"}` and touches
+  nothing, so Compose can restart on it without a locked database becoming a
+  restart loop.
+- `GET /readyz` — unauthenticated readiness and the compatibility contract a
+  deploy gate reads: `version`, `api`, the rendition widths and formats, and
+  whether the volume has room for writes. `200` when the metadata database
+  answers, `503` when it does not. See [Readiness and the compatibility
+  marker](#readiness-and-the-compatibility-marker).
 - `POST /api/v1/images` — authenticated image upload. The body is the file
   itself; `Content-Type` must be `image/jpeg`, `image/png`, `image/webp`,
   `image/avif`, `image/jxl` or `image/heic`, and
@@ -467,6 +475,50 @@ original is cached for five minutes rather than a year, and its ETag covers the
 name: after that window a revalidation returns the new `Content-Disposition`
 instead of a `304` carrying the old one. Consumers that want a separate display
 name should still keep it in their own database.
+
+## Readiness and the compatibility marker
+
+`GET /readyz` is what a consumer's deploy gate should read. It is
+unauthenticated and root-level; a reverse proxy should expose `/media/*` and
+leave this on the loopback.
+
+```json
+{
+  "ok": true,
+  "version": "0.1.0-alpha.3",
+  "api": 1,
+  "rendition_widths": [320, 640, 960, 1280],
+  "formats": ["jpeg", "png", "webp", "avif", "jxl"],
+  "writable": true,
+  "free_bytes": 4219387904
+}
+```
+
+`ok` is narrow on purpose: the process is serving and the metadata database
+answers a `SELECT 1`. The integrity checks are startup-only. Disk space is
+data, not readiness — `writable` is false when the data volume is below
+`ATLAS_MIN_FREE_BYTES`, and the consumer decides whether that is a reason to
+hold a deploy. A volume that cannot be read at all is reported as zero free,
+so `writable` is false whenever a floor is configured, and the log says why.
+
+`formats` is a set, not a list: it names every rendition format the instance
+can write, including both fallbacks (JPEG for an opaque source, PNG for one
+with alpha), and no order is promised. The answer is sent with
+`Cache-Control: no-store`, because a cached readiness answer is worse than
+none.
+
+When the database does not answer, the status is `503` and the body keeps the
+contract, so "down" and "too old" are distinguishable:
+
+```json
+{"ok":false,"version":"0.1.0-alpha.3","api":1,"reason":"metadata_database_unreachable"}
+```
+
+`api` is the compatibility marker. It starts at 1 and is incremented when a
+route, a method, or a request/response field of a consumer-visible route
+changes or disappears — never for an additive field or route. It is a promise
+to be honest about breaking changes, not a promise that there are none.
+`version` is the crate version, the same one the image is labelled with.
 
 ## Asking what Atlas can still serve
 

@@ -108,6 +108,13 @@ jobs:
             sleep 1
           done
           curl --silent --fail http://127.0.0.1:3000/healthz
+          # The deploy gate's contract, checked in the artifact that ships it:
+          # a 503 fails the step through `--fail`, and the body must carry the
+          # readiness answer and the api marker the consumer gates on.
+          ready="$(curl --silent --fail http://127.0.0.1:3000/readyz)"
+          echo "$ready"
+          echo "$ready" | grep --quiet '"ok":true'
+          echo "$ready" | grep --quiet '"api":1'
           docker logs atlas
           docker rm --force atlas
           docker volume rm atlas-image-check

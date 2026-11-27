@@ -81,6 +81,101 @@ pub(crate) async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
+/// The compatibility marker a consumer's deploy gate reads.
+///
+/// It starts at 1 and is incremented when a route, a method, or a
+/// request/response field of a consumer-visible route changes or disappears —
+/// never for an additive field or route. It is a promise to be honest about
+/// breaking changes, not a promise that there are none.
+const API_COMPATIBILITY: u32 = 1;
+
+/// Readiness plus the contract a consumer gates a deploy on.
+///
+/// `ok` is deliberately narrow: the process is serving and the metadata
+/// database answers. Integrity checks are startup-only, and disk space is
+/// data, not readiness — a filling volume is reported through `writable` and
+/// left for the consumer to judge.
+pub(super) async fn ready(State(state): State<AppState>) -> Response {
+    let mut response = match state.store.ping().await {
+        Ok(()) => {
+            let space = match disk::space(&state.config.data_dir) {
+                Ok(space) => space,
+                Err(error) => {
+                    tracing::warn!(%error, "could not read free space for readiness");
+                    // Zero free, so `writable` is false and the consumer holds
+                    // the deploy. A failed statvfs is not a readiness failure:
+                    // `ok` is about the database.
+                    disk::DiskSpace {
+                        free_bytes: 0,
+                        total_bytes: 0,
+                    }
+                }
+            };
+            Json(ReadyResponse {
+                ok: true,
+                version: env!("CARGO_PKG_VERSION"),
+                api: API_COMPATIBILITY,
+                rendition_widths: state.config.variant_widths.clone(),
+                formats: RenditionFormat::ALL
+                    .iter()
+                    .map(|format| format.key())
+                    .collect(),
+                writable: space.free_bytes >= state.config.min_free_bytes,
+                free_bytes: space.free_bytes,
+            })
+            .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "readiness probe could not reach the metadata database");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(NotReadyResponse {
+                    ok: false,
+                    version: env!("CARGO_PKG_VERSION"),
+                    api: API_COMPATIBILITY,
+                    reason: "metadata_database_unreachable",
+                }),
+            )
+                .into_response()
+        }
+    };
+    // A cached readiness answer is worse than none: a proxy holding a `200`
+    // would hide the database going away.
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// What a ready Atlas tells a deploy gate.
+#[derive(Serialize)]
+pub(super) struct ReadyResponse {
+    ok: bool,
+    version: &'static str,
+    api: u32,
+    /// The widths this instance generates renditions at.
+    rendition_widths: Vec<u32>,
+    /// Every rendition format the instance can write. Both fallbacks are
+    /// listed because the fallback depends on the source: JPEG for an opaque
+    /// photo, PNG for one with alpha. A set, not a list: no order is promised.
+    formats: Vec<&'static str>,
+    /// False when uploads and re-renders would be refused by the free-space
+    /// floor.
+    writable: bool,
+    /// Bytes an unprivileged writer may still use on the data volume.
+    free_bytes: u64,
+}
+
+/// What an unready Atlas still tells a deploy gate, so "down" and "too old"
+/// are distinguishable.
+#[derive(Serialize)]
+pub(super) struct NotReadyResponse {
+    ok: bool,
+    version: &'static str,
+    api: u32,
+    reason: &'static str,
+}
+
 #[derive(Serialize)]
 pub(super) struct AssetResponse {
     id: String,
@@ -6333,6 +6428,127 @@ mod tests {
             total_bytes: 20,
         };
         assert_eq!(summary_disk_fields(Ok(space)), (Some(10), Some(20)));
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_the_contract_a_deploy_gate_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.variant_widths = vec![320, 640];
+        config.min_free_bytes = 0;
+        let router = app(AppState::new(config).await.unwrap());
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["cache-control"],
+            "no-store",
+            "a cached readiness answer would hide the database going away"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["api"], 1);
+        assert_eq!(body["rendition_widths"], json!([320, 640]));
+        assert_eq!(
+            body["formats"],
+            json!(["jpeg", "png", "webp", "avif", "jxl"])
+        );
+        assert_eq!(body["writable"], true);
+        assert!(body["free_bytes"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_a_volume_below_the_floor_as_not_writable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.min_free_bytes = u64::MAX;
+        let router = app(AppState::new(config).await.unwrap());
+
+        let (status, body) = send(
+            &router,
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a filling disk is data, not readiness"
+        );
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["writable"], false);
+        assert!(body["free_bytes"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn readyz_keeps_the_contract_when_the_database_is_unreachable() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let router = app(state.clone());
+        state.store.close().await;
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()["cache-control"],
+            "no-store",
+            "a cached 503 would outlive the outage"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["api"], 1);
+        assert_eq!(body["reason"], "metadata_database_unreachable");
+        assert!(
+            body.get("rendition_widths").is_none(),
+            "the failure body is the contract only"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_answers_without_touching_the_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let router = app(state.clone());
+        state.store.close().await;
+
+        let (status, body) = send(
+            &router,
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"status": "ok"}));
     }
 
     fn action_request(collection: &str, action: &str, ids: &[&str]) -> Request<Body> {

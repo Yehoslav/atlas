@@ -248,6 +248,13 @@ pub enum RenditionFormat {
 }
 
 impl RenditionFormat {
+    /// Every rendition format Atlas can write.
+    ///
+    /// Both fallbacks are listed because the fallback depends on the source:
+    /// an opaque photo gets JPEG, one with alpha gets PNG.
+    pub const ALL: [RenditionFormat; 5] =
+        [Self::Jpeg, Self::Png, Self::Webp, Self::Avif, Self::Jxl];
+
     pub fn key(self) -> &'static str {
         match self {
             Self::Jpeg => "jpeg",

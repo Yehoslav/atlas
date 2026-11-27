@@ -139,11 +139,17 @@ impl ImageProcessor {
         }
         let available = read_write_formats(&String::from_utf8_lossy(&output.stdout));
 
-        // Every format that is written out must also be readable back, and
-        // now that uploads may be in AVIF, JXL or HEIC, they must be readable
-        // too. A build without the delegate refuses to start rather than
-        // failing on somebody's first upload.
-        for required in ["JPEG", "PNG", "WEBP", "AVIF", "JXL", "HEIC"] {
+        // Every rendition format must be writable and readable back, and it is
+        // the same set `/readyz` publishes. HEIC is not a rendition format but
+        // an upload may be one, so it is required here as well. A build
+        // without the delegate refuses to start rather than failing on
+        // somebody's first upload.
+        let mut required: Vec<&str> = RenditionFormat::ALL
+            .iter()
+            .map(|format| format.magick_name())
+            .collect();
+        required.push("HEIC");
+        for required in required {
             if !available.iter().any(|format| format == required) {
                 return Err(MediaError::Invalid(format!(
                     "ImageMagick must provide read/write support for {required}."

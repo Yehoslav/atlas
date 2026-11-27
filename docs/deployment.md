@@ -182,8 +182,15 @@ more than a liveness ping, because the service only starts serving after it
 has applied the schema migrations and run `PRAGMA integrity_check` and
 `PRAGMA foreign_key_check` — a database that fails either of those stops the
 service from starting at all, with the reason in the log. A `200` from
-`/healthz` therefore means the database is sound, not merely that a process
-answers.
+`/healthz` therefore means the database was sound at startup, not merely that a
+process answers.
+
+A deploy gate should read `GET /readyz` instead. It answers `503` when the
+database stops answering after startup, and its body carries `version`, the
+`api` compatibility number, the rendition widths and formats, and whether the
+volume has room for writes. `/healthz` stays a pure liveness answer so a
+locked database does not become a restart loop; `/readyz` is what a consumer
+should refuse to roll forward on.
 
 ### Upgrading
 

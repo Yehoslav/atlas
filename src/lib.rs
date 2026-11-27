@@ -318,6 +318,7 @@ async fn recover_incomplete_storage(
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(api::health))
+        .route("/readyz", get(api::ready))
         // Two collections: the caller's choice is in the path, so asking for a
         // rendition is asking for an image by construction.
         .route(
