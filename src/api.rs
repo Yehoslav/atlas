@@ -98,19 +98,11 @@ const API_COMPATIBILITY: u32 = 1;
 pub(super) async fn ready(State(state): State<AppState>) -> Response {
     let mut response = match state.store.ping().await {
         Ok(()) => {
-            let space = match disk::space(&state.config.data_dir) {
-                Ok(space) => space,
-                Err(error) => {
-                    tracing::warn!(%error, "could not read free space for readiness");
-                    // Zero free, so `writable` is false and the consumer holds
-                    // the deploy. A failed statvfs is not a readiness failure:
-                    // `ok` is about the database.
-                    disk::DiskSpace {
-                        free_bytes: 0,
-                        total_bytes: 0,
-                    }
-                }
-            };
+            let space = disk::space(&state.config.data_dir);
+            if let Err(error) = &space {
+                tracing::warn!(%error, "could not read free space for readiness");
+            }
+            let (free_bytes, writable) = ready_disk(space, state.config.min_free_bytes);
             Json(ReadyResponse {
                 ok: true,
                 version: env!("CARGO_PKG_VERSION"),
@@ -120,8 +112,8 @@ pub(super) async fn ready(State(state): State<AppState>) -> Response {
                     .iter()
                     .map(|format| format.key())
                     .collect(),
-                writable: space.free_bytes >= state.config.min_free_bytes,
-                free_bytes: space.free_bytes,
+                writable,
+                free_bytes,
             })
             .into_response()
         }
@@ -147,6 +139,19 @@ pub(super) async fn ready(State(state): State<AppState>) -> Response {
     response
 }
 
+/// The disk fields readiness reports, from a volume reading and the floor.
+///
+/// A volume that cannot be read is never writable, whatever the floor says:
+/// the floor is a comparison against a number Atlas does not have, and the
+/// safe answer is that a write cannot be promised. `free_bytes` is zero then,
+/// so the consumer sees both the missing reading and the refusal.
+fn ready_disk(space: std::io::Result<disk::DiskSpace>, min_free_bytes: u64) -> (u64, bool) {
+    match space {
+        Ok(space) => (space.free_bytes, space.free_bytes >= min_free_bytes),
+        Err(_) => (0, false),
+    }
+}
+
 /// What a ready Atlas tells a deploy gate.
 #[derive(Serialize)]
 pub(super) struct ReadyResponse {
@@ -159,8 +164,8 @@ pub(super) struct ReadyResponse {
     /// listed because the fallback depends on the source: JPEG for an opaque
     /// photo, PNG for one with alpha. A set, not a list: no order is promised.
     formats: Vec<&'static str>,
-    /// False when uploads and re-renders would be refused by the free-space
-    /// floor.
+    /// False when the volume cannot be read, or when uploads and re-renders
+    /// would be refused by the free-space floor.
     writable: bool,
     /// Bytes an unprivileged writer may still use on the data volume.
     free_bytes: u64,
@@ -3926,7 +3931,7 @@ mod tests {
 
     use super::{
         ByteRange, HashEntryResponse, ORIGINAL_FILENAME_HEADER, PLACEHOLDER_PNG, echoed,
-        parse_range, rename_rejected, select_format, summary_disk_fields,
+        parse_range, ready_disk, rename_rejected, select_format, summary_disk_fields,
     };
 
     fn rendition(format: RenditionFormat) -> RenditionRecord {
@@ -6466,6 +6471,21 @@ mod tests {
         );
         assert_eq!(body["writable"], true);
         assert!(body["free_bytes"].is_u64());
+    }
+
+    /// An unreadable volume is never writable, even when the floor is disabled
+    /// and `0 >= 0` would otherwise say yes.
+    #[test]
+    fn an_unreadable_volume_is_never_writable() {
+        let error = std::io::Error::other("the volume went away");
+        assert_eq!(ready_disk(Err(error), 0), (0, false));
+
+        let space = disk::DiskSpace {
+            free_bytes: 10,
+            total_bytes: 100,
+        };
+        assert_eq!(ready_disk(Ok(space), 10), (10, true));
+        assert_eq!(ready_disk(Ok(space), 11), (10, false));
     }
 
     #[tokio::test]

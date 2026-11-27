@@ -498,8 +498,8 @@ leave this on the loopback.
 answers a `SELECT 1`. The integrity checks are startup-only. Disk space is
 data, not readiness — `writable` is false when the data volume is below
 `ATLAS_MIN_FREE_BYTES`, and the consumer decides whether that is a reason to
-hold a deploy. A volume that cannot be read at all is reported as zero free,
-so `writable` is false whenever a floor is configured, and the log says why.
+hold a deploy. A volume that cannot be read at all is reported as zero free
+and is never writable, whatever the floor says, and the log says why.
 
 `formats` is a set, not a list: it names every rendition format the instance
 can write, including both fallbacks (JPEG for an opaque source, PNG for one
