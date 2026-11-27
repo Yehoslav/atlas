@@ -1174,13 +1174,11 @@ pub(super) async fn summary(
     // Free space is advisory, so a filesystem Atlas cannot read must not turn
     // a counts endpoint into a 500: the disk fields go null and the counts
     // still answer. The floor is configuration and is always reported.
-    let space = match disk::space(&state.config.data_dir) {
-        Ok(space) => Some(space),
-        Err(error) => {
-            tracing::warn!(%error, "could not read free space for the summary");
-            None
-        }
-    };
+    let space = disk::space(&state.config.data_dir);
+    if let Err(error) = &space {
+        tracing::warn!(%error, "could not read free space for the summary");
+    }
+    let (free_bytes, total_bytes) = summary_disk_fields(space);
     let for_kind = |kind: Kind| -> CollectionSummary {
         rows.iter()
             .find(|(stored, _, _)| *stored == kind)
@@ -1201,10 +1199,21 @@ pub(super) async fn summary(
         documents,
         total,
         rendition_widths: state.config.variant_widths.clone(),
-        data_dir_free_bytes: space.map(|space| space.free_bytes),
-        data_dir_total_bytes: space.map(|space| space.total_bytes),
+        data_dir_free_bytes: free_bytes,
+        data_dir_total_bytes: total_bytes,
         min_free_bytes: state.config.min_free_bytes,
     }))
+}
+
+/// The summary's disk fields, from a volume reading.
+///
+/// A read failure is not an error here: the counts are still useful without
+/// the reading, so the fields go null instead of the endpoint answering 500.
+fn summary_disk_fields(space: std::io::Result<disk::DiskSpace>) -> (Option<u64>, Option<u64>) {
+    match space {
+        Ok(space) => (Some(space.free_bytes), Some(space.total_bytes)),
+        Err(_) => (None, None),
+    }
 }
 
 #[derive(Default, Serialize)]
@@ -3496,7 +3505,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::{
-        AppState, Config, app,
+        AppState, Config, app, disk,
         ident::AssetId,
         model::{RenditionFormat, RenditionRecord, SourceFormat},
     };
@@ -3505,6 +3514,7 @@ mod tests {
 
     use super::{
         ByteRange, ORIGINAL_FILENAME_HEADER, PLACEHOLDER_PNG, echoed, parse_range, select_format,
+        summary_disk_fields,
     };
 
     fn rendition(format: RenditionFormat) -> RenditionRecord {
@@ -5662,24 +5672,23 @@ mod tests {
         );
     }
 
-    /// Free space is advisory: if the volume cannot be read, the counts still
-    /// answer and the disk fields go null rather than failing the endpoint.
-    #[tokio::test]
-    async fn the_summary_survives_an_unreadable_volume() {
-        let directory = tempfile::tempdir().unwrap();
-        let data_dir = directory.path().join("atlas");
-        let router = app(AppState::new(test_config(data_dir.clone())).await.unwrap());
-
-        std::fs::remove_dir_all(&data_dir).unwrap();
-
-        let (status, body) = send(&router, authorized("GET", "/api/v1/summary")).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body["data_dir_free_bytes"].is_null());
-        assert!(body["data_dir_total_bytes"].is_null());
+    /// Free space is advisory: a volume that cannot be read leaves the disk
+    /// fields null rather than failing the endpoint.
+    ///
+    /// Tested through the mapping rather than by deleting the data directory:
+    /// the database lives in that directory too, so an integration test would
+    /// depend on the pool keeping the unlinked file open.
+    #[test]
+    fn an_unreadable_volume_leaves_the_disk_fields_null() {
         assert_eq!(
-            body["min_free_bytes"], 0,
-            "the floor is configuration, so it is still reported"
+            summary_disk_fields(Err(std::io::Error::other("no such directory"))),
+            (None, None)
         );
+        let space = disk::DiskSpace {
+            free_bytes: 10,
+            total_bytes: 20,
+        };
+        assert_eq!(summary_disk_fields(Ok(space)), (Some(10), Some(20)));
     }
 
     fn action_request(collection: &str, action: &str, ids: &[&str]) -> Request<Body> {
