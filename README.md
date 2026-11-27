@@ -91,7 +91,8 @@ Everything else lives in `docs/`, for a reader who goes looking for it:
 
 - **[The HTTP API](docs/api.md)** — every route, how a rendition URL resolves,
   uploads and deduplication, and the trash lifecycle. The reference a consumer
-  codes against.
+  codes against, and the pointer to the served OpenAPI document at
+  `GET /api/v1/openapi.json`.
 - **[Architecture](docs/architecture.md)** — how the service is put together,
   and what lives where in the repository. The design record with the reasoning
   behind the decisions is [`PLAN.md`](PLAN.md), and [`TODO.md`](TODO.md) holds
@@ -120,7 +121,9 @@ the codecs and LCMS support described in
 [`CONTRIBUTING.md`](CONTRIBUTING.md); SQLite is compiled into the binary. Free
 space is read with `statvfs` through the `rustix` crate, which is pure Rust and
 adds no native build step or external command — shelling out to `df` would mean
-parsing human output.
+parsing human output. The OpenAPI document is generated with `utoipa` and
+`utoipa-axum`, both pure Rust and compile-time only: they add no runtime
+process and no native library.
 
 ## Status
 

@@ -9,7 +9,7 @@ use crate::ident::AssetId;
 /// served as an attachment), and both take the identical path through storage,
 /// hashing and delivery. Format decides what the bytes may be *done to*; kind
 /// decides which operations exist at all.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Image,
@@ -361,7 +361,7 @@ impl AssetRecord {
 }
 
 /// How Atlas should treat an asset: live, in trash, or purged to a tombstone.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AssetState {
     Active,

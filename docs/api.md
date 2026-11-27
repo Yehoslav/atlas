@@ -31,6 +31,10 @@ as an attachment instead of being re-encoded into a picture.
   whether the volume has room for writes. `200` when the metadata database
   answers, `503` when it does not. See [Readiness and the compatibility
   marker](#readiness-and-the-compatibility-marker).
+- `GET /api/v1/openapi.json` — unauthenticated OpenAPI 3.1 document generated
+  from the same handlers the router serves. Not a committed file, so it cannot
+  drift. See [The machine-readable
+  contract](#the-machine-readable-contract).
 - `POST /api/v1/images` — authenticated image upload. The body is the file
   itself; `Content-Type` must be `image/jpeg`, `image/png`, `image/webp`,
   `image/avif`, `image/jxl` or `image/heic`, and
@@ -475,6 +479,25 @@ original is cached for five minutes rather than a year, and its ETag covers the
 name: after that window a revalidation returns the new `Content-Disposition`
 instead of a `304` carrying the old one. Consumers that want a separate display
 name should still keep it in their own database.
+
+## The machine-readable contract
+
+`GET /api/v1/openapi.json` serves an OpenAPI 3.1 document. It is generated from
+the same handlers the router serves — their paths, methods, request bodies and
+the serde structs they return — so a route that is not annotated is not served,
+and the document cannot describe a route that is not there. Nothing is
+committed as a YAML file that could drift.
+
+The document carries the pre-1.0 instability statement: routes and responses
+may change, and `api` on `/readyz` is the number that marks a breaking change.
+`docs/api.md` remains the prose reference; the served document is the one a
+client generator or an editor plugin reads. The schemas are static and are
+derived from the structs; the `/readyz` response example carries this
+instance's own rendition widths and formats, so a generator sees the values the
+deployment actually uses without the contract describing one host.
+
+The document is unauthenticated, like `/healthz` and `/readyz`; keep it on the
+loopback with them.
 
 ## Readiness and the compatibility marker
 
