@@ -306,6 +306,14 @@ collections.
 - `POST /api/v1/assets/state` — authenticated batch state for up to 500 ids the
   caller supplies, across collections. Not a listing, and Atlas learns nothing
   from the ids.
+- `POST /api/v1/assets/by-hash` — authenticated batch lookup for up to 500
+  SHA-256 hashes, per collection, answering the best match and its state
+  (`active`, `deleted`, `purged`) or an empty result. Dedup keys on
+  `(sha256, kind)`, so the same bytes can answer in both collections. A hash
+  whose row cannot be read is answered with a per-hash error, not as missing.
+  This assumes the single-consumer deployment: the token can read the whole
+  library, so presence is not a new disclosure. Multiple consumers will need a
+  narrower answer.
 - `DELETE /api/v1/{kind}/{id}` — authenticated move to the trash.
 - `POST /api/v1/{kind}/{id}/restore` — authenticated restore from the trash.
 - `PUT /api/v1/{kind}/{id}/pin` — authenticated usage registration.

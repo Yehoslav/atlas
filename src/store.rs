@@ -217,6 +217,35 @@ pub struct ListQuery {
     pub offset: i64,
 }
 
+/// One asset that owns a requested content hash, chosen per `(sha256, kind)`.
+#[derive(Clone, Debug)]
+pub struct HashMatch {
+    pub sha256: String,
+    pub kind: Kind,
+    pub id: AssetId,
+    pub state: AssetState,
+}
+
+/// The answer to a batch hash lookup.
+#[derive(Clone, Debug, Default)]
+pub struct HashLookup {
+    /// The best readable asset for each hash and collection.
+    pub matches: Vec<HashMatch>,
+    /// Hashes with a matching row that does not parse.
+    ///
+    /// Such a hash is neither present nor missing: it cannot be answered, and
+    /// an importer must not treat it as absent.
+    pub unreadable: Vec<UnreadableHash>,
+}
+
+/// A matching row that could not be read back into a [`HashMatch`].
+#[derive(Clone, Debug)]
+pub struct UnreadableHash {
+    pub sha256: String,
+    /// What was wrong, for the log. Never sent to a client.
+    pub detail: String,
+}
+
 impl Default for ListQuery {
     fn default() -> Self {
         Self {
@@ -896,6 +925,101 @@ impl Store {
         Ok(row
             .and_then(|row| row.try_get::<String, _>("id").ok())
             .and_then(|id| AssetId::parse(&id).ok()))
+    }
+
+    /// The best asset for each requested hash, per collection.
+    ///
+    /// Dedup keys on `(sha256, kind)`, so one hash can answer in both
+    /// collections. For each pair this picks the oldest live asset when one
+    /// exists, otherwise the oldest retired one, and reports the state: an
+    /// upload only deduplicates against a live asset, so "only in the trash"
+    /// must not read as "already here". `kind` narrows the answer to one
+    /// collection for a consumer that already knows what it is importing, but
+    /// it is applied after each row is read: filtering in SQL would hide a row
+    /// whose kind is NULL before it could be reported as unreadable, and a
+    /// NULL kind must not look like a miss.
+    ///
+    /// A hash with a matching row that does not parse comes back in
+    /// [`HashLookup::unreadable`], never as a miss: `missing` is the answer
+    /// that tells an importer to upload, so corruption must not be able to
+    /// masquerade as absence.
+    pub async fn assets_by_sha256(
+        &self,
+        hashes: &[String],
+        kind: Option<Kind>,
+    ) -> Result<HashLookup, StoreError> {
+        if hashes.is_empty() {
+            return Ok(HashLookup::default());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT sha256, kind, id, deleted_at, purged_at FROM assets WHERE sha256 IN (",
+        );
+        let mut separated = query.separated(", ");
+        for hash in hashes {
+            separated.push_bind(hash);
+        }
+        separated.push_unseparated(")");
+        // Best first: a live asset beats a retired one, and the oldest row
+        // wins a tie, matching `find_live_by_sha256`.
+        query.push(" ORDER BY (deleted_at IS NULL AND purged_at IS NULL) DESC, created_at ASC");
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut best: HashMap<(String, &'static str), HashMatch> = HashMap::new();
+        let mut unreadable: HashMap<String, String> = HashMap::new();
+        for row in rows {
+            let sha256: String = row.try_get("sha256")?;
+            let stored_kind: Option<String> = row.try_get("kind")?;
+            let parsed_kind = stored_kind.as_deref().and_then(Kind::from_key);
+
+            // A row whose kind is readable and outside the requested collection
+            // cannot affect that answer: dedup keys on `(sha256, kind)`. A row
+            // whose kind cannot be read might belong to any collection, so it
+            // is unreadable whatever was asked for.
+            if let (Some(wanted), Some(row_kind)) = (kind, parsed_kind)
+                && row_kind != wanted
+            {
+                continue;
+            }
+
+            let Some(row_kind) = parsed_kind else {
+                unreadable
+                    .entry(sha256)
+                    .or_insert_with(|| format!("kind does not parse: {stored_kind:?}"));
+                continue;
+            };
+            let stored_id: String = row.try_get("id")?;
+            let Ok(id) = AssetId::parse(&stored_id) else {
+                unreadable
+                    .entry(sha256)
+                    .or_insert_with(|| format!("id does not parse: {stored_id:?}"));
+                continue;
+            };
+            // `ORDER BY` puts a live row before a retired one and the oldest
+            // before a newer one, so the first row for a pair is the one to
+            // keep. `or_insert` relies on that ordering: changing the
+            // `ORDER BY` means revisiting this loop.
+            best.entry((sha256.clone(), row_kind.key()))
+                .or_insert(HashMatch {
+                    sha256,
+                    kind: row_kind,
+                    id,
+                    state: state_from(&row),
+                });
+        }
+        // A hash with any unreadable row is answered as an error rather than
+        // with the rows that did parse: the unreadable one may be the live row
+        // an upload would deduplicate against.
+        for hash in unreadable.keys() {
+            best.retain(|(candidate, _), _| candidate != hash);
+        }
+        Ok(HashLookup {
+            matches: best.into_values().collect(),
+            unreadable: unreadable
+                .into_iter()
+                .map(|(sha256, detail)| UnreadableHash { sha256, detail })
+                .collect(),
+        })
     }
 
     /// A page of one collection, plus the size of the whole filtered set.
@@ -1681,6 +1805,256 @@ mod tests {
             AssetState::Active
         );
         assert!(store.get_asset(&id).await.unwrap().unwrap().asset.pinned);
+    }
+
+    #[tokio::test]
+    async fn hash_lookup_prefers_live_and_separates_collections() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+        let hash = "a".repeat(64);
+
+        // An older trashed image and a newer live one with the same bytes.
+        let trashed_image = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        let mut trashed = record(&trashed_image);
+        trashed.sha256 = hash.clone();
+        trashed.created_at = 1_700_000_000;
+        store.insert_asset(&trashed, &[]).await.unwrap();
+        store
+            .mark_deleted(&trashed_image, 1_700_000_100)
+            .await
+            .unwrap();
+
+        let live_image = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        let mut live = record(&live_image);
+        live.sha256 = hash.clone();
+        live.created_at = 1_700_000_200;
+        store.insert_asset(&live, &[]).await.unwrap();
+
+        // The same bytes as a document are a different answer.
+        let document = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        let mut document_record = record(&document);
+        document_record.sha256 = hash.clone();
+        document_record.kind = Some(Kind::Document);
+        store.insert_asset(&document_record, &[]).await.unwrap();
+
+        let found = store
+            .assets_by_sha256(std::slice::from_ref(&hash), None)
+            .await
+            .unwrap();
+        assert!(found.unreadable.is_empty());
+        let found = found.matches;
+        assert_eq!(found.len(), 2, "one answer per collection");
+        let image = found
+            .iter()
+            .find(|matched| matched.kind == Kind::Image)
+            .unwrap();
+        assert_eq!(
+            image.id, live_image,
+            "the live row beats the older trashed one"
+        );
+        assert_eq!(image.state, AssetState::Active);
+        let document_match = found
+            .iter()
+            .find(|matched| matched.kind == Kind::Document)
+            .unwrap();
+        assert_eq!(document_match.id, document);
+
+        let images_only = store
+            .assets_by_sha256(std::slice::from_ref(&hash), Some(Kind::Image))
+            .await
+            .unwrap()
+            .matches;
+        assert_eq!(images_only.len(), 1);
+        assert_eq!(images_only[0].kind, Kind::Image);
+
+        assert!(
+            store
+                .assets_by_sha256(&["b".repeat(64)], None)
+                .await
+                .unwrap()
+                .matches
+                .is_empty(),
+            "an unknown hash has no row"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hash_lookup_uses_the_composite_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+
+        let rows = sqlx::query(
+            "EXPLAIN QUERY PLAN
+             SELECT sha256, kind, id, deleted_at, purged_at FROM assets
+             WHERE sha256 IN (?, ?)
+             ORDER BY (deleted_at IS NULL AND purged_at IS NULL) DESC, created_at ASC",
+        )
+        .bind("a".repeat(64))
+        .bind("b".repeat(64))
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        let plan: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("detail").unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("assets_by_sha256_kind")),
+            "the lookup must not grow into a table scan: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_composite_index_replaces_the_single_column_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+
+        let names: Vec<String> = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'assets'",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.try_get::<String, _>("name").unwrap())
+        .collect();
+        assert!(names.iter().any(|name| name == "assets_by_sha256_kind"));
+        assert!(
+            !names.iter().any(|name| name == "assets_by_sha256"),
+            "the single-column index only duplicated the composite's leading column"
+        );
+    }
+
+    async fn insert_corrupt_asset(store: &Store, id: &str, hash: &str, kind: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO assets
+                 (id, source_format, bytes, sha256, width, height, created_at, kind)
+             VALUES (?, 'jpeg', 1, ?, 1, 1, 0, ?)",
+        )
+        .bind(id)
+        .bind(hash)
+        .bind(kind)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_matching_row_that_does_not_parse_is_reported_not_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+
+        let second = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        let third = AssetId::generate(DEFAULT_LENGTH).unwrap();
+        let cases = [
+            ("not-an-asset-id".to_owned(), "a".repeat(64), Some("image")),
+            (second.to_string(), "b".repeat(64), Some("video")),
+            (third.to_string(), "c".repeat(64), None),
+        ];
+        for (id, hash, kind) in cases {
+            insert_corrupt_asset(&store, &id, &hash, kind).await;
+
+            let lookup = store
+                .assets_by_sha256(std::slice::from_ref(&hash), None)
+                .await
+                .expect("a bad row is reported, not fatal");
+            assert!(lookup.matches.is_empty(), "{id:?} must not look present");
+            assert_eq!(lookup.unreadable.len(), 1, "{id:?}");
+            assert_eq!(lookup.unreadable[0].sha256, hash);
+            assert!(!lookup.unreadable[0].detail.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kind_filter_does_not_hide_an_unreadable_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+
+        // A NULL kind is invisible to `kind = ?` in SQL, so the filter has to
+        // run after the row is read; otherwise this hash answers `missing`.
+        let hash = "f".repeat(64);
+        insert_corrupt_asset(&store, "not-an-asset-id", &hash, None).await;
+
+        let lookup = store
+            .assets_by_sha256(std::slice::from_ref(&hash), Some(Kind::Image))
+            .await
+            .unwrap();
+        assert!(lookup.matches.is_empty());
+        assert_eq!(lookup.unreadable.len(), 1, "not a miss");
+        assert_eq!(lookup.unreadable[0].sha256, hash);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_row_only_affects_the_collection_it_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+
+        // The kind parses, so this row belongs to documents and says nothing
+        // about whether the same bytes are an image.
+        let hash = "9".repeat(64);
+        insert_corrupt_asset(&store, "not-an-asset-id", &hash, Some("document")).await;
+
+        let images = store
+            .assets_by_sha256(std::slice::from_ref(&hash), Some(Kind::Image))
+            .await
+            .unwrap();
+        assert!(images.matches.is_empty());
+        assert!(
+            images.unreadable.is_empty(),
+            "the image answer is well defined"
+        );
+
+        let documents = store
+            .assets_by_sha256(std::slice::from_ref(&hash), Some(Kind::Document))
+            .await
+            .unwrap();
+        assert!(documents.matches.is_empty());
+        assert_eq!(documents.unreadable.len(), 1);
+
+        // Without a filter the document answer is still part of the question.
+        let all = store
+            .assets_by_sha256(std::slice::from_ref(&hash), None)
+            .await
+            .unwrap();
+        assert_eq!(all.unreadable.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_hash_does_not_spoil_the_rest_of_the_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&directory.path().join("atlas.sqlite3"))
+            .await
+            .unwrap();
+
+        let good_hash = "d".repeat(64);
+        let mut good = record(&AssetId::generate(DEFAULT_LENGTH).unwrap());
+        good.sha256 = good_hash.clone();
+        store.insert_asset(&good, &[]).await.unwrap();
+
+        let bad_hash = "e".repeat(64);
+        insert_corrupt_asset(&store, "not-an-asset-id", &bad_hash, Some("image")).await;
+
+        let lookup = store
+            .assets_by_sha256(&[good_hash.clone(), bad_hash.clone()], None)
+            .await
+            .unwrap();
+        assert_eq!(lookup.matches.len(), 1, "the readable hash still answers");
+        assert_eq!(lookup.matches[0].sha256, good_hash);
+        assert_eq!(lookup.unreadable.len(), 1);
+        assert_eq!(lookup.unreadable[0].sha256, bad_hash);
     }
 
     #[tokio::test]
