@@ -278,6 +278,9 @@ collections.
   `version`, `api`, rendition widths and formats, `writable` and `free_bytes`
   on `200`; `version`, `api` and a `reason` on `503` when the metadata
   database does not answer. `/healthz` stays liveness-only.
+- `GET /api/v1/openapi.json` — unauthenticated OpenAPI 3.1 document, generated
+  from the same handlers the router serves so a route cannot ship
+  undocumented. `docs/api.md` stays the prose reference.
 - `POST /api/v1/images` — authenticated raw-body image upload. `Content-Type`
   must be an allowlisted image type and `X-Original-Filename` optionally names
   the file; the request body is streamed to a staging file with limits. Returns

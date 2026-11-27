@@ -31,7 +31,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     AppState, disk,
-    error::ApiError,
+    error::{ApiError, ErrorResponse},
     filename,
     ident::AssetId,
     media::{MediaError, detect_multiframe, sha256_bytes, sha256_file, validate_signature},
@@ -72,13 +72,41 @@ const ORIGINAL_FILENAME_HEADER: &str = "x-original-filename";
 static PLACEHOLDER_ETAG: LazyLock<String> =
     LazyLock::new(|| format!("\"{}\"", sha256_bytes(PLACEHOLDER_PNG)));
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct HealthResponse {
     status: &'static str,
 }
 
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    security(()),
+    responses((status = 200, description = "The process answers; no database is touched.", body = HealthResponse))
+)]
 pub(crate) async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+/// The machine-readable contract for this instance.
+///
+/// Built once in `app()` from the handlers the router serves, so it cannot
+/// describe a route that is not there or miss one that is.
+#[utoipa::path(
+    get,
+    path = "/api/v1/openapi.json",
+    security(()),
+    responses((status = 200, description = "The OpenAPI 3.1 document for this instance."))
+)]
+pub(super) async fn openapi(
+    State(state): State<AppState>,
+) -> Result<Json<utoipa::openapi::OpenApi>, ApiError> {
+    let document = state.openapi.get().ok_or_else(|| {
+        // Only reachable when the route is mounted without `app()`, which is
+        // the one place the document is built. Answering says so; a panic
+        // would only say that something went wrong.
+        ApiError::internal("the OpenAPI document is missing; build the router with app()")
+    })?;
+    Ok(Json(document.clone()))
 }
 
 /// The compatibility marker a consumer's deploy gate reads.
@@ -87,7 +115,7 @@ pub(crate) async fn health() -> Json<HealthResponse> {
 /// request/response field of a consumer-visible route changes or disappears —
 /// never for an additive field or route. It is a promise to be honest about
 /// breaking changes, not a promise that there are none.
-const API_COMPATIBILITY: u32 = 1;
+pub(crate) const API_COMPATIBILITY: u32 = 1;
 
 /// Readiness plus the contract a consumer gates a deploy on.
 ///
@@ -95,6 +123,13 @@ const API_COMPATIBILITY: u32 = 1;
 /// database answers. Integrity checks are startup-only, and disk space is
 /// data, not readiness — a filling volume is reported through `writable` and
 /// left for the consumer to judge.
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    security(()),
+    responses((status = 200, description = "Ready: the metadata database answers.", body = ReadyResponse),
+        (status = 503, description = "The metadata database does not answer.", body = NotReadyResponse))
+)]
 pub(super) async fn ready(State(state): State<AppState>) -> Response {
     let mut response = match state.store.ping().await {
         Ok(()) => {
@@ -145,7 +180,10 @@ pub(super) async fn ready(State(state): State<AppState>) -> Response {
 /// the floor is a comparison against a number Atlas does not have, and the
 /// safe answer is that a write cannot be promised. `free_bytes` is zero then,
 /// so the consumer sees both the missing reading and the refusal.
-fn ready_disk(space: std::io::Result<disk::DiskSpace>, min_free_bytes: u64) -> (u64, bool) {
+pub(crate) fn ready_disk(
+    space: std::io::Result<disk::DiskSpace>,
+    min_free_bytes: u64,
+) -> (u64, bool) {
     match space {
         Ok(space) => (space.free_bytes, space.free_bytes >= min_free_bytes),
         Err(_) => (0, false),
@@ -153,7 +191,7 @@ fn ready_disk(space: std::io::Result<disk::DiskSpace>, min_free_bytes: u64) -> (
 }
 
 /// What a ready Atlas tells a deploy gate.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ReadyResponse {
     ok: bool,
     version: &'static str,
@@ -173,7 +211,7 @@ pub(super) struct ReadyResponse {
 
 /// What an unready Atlas still tells a deploy gate, so "down" and "too old"
 /// are distinguishable.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct NotReadyResponse {
     ok: bool,
     version: &'static str,
@@ -181,7 +219,7 @@ pub(super) struct NotReadyResponse {
     reason: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct AssetResponse {
     id: String,
     /// Present only when an upload matched an asset that already existed. The
@@ -208,7 +246,7 @@ pub(super) struct AssetResponse {
     renditions: Vec<RenditionResponse>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct OriginalResponse {
     url: String,
     /// The name the uploader gave the file, when it sent one.
@@ -220,7 +258,7 @@ pub(super) struct OriginalResponse {
     height: Option<u32>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct RenditionResponse {
     max_width: u32,
     width: u32,
@@ -239,7 +277,7 @@ pub(super) struct RenditionResponse {
 
 /// A trash listing entry. Purged entries are tombstones: they describe bytes
 /// that no longer exist, which is why they carry no rendition list.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct TrashEntryResponse {
     id: String,
     /// Which collection this entry lives in, so a caller listing the whole
@@ -258,7 +296,7 @@ pub(super) struct TrashEntryResponse {
     height: Option<u32>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct TrashResponse {
     assets: Vec<TrashEntryResponse>,
     total: i64,
@@ -271,20 +309,20 @@ pub(super) struct TrashResponse {
 const DEFAULT_TRASH_LIMIT: i64 = 200;
 const MAX_TRASH_LIMIT: i64 = 500;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct PinRequest {
     pinned: bool,
 }
 
 /// A consumer's opaque note. `null` clears it.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct DataRequest {
     data: Option<String>,
 }
 
 /// A rename. A missing key is refused rather than treated as `null`, so a
 /// typo cannot silently clear the name.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct FilenameRequest {
     #[serde(default, deserialize_with = "present")]
     filename: Option<serde_json::Value>,
@@ -311,30 +349,30 @@ const MAX_STATE_IDS: usize = 500;
 /// a bulk import asks about a page of files, not its whole catalogue.
 const MAX_HASHES: usize = 500;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct TrashQuery {
     limit: Option<i64>,
     offset: Option<i64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct StateRequest {
     ids: Vec<String>,
 }
 
 /// A batch hash lookup. `kind` narrows the question to one collection.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct ByHashRequest {
     hashes: Vec<String>,
     kind: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ByHashResponse {
     hashes: Vec<HashEntryResponse>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct HashEntryResponse {
     sha256: String,
     /// One match per collection, when one exists. Empty is the `missing`
@@ -362,20 +400,20 @@ impl HashEntryResponse {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct HashEntryErrorResponse {
     code: &'static str,
     message: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct HashMatchResponse {
     id: String,
     kind: Kind,
     state: AssetState,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct StateEntryResponse {
     id: String,
     state: AssetState,
@@ -385,7 +423,7 @@ pub(super) struct StateEntryResponse {
     pinned: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct StateResponse {
     assets: Vec<StateEntryResponse>,
 }
@@ -485,6 +523,19 @@ impl From<&StoredAsset> for TrashEntryResponse {
 }
 
 /// Upload into the images collection.
+#[utoipa::path(
+    post,
+    path = "/api/v1/images",
+    request_body(content(("image/*")), description = "The file bytes."),
+    responses((status = 201, description = "Created.", body = AssetResponse),
+        (status = 200, description = "The bytes are already live here; deduplicated.", body = AssetResponse),
+        (status = 400, description = "Invalid request.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 413, description = "The upload is larger than the limit.", body = ErrorResponse),
+        (status = 415, description = "Unsupported media type.", body = ErrorResponse),
+        (status = 422, description = "The bytes are not valid media.", body = ErrorResponse),
+        (status = 507, description = "The data volume is below the free-space floor.", body = ErrorResponse))
+)]
 pub(super) async fn upload_image(
     State(state): State<AppState>,
     request: Request,
@@ -494,6 +545,18 @@ pub(super) async fn upload_image(
 
 /// Upload into the documents collection, which also accepts images that should
 /// be stored without being converted.
+#[utoipa::path(
+    post,
+    path = "/api/v1/documents",
+    request_body(content(("application/*")), description = "The file bytes."),
+    responses((status = 201, description = "Created.", body = AssetResponse),
+        (status = 200, description = "The bytes are already live here; deduplicated.", body = AssetResponse),
+        (status = 400, description = "Invalid request.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 413, description = "The upload is larger than the limit.", body = ErrorResponse),
+        (status = 415, description = "Unsupported media type.", body = ErrorResponse),
+        (status = 507, description = "The data volume is below the free-space floor.", body = ErrorResponse))
+)]
 pub(super) async fn upload_document(
     State(state): State<AppState>,
     request: Request,
@@ -848,6 +911,14 @@ async fn stream_upload(
     Ok((total, prefix))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/{kind}/{id}",
+    params(("kind" = String, Path, description = "The collection: images or documents."), ("id" = String, Path, description = "The asset id.")),
+    responses((status = 200, description = "The asset metadata.", body = AssetResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 404, description = "No such asset in that collection.", body = ErrorResponse))
+)]
 pub(super) async fn get_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -868,6 +939,14 @@ pub(super) async fn get_asset(
 /// refuses to publish is strictly wider than the window where the bytes are
 /// still in `assets/`. A crash in between leaves the bytes to be swept into the
 /// trash by startup recovery, never a live row with missing files.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/{kind}/{id}",
+    params(("kind" = String, Path), ("id" = String, Path)),
+    responses((status = 204, description = "Moved to the trash."),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 404, description = "No such asset.", body = ErrorResponse))
+)]
 pub(super) async fn delete_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -911,6 +990,15 @@ async fn delete_inner(state: &AppState, id: &AssetId) -> Result<(), ApiError> {
     Ok(())
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/{kind}/{id}/restore",
+    params(("kind" = String, Path), ("id" = String, Path)),
+    responses((status = 204, description = "Restored."),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 404, description = "No such asset.", body = ErrorResponse),
+        (status = 409, description = "The asset was purged and cannot be restored.", body = ErrorResponse))
+)]
 pub(super) async fn restore_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -955,6 +1043,16 @@ async fn restore_inner(state: &AppState, id: &AssetId) -> Result<(), ApiError> {
 }
 
 /// Record that a consuming application still uses this asset, so purge skips it.
+#[utoipa::path(
+    put,
+    path = "/api/v1/{kind}/{id}/pin",
+    params(("kind" = String, Path), ("id" = String, Path)),
+    request_body = PinRequest,
+    responses((status = 200, description = "The updated asset.", body = AssetResponse),
+        (status = 400, description = "Invalid body.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 404, description = "No such asset.", body = ErrorResponse))
+)]
 pub(super) async fn set_pin(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -978,6 +1076,16 @@ pub(super) async fn set_pin(
 /// validation and no interpretation of the value anywhere on this path: the
 /// field was documented as opaque, and reading into it is exactly the thing
 /// that would make Atlas a content store.
+#[utoipa::path(
+    put,
+    path = "/api/v1/{kind}/{id}/data",
+    params(("kind" = String, Path), ("id" = String, Path)),
+    request_body = DataRequest,
+    responses((status = 200, description = "The updated asset.", body = AssetResponse),
+        (status = 400, description = "The note is too large.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 404, description = "No such asset.", body = ErrorResponse))
+)]
 pub(super) async fn set_data(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1035,6 +1143,17 @@ async fn set_pinned_inner(state: &AppState, id: &AssetId, pinned: bool) -> Resul
 /// percent sign here and only the header needs the escape. Only an active asset
 /// can be renamed; a trashed or purged one is a `409`, and a rename that races
 /// a delete changes nothing.
+#[utoipa::path(
+    put,
+    path = "/api/v1/{kind}/{id}/filename",
+    params(("kind" = String, Path), ("id" = String, Path)),
+    request_body = FilenameRequest,
+    responses((status = 200, description = "The updated asset.", body = AssetResponse),
+        (status = 400, description = "Invalid filename.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 404, description = "No such asset.", body = ErrorResponse),
+        (status = 409, description = "The asset is in the trash or purged.", body = ErrorResponse))
+)]
 pub(super) async fn rename_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1115,6 +1234,14 @@ fn rename_rejected(state: AssetState) -> ApiError {
 /// about the consumer's content and the result cannot be paged through. Ids
 /// Atlas does not know come back as `missing`, because telling "never existed"
 /// apart from "deleted" is the whole reason a consumer asks.
+#[utoipa::path(
+    post,
+    path = "/api/v1/assets/state",
+    request_body = StateRequest,
+    responses((status = 200, description = "One answer per id, in request order.", body = StateResponse),
+        (status = 400, description = "Too many or malformed ids.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse))
+)]
 pub(super) async fn asset_states(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1171,6 +1298,14 @@ pub(super) async fn asset_states(
 /// the bytes. Dedup keys on `(sha256, kind)`, so one hash can answer in both
 /// collections; a live match is what an upload would deduplicate against, and
 /// a retired match says the bytes are here but would not.
+#[utoipa::path(
+    post,
+    path = "/api/v1/assets/by-hash",
+    request_body = ByHashRequest,
+    responses((status = 200, description = "One answer per hash, in request order.", body = ByHashResponse),
+        (status = 400, description = "Too many or malformed hashes.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse))
+)]
 pub(super) async fn assets_by_hash(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1261,6 +1396,14 @@ pub(super) async fn assets_by_hash(
 ///
 /// Every filter here is a fact Atlas stores; nothing about meaning is
 /// filterable, because nothing about meaning is Atlas's business.
+#[utoipa::path(
+    get,
+    path = "/api/v1/images",
+    params(ListParams),
+    responses((status = 200, description = "A page of the collection.", body = ListResponse),
+        (status = 400, description = "Invalid filter.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse))
+)]
 pub(super) async fn list_images(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1269,6 +1412,14 @@ pub(super) async fn list_images(
     list_collection(state, Kind::Image, headers, params).await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/documents",
+    params(ListParams),
+    responses((status = 200, description = "A page of the collection.", body = ListResponse),
+        (status = 400, description = "Invalid filter.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse))
+)]
 pub(super) async fn list_documents(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1323,7 +1474,7 @@ async fn list_collection(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct ListParams {
     state: Option<String>,
     q: Option<String>,
@@ -1525,7 +1676,7 @@ impl ListParams {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ListResponse {
     assets: Vec<AssetResponse>,
     total: i64,
@@ -1534,6 +1685,12 @@ pub(super) struct ListResponse {
 }
 
 /// Counts and bytes per collection, for a library header.
+#[utoipa::path(
+    get,
+    path = "/api/v1/summary",
+    responses((status = 200, description = "Counts, bytes and the data volume.", body = SummaryResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse))
+)]
 pub(super) async fn summary(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1585,7 +1742,7 @@ fn summary_disk_fields(space: std::io::Result<disk::DiskSpace>) -> (Option<u64>,
     }
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, Serialize, utoipa::ToSchema)]
 pub(super) struct CollectionSummary {
     count: i64,
     bytes: i64,
@@ -1613,6 +1770,12 @@ fn accepted_formats(kind: Kind) -> Vec<SourceFormat> {
 /// one media type per format, so counting it counts formats, while
 /// `media_types` holds every spelling a caller may declare, so a format with
 /// two names appears twice in it and once in `formats`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/formats",
+    responses((status = 200, description = "What each collection accepts.", body = FormatsResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse))
+)]
 pub(super) async fn list_formats(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1642,7 +1805,7 @@ pub(super) async fn list_formats(
     }))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct AcceptedFormats {
     /// One media type per accepted format: the canonical spelling, the one
     /// the asset is stored and served as.
@@ -1654,13 +1817,13 @@ pub(super) struct AcceptedFormats {
     generates_renditions: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct FormatsResponse {
     images: AcceptedFormats,
     documents: AcceptedFormats,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct SummaryResponse {
     images: CollectionSummary,
     documents: CollectionSummary,
@@ -1700,6 +1863,15 @@ pub(super) struct SummaryResponse {
 /// forty-first. Once it starts, each id reports its own outcome, because a
 /// filesystem operation can still fail halfway and pretending otherwise would be
 /// a lie.
+#[utoipa::path(
+    post,
+    path = "/api/v1/{kind}/actions",
+    params(("kind" = String, Path)),
+    request_body = ActionRequest,
+    responses((status = 200, description = "One result per id.", body = ActionsResponse),
+        (status = 400, description = "Invalid action or ids.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse))
+)]
 pub(super) async fn bulk_actions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1774,7 +1946,7 @@ pub(super) async fn bulk_actions(
     Ok(Json(ActionsResponse { results }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct ActionRequest {
     action: String,
     ids: Vec<String>,
@@ -1803,14 +1975,14 @@ enum BulkAction {
     Unpin,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ActionResult {
     id: String,
     status: &'static str,
     error: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ActionsResponse {
     results: Vec<ActionResult>,
 }
@@ -1820,6 +1992,16 @@ pub(super) struct ActionsResponse {
 /// Each descriptor is the rendition's *actual* width while its URL keeps the
 /// profile it was stored under, which is the distinction a hand-written srcset
 /// gets wrong.
+#[utoipa::path(
+    get,
+    path = "/api/v1/images/{id}/srcset",
+    params(("id" = String, Path), SrcsetParams),
+    responses((status = 200, description = "The srcset for the requested widths.", body = SrcsetResponse),
+        (status = 400, description = "Invalid widths.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 404, description = "No such image.", body = ErrorResponse),
+        (status = 406, description = "No stored format matches the request.", body = ErrorResponse))
+)]
 pub(super) async fn get_srcset(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1953,7 +2135,7 @@ fn srcset_for(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct SrcsetParams {
     widths: Option<String>,
 }
@@ -1990,7 +2172,7 @@ impl SrcsetParams {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct SrcsetResponse {
     src: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2003,7 +2185,7 @@ pub(super) struct SrcsetResponse {
     generation: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct SrcsetEntryResponse {
     /// The profile width this URL names.
     max_width: u32,
@@ -2033,6 +2215,18 @@ pub(super) struct SrcsetEntryResponse {
 /// their cache policy says. So the widths that exist are left exactly as
 /// they are, and only the missing ones are generated — which is what the
 /// mistake this repairs needs.
+#[utoipa::path(
+    post,
+    path = "/api/v1/images/{id}/renditions",
+    params(("id" = String, Path)),
+    request_body = RenditionsRequest,
+    responses((status = 200, description = "The renditions as they are now.", body = RenditionRefreshResponse),
+        (status = 400, description = "Invalid body.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 404, description = "No such image.", body = ErrorResponse),
+        (status = 409, description = "The asset changed or is retired.", body = ErrorResponse),
+        (status = 507, description = "The data volume is below the free-space floor.", body = ErrorResponse))
+)]
 pub(super) async fn refresh_renditions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2473,6 +2667,7 @@ async fn re_encode_staged(
 /// repair that adds the missing widths.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(utoipa::ToSchema)]
 pub(super) struct RenditionsRequest {
     /// Re-encode every rendition from the original, as a new generation.
     #[serde(default)]
@@ -2517,6 +2712,15 @@ const MAX_ASYNC_RE_RENDER_IDS: usize = 1000;
 /// processing runs in a task that no longer has anything to do with the
 /// connection: a client that disconnects, times out or reloads polls
 /// `GET /api/v1/images/re-render/{job_id}` for progress and results.
+#[utoipa::path(
+    post,
+    path = "/api/v1/images/re-render",
+    request_body = ReRenderRequest,
+    responses((status = 200, description = "The page that was re-rendered.", body = ReRenderResponse),
+        (status = 202, description = "A detached job was started.", body = ReRenderStartResponse),
+        (status = 400, description = "Invalid selection.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse))
+)]
 pub(super) async fn re_render_images(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2595,6 +2799,7 @@ pub(super) async fn re_render_images(
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(utoipa::ToSchema)]
 pub(super) struct ReRenderRequest {
     ids: Option<Vec<ReRenderItem>>,
     limit: Option<i64>,
@@ -2608,6 +2813,7 @@ pub(super) struct ReRenderRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(utoipa::ToSchema)]
 struct ReRenderItem {
     id: String,
     expect_generation: Option<u32>,
@@ -2650,13 +2856,13 @@ fn validate_re_render_items(
         .collect()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ReEncodedImage {
     id: String,
     generation: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ReRenderResponse {
     /// How many images this page re-encoded.
     count: usize,
@@ -2669,19 +2875,19 @@ pub(super) struct ReRenderResponse {
     remaining: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct SkippedImage {
     id: String,
     generation: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct ReRenderFailure {
     id: String,
     error: ReRenderErrorDetail,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct ReRenderErrorDetail {
     code: String,
     message: String,
@@ -2689,13 +2895,13 @@ struct ReRenderErrorDetail {
 
 /// The answer to starting an asynchronous job: nothing but the handle the
 /// caller polls. The work itself is already durable in the job rows.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ReRenderStartResponse {
     job_id: String,
 }
 
 /// A job's lifecycle, progress, and per-asset results.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ReRenderJobResponse {
     job_id: String,
     /// `queued`, `running`, `completed` or `failed`.
@@ -2709,7 +2915,7 @@ pub(super) struct ReRenderJobResponse {
     results: Vec<ReRenderJobItemResponse>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct ReRenderJobProgress {
     /// Assets the job selected, frozen at creation.
     total: usize,
@@ -2720,7 +2926,7 @@ struct ReRenderJobProgress {
     failed: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct ReRenderJobItemResponse {
     id: String,
     /// `pending`, `re_encoded`, `skipped` or `failed`.
@@ -3114,6 +3320,14 @@ pub(crate) async fn resume_re_render_jobs(state: AppState) {
 }
 
 /// Progress and per-asset results for one job, by id.
+#[utoipa::path(
+    get,
+    path = "/api/v1/images/re-render/{job_id}",
+    params(("job_id" = String, Path)),
+    responses((status = 200, description = "The job and its results.", body = ReRenderJobResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 404, description = "No such job.", body = ErrorResponse))
+)]
 pub(super) async fn get_re_render_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3185,7 +3399,7 @@ fn implied_widths(configured: &[u32], source_width: u32) -> Vec<(u32, u32)> {
         .collect()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct RenditionRefreshResponse {
     id: String,
     /// The generation the renditions are at now.
@@ -3201,6 +3415,14 @@ pub(super) struct RenditionRefreshResponse {
     srcset: SrcsetResponse,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/trash",
+    params(TrashQuery),
+    responses((status = 200, description = "A page of the trash.", body = TrashResponse),
+        (status = 400, description = "Invalid paging.", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse))
+)]
 pub(super) async fn list_trash(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3252,6 +3474,14 @@ async fn load_asset(
     Ok(asset)
 }
 
+#[utoipa::path(
+    get,
+    path = "/media/{id}/original",
+    security(()),
+    params(("id" = String, Path)),
+    responses((status = 200, description = "The original bytes, with a Content-Disposition name.", content_type = "application/octet-stream"),
+        (status = 404, description = "No such asset.", body = ErrorResponse))
+)]
 pub(super) async fn get_original(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3302,6 +3532,15 @@ pub(super) async fn get_original(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/media/{id}/{rendition}",
+    security(()),
+    params(("id" = String, Path), ("rendition" = String, Path, description = "The rendition name, e.g. w320."), RenditionQuery),
+    responses((status = 200, description = "The selected representation.", content_type = "application/octet-stream"),
+        (status = 404, description = "No such asset or rendition.", body = ErrorResponse),
+        (status = 406, description = "No stored format matches the request.", body = ErrorResponse))
+)]
 pub(super) async fn get_rendition(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3383,7 +3622,7 @@ pub(super) async fn get_rendition(
 }
 
 /// The optional `format` parameter of a rendition URL.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct RenditionQuery {
     /// The format the caller wants, named the way Atlas names it in a
     /// response: `jxl`, `avif`, `webp`, `jpeg`, `png`.
@@ -6577,6 +6816,193 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"status": "ok"}));
+    }
+
+    /// The document is built in `app()`. If the route is mounted without it,
+    /// the answer says so instead of panicking.
+    #[tokio::test]
+    async fn the_openapi_route_answers_when_no_document_was_built() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let router = Router::new()
+            .route("/api/v1/openapi.json", axum::routing::get(super::openapi))
+            .with_state(state);
+
+        let (status, body) = send(
+            &router,
+            Request::builder()
+                .uri("/api/v1/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "internal_error");
+    }
+
+    #[tokio::test]
+    async fn the_openapi_document_covers_every_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let (status, document) = send(
+            &router,
+            Request::builder()
+                .uri("/api/v1/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            document["openapi"].as_str().unwrap().starts_with("3.1"),
+            "{document}"
+        );
+
+        let mut documented: Vec<&str> = document["paths"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        documented.sort_unstable();
+        let mut expected = vec![
+            "/api/v1/assets/by-hash",
+            "/api/v1/assets/state",
+            "/api/v1/documents",
+            "/api/v1/formats",
+            "/api/v1/images",
+            "/api/v1/images/re-render",
+            "/api/v1/images/re-render/{job_id}",
+            "/api/v1/images/{id}/renditions",
+            "/api/v1/images/{id}/srcset",
+            "/api/v1/openapi.json",
+            "/api/v1/summary",
+            "/api/v1/trash",
+            "/api/v1/{kind}/actions",
+            "/api/v1/{kind}/{id}",
+            "/api/v1/{kind}/{id}/data",
+            "/api/v1/{kind}/{id}/filename",
+            "/api/v1/{kind}/{id}/pin",
+            "/api/v1/{kind}/{id}/restore",
+            "/healthz",
+            "/media/{id}/original",
+            "/media/{id}/{rendition}",
+            "/readyz",
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            documented, expected,
+            "the document and the router must name the same routes"
+        );
+
+        let schemas = &document["components"]["schemas"];
+        assert!(schemas["AssetResponse"].is_object());
+        assert!(
+            schemas["ErrorResponse"].is_object(),
+            "the error envelope is documented once and referenced"
+        );
+        assert_eq!(
+            document["components"]["securitySchemes"]["bearer"]["scheme"],
+            "bearer"
+        );
+        assert_eq!(
+            document["paths"]["/readyz"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["example"]["rendition_widths"],
+            json!([320, 640]),
+            "the example is this instance's own widths, not a static guess"
+        );
+    }
+
+    /// The document is generated from the same structs the handler serializes,
+    /// so a field the response carries must be a property, and a required
+    /// property must be present.
+    #[tokio::test]
+    async fn a_real_asset_response_matches_the_documented_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+
+        let (_, document) = send(
+            &router,
+            Request::builder()
+                .uri("/api/v1/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let image = write_test_image(&directory.path().join("schema.png"), "640x480");
+        let (status, asset) = send(&router, upload_request("image/png", image)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        for (name, value) in [
+            ("AssetResponse", &asset),
+            ("RenditionResponse", &asset["renditions"][0]),
+        ] {
+            assert_matches_schema(&document, name, value);
+        }
+
+        // The envelope is the one `src/error.rs` serializes, not a copy, and a
+        // real refusal is checked against it.
+        let (status, error) = send(
+            &router,
+            Request::builder()
+                .uri("/api/v1/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error["error"]["code"], "unauthorized");
+        assert_matches_schema(&document, "ErrorResponse", &error);
+
+        // Readiness is checked against its schema and its live example.
+        let (status, ready) = send(
+            &router,
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_matches_schema(&document, "ReadyResponse", &ready);
+        let example = &document["paths"]["/readyz"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["example"];
+        assert_eq!(example["api"], ready["api"]);
+        assert_eq!(example["rendition_widths"], ready["rendition_widths"]);
+        assert_eq!(example["formats"], ready["formats"]);
+        // The disk figures are a startup snapshot; comparing them to the live
+        // answer would make the test depend on how full the test host is.
+        assert!(example["writable"].is_boolean());
+        assert!(ready["writable"].is_boolean());
+    }
+
+    /// Every field the response carries is a property, and every required
+    /// property is present: a two-way check against the served schema.
+    fn assert_matches_schema(document: &serde_json::Value, name: &str, value: &serde_json::Value) {
+        let schema = &document["components"]["schemas"][name];
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name} is not in the document"));
+        for key in value.as_object().unwrap().keys() {
+            assert!(
+                properties.contains_key(key),
+                "{name} has an undocumented field: {key}"
+            );
+        }
+        for key in schema["required"].as_array().unwrap() {
+            let key = key.as_str().unwrap();
+            assert!(
+                value.get(key).is_some(),
+                "{name} documents {key} as required but the response omits it"
+            );
+        }
     }
 
     fn action_request(collection: &str, action: &str, ids: &[&str]) -> Request<Body> {

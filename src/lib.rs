@@ -12,16 +12,18 @@ use std::{
     collections::HashMap,
     error::Error,
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::{Arc, OnceLock, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use axum::{Router, routing::get};
+use axum::Router;
 use ident::AssetId;
 use media::ImageProcessor;
 use model::AssetState;
 use store::Store;
 use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
+use utoipa::OpenApi;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
@@ -41,6 +43,9 @@ pub struct AppState {
     pub(crate) conversion_slots: Arc<Semaphore>,
     asset_conversion_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     pub(crate) last_purge: Arc<Mutex<Option<Instant>>>,
+    /// The OpenAPI document, built once in `app()` from the same handlers the
+    /// router serves. Empty until then, which is why the handler expects it.
+    pub(crate) openapi: Arc<OnceLock<utoipa::openapi::OpenApi>>,
 }
 
 impl AppState {
@@ -75,6 +80,7 @@ impl AppState {
             conversion_slots: Arc::new(Semaphore::new(conversion_concurrency)),
             asset_conversion_locks: Arc::new(Mutex::new(HashMap::new())),
             last_purge: Arc::new(Mutex::new(None)),
+            openapi: Arc::new(OnceLock::new()),
         };
 
         match state.purge_expired_trash().await {
@@ -315,79 +321,112 @@ async fn recover_incomplete_storage(
     Ok(())
 }
 
+/// The document served at `/api/v1/openapi.json`.
+///
+/// The paths and schemas come from the handlers registered with
+/// `utoipa_axum::routes!`, so a route that is not annotated is not served:
+/// the document cannot describe a route the router does not have, and the
+/// router cannot have a route the document does not describe.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Atlas",
+        version = env!("CARGO_PKG_VERSION"),
+        description = "The HTTP API of an Atlas instance. This contract is pre-1.0: routes and responses may change, and the `api` number on /readyz marks a breaking change."
+    ),
+    security(("bearer" = [])),
+    modifiers(&BearerAuth)
+)]
+struct ApiDoc;
+
+/// Adds the bearer scheme the routes refer to.
+struct BearerAuth;
+
+impl utoipa::Modify for BearerAuth {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearer",
+                utoipa::openapi::security::SecurityScheme::Http(
+                    utoipa::openapi::security::HttpBuilder::new()
+                        .scheme(utoipa::openapi::security::HttpAuthScheme::Bearer)
+                        .build(),
+                ),
+            );
+        }
+    }
+}
+
 pub fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(api::health))
-        .route("/readyz", get(api::ready))
-        // Two collections: the caller's choice is in the path, so asking for a
-        // rendition is asking for an image by construction.
-        .route(
-            "/api/v1/images",
-            axum::routing::post(api::upload_image).get(api::list_images),
-        )
-        .route(
-            "/api/v1/documents",
-            axum::routing::post(api::upload_document).get(api::list_documents),
-        )
-        .route(
-            "/api/v1/{kind}/{id}",
-            get(api::get_asset).delete(api::delete_asset),
-        )
-        .route(
-            "/api/v1/{kind}/{id}/restore",
-            axum::routing::post(api::restore_asset),
-        )
-        .route("/api/v1/{kind}/{id}/pin", axum::routing::put(api::set_pin))
-        .route(
-            "/api/v1/{kind}/{id}/filename",
-            axum::routing::put(api::rename_asset),
-        )
-        // A consumer's own opaque note. Typed like the rest: it belongs to an
-        // asset, and an asset belongs to a collection.
-        .route(
-            "/api/v1/{kind}/{id}/data",
-            axum::routing::put(api::set_data),
-        )
-        .route(
-            "/api/v1/{kind}/actions",
-            axum::routing::post(api::bulk_actions),
-        )
-        // Images only: documents have no renditions, so there is no such route.
-        .route("/api/v1/images/{id}/srcset", get(api::get_srcset))
-        // Images only, and authenticated: a rendition is made of the original
-        // bytes, so only someone who may change the asset may ask for more of
-        // them.
-        .route(
-            "/api/v1/images/{id}/renditions",
-            axum::routing::post(api::refresh_renditions),
-        )
-        // Every live image, re-encoded a page at a time — or, with `async`,
-        // as a detached job whose progress and results are polled by id.
-        .route(
-            "/api/v1/images/re-render",
-            axum::routing::post(api::re_render_images),
-        )
-        .route(
-            "/api/v1/images/re-render/{job_id}",
-            get(api::get_re_render_job),
-        )
-        // Uniform reads: a caller naturally asks about a mixed set of ids, and
-        // reading is harmless when the caller's classification is wrong.
-        .route(
-            "/api/v1/assets/state",
-            axum::routing::post(api::asset_states),
-        )
-        .route(
-            "/api/v1/assets/by-hash",
-            axum::routing::post(api::assets_by_hash),
-        )
-        .route("/api/v1/summary", get(api::summary))
-        .route("/api/v1/formats", get(api::list_formats))
-        .route("/api/v1/trash", get(api::list_trash))
-        // Public delivery is addressed by id and stays untyped.
-        .route("/media/{id}/original", get(api::get_original))
-        .route("/media/{id}/{rendition}", get(api::get_rendition))
-        .with_state(state)
+    let (router, mut document) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+        // One `routes!` per path: handlers in a single call must share it, and
+        // the macro folds their methods into one method router.
+        .routes(routes!(api::health))
+        .routes(routes!(api::ready))
+        .routes(routes!(api::openapi))
+        .routes(routes!(api::upload_image, api::list_images))
+        .routes(routes!(api::upload_document, api::list_documents))
+        .routes(routes!(api::get_asset, api::delete_asset))
+        .routes(routes!(api::restore_asset))
+        .routes(routes!(api::set_pin))
+        .routes(routes!(api::rename_asset))
+        .routes(routes!(api::set_data))
+        .routes(routes!(api::bulk_actions))
+        .routes(routes!(api::get_srcset))
+        .routes(routes!(api::refresh_renditions))
+        .routes(routes!(api::re_render_images))
+        .routes(routes!(api::get_re_render_job))
+        .routes(routes!(api::asset_states))
+        .routes(routes!(api::assets_by_hash))
+        .routes(routes!(api::summary))
+        .routes(routes!(api::list_formats))
+        .routes(routes!(api::list_trash))
+        .routes(routes!(api::get_original))
+        .routes(routes!(api::get_rendition))
+        .split_for_parts();
+    add_live_examples(&mut document, &state);
+    // The handlers read it back from the state, so a second `app()` on a clone
+    // of the same state keeps the first document.
+    state.openapi.set(document).ok();
+    router.with_state(state)
+}
+
+/// Put the instance's own widths and formats into the document as examples.
+///
+/// The schemas stay static and per-build; only the examples are per-instance,
+/// so a generator sees the values this deployment actually uses without the
+/// contract becoming a description of one host.
+fn add_live_examples(document: &mut utoipa::openapi::OpenApi, state: &AppState) {
+    let widths = state.config.variant_widths.clone();
+    let formats: Vec<&'static str> = model::RenditionFormat::ALL
+        .iter()
+        .map(|format| format.key())
+        .collect();
+    let (free_bytes, writable) = api::ready_disk(
+        disk::space(&state.config.data_dir),
+        state.config.min_free_bytes,
+    );
+    let Some(item) = document.paths.paths.get_mut("/readyz") else {
+        return;
+    };
+    let Some(operation) = item.get.as_mut() else {
+        return;
+    };
+    let Some(utoipa::openapi::RefOr::T(response)) = operation.responses.responses.get_mut("200")
+    else {
+        return;
+    };
+    if let Some(utoipa::openapi::RefOr::T(media)) = response.content.get_mut("application/json") {
+        media.example = Some(serde_json::json!({
+            "ok": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "api": api::API_COMPATIBILITY,
+            "rendition_widths": widths,
+            "formats": formats,
+            "writable": writable,
+            "free_bytes": free_bytes,
+        }));
+    }
 }
 
 #[cfg(test)]
