@@ -310,8 +310,9 @@ collections.
 - `POST /api/v1/{kind}/{id}/restore` — authenticated restore from the trash.
 - `PUT /api/v1/{kind}/{id}/pin` — authenticated usage registration.
 - `PUT /api/v1/{kind}/{id}/filename` — authenticated edit of the stored
-  original filename, through the upload header's sanitizer. `null` clears it;
-  only active assets may be renamed, and a retired one is `409`.
+  original filename, through the upload header's sanitizer but without its
+  percent-decoding: a JSON body is taken literally. `null` clears it; only
+  active assets may be renamed, and a retired one is `409`.
 - `PUT /api/v1/{kind}/{id}/data` — authenticated consumer-owned opaque note.
   Atlas caps it, stores it and returns it verbatim; it never reads, validates,
   searches or logs the value, and listings omit it.

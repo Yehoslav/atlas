@@ -106,12 +106,15 @@ as an attachment instead of being re-encoded into a picture.
 - `PUT /api/v1/{kind}/{id}/pin` — authenticated usage registration. Body
   `{"pinned": true|false}`; purge skips pinned assets.
 - `PUT /api/v1/{kind}/{id}/filename` — authenticated edit of the stored
-  original filename. Body `{"filename": "..."}` runs the same sanitizer as
-  `X-Original-Filename` (raw UTF-8 or percent-encoded, any path stripped,
-  255 characters), and `{"filename": null}` clears it back to the unnamed
-  state. Only active assets can be renamed; a trashed one is `409
-  asset_retired`, a purged one `409 asset_purged`. Public URLs are untouched,
-  because the name was never part of one.
+  original filename. Body `{"filename": "..."}` runs the upload header's
+  sanitizer (any path stripped, 255 characters, control characters refused),
+  with one difference: the body is **not** percent-decoded, because JSON
+  already carries text. `100%.pdf` and `a%20b.pdf` are stored exactly as sent,
+  while the same text in `X-Original-Filename` may be an escape. `{"filename":
+  null}` clears it back to the unnamed state. Only active assets can be
+  renamed; a trashed one is `409 asset_retired`, a purged one `409
+  asset_purged`. Public URLs are untouched, because the name was never part of
+  one.
 - `PUT /api/v1/{kind}/{id}/data` — authenticated consumer-owned note. Body
   `{"data": "..."}`, or `{"data": null}` to clear. Atlas stores it, caps it at
   `ATLAS_MAX_CONSUMER_DATA_BYTES` (64 KiB) and hands it back untouched: it does
@@ -427,15 +430,16 @@ restores keep working below the floor — an operator needs them to free space.
 Set the floor to `0` to disable it.
 
 The name is optional metadata and is never used as a path: the file on disk is
-named after the asset ID and the detected format. It arrives as raw UTF-8 or
-percent-encoded, so `Отчет за 2026.pdf`, `Jahresbericht (Ü).pdf` and
-`100% pure.pdf` all survive. Names are truncated at 255 characters, any path is
-stripped, and a name containing control characters is refused with
-`400 invalid_filename`. Delivery sends it as `Content-Disposition: inline;
-filename="…"; filename*=UTF-8''…`, falling back to `asset.pdf` when the upload
-had no name. The name can be changed later with `PUT
-/api/v1/{kind}/{id}/filename`; consumers that want a separate display name
-should still keep it in their own database.
+named after the asset ID and the detected format. In the upload header it
+arrives as raw UTF-8 or percent-encoded, so `Отчет за 2026.pdf`,
+`Jahresbericht (Ü).pdf` and `100% pure.pdf` all survive. Names are truncated at
+255 characters, any path is stripped, and a name containing control characters
+is refused with `400 invalid_filename`. Delivery sends it as `Content-Disposition:
+inline; filename="…"; filename*=UTF-8''…`, falling back to `asset.pdf` when the
+upload had no name. The name can be changed later with `PUT
+/api/v1/{kind}/{id}/filename`; a JSON body is literal, so it is not
+percent-decoded the way the header is. Consumers that want a separate display
+name should still keep it in their own database.
 
 ## Asking what Atlas can still serve
 

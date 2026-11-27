@@ -388,13 +388,13 @@ async fn upload_into(
         }
     }
     // Raw UTF-8 or percent-encoded; see `crate::filename`.
-    let original_name = match headers.get(ORIGINAL_FILENAME_HEADER) {
-        Some(value) => Some(
-            filename::from_header_bytes(value.as_bytes())
-                .map_err(|error| ApiError::bad_request("invalid_filename", error.to_string()))?,
-        ),
-        None => None,
-    };
+    let original_name =
+        match headers.get(ORIGINAL_FILENAME_HEADER) {
+            Some(value) => Some(filename::from_header_bytes(value.as_bytes()).map_err(
+                |error| ApiError::bad_request("invalid_filename", error.header_message()),
+            )?),
+            None => None,
+        };
 
     if let Some(content_length) = headers.get(CONTENT_LENGTH) {
         let declared = content_length
@@ -867,9 +867,11 @@ async fn set_pinned_inner(state: &AppState, id: &AssetId, pinned: bool) -> Resul
 ///
 /// The name is metadata, not a location: it reaches `Content-Disposition`, the
 /// metadata response and listing sort, never a filesystem path or a format
-/// decision. The value therefore runs the upload header's sanitizer, so the two
-/// entry points cannot drift. Only an active asset can be renamed; a trashed or
-/// purged one is a `409`, and a rename that races a delete changes nothing.
+/// decision. The value therefore runs the upload header's sanitizer, minus its
+/// percent-decoding: a JSON body already carries text, so `100%` is a literal
+/// percent sign here and only the header needs the escape. Only an active asset
+/// can be renamed; a trashed or purged one is a `409`, and a rename that races
+/// a delete changes nothing.
 pub(super) async fn rename_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -881,7 +883,7 @@ pub(super) async fn rename_asset(
     let id = parse_id(&id)?;
     let filename = match body.filename {
         Some(serde_json::Value::String(value)) => Some(
-            filename::from_header_bytes(value.as_bytes())
+            filename::from_json_str(&value)
                 .map_err(|error| ApiError::bad_request("invalid_filename", error.to_string()))?,
         ),
         Some(serde_json::Value::Null) => None,
@@ -8028,13 +8030,14 @@ mod tests {
         .await;
         let second_id = second["id"].as_str().unwrap().to_owned();
 
-        // The same decoding and path-stripping the upload header applies.
+        // The same path-stripping the upload header applies. A body is not
+        // percent-decoded, so the path arrives literally.
         let (status, renamed) = send(
             &router,
             json_request(
                 "PUT",
                 &format!("/api/v1/documents/{first_id}/filename"),
-                &json!({"filename": "..%2F..%2FJahresbericht%20%28%C3%9C%29.pdf"}),
+                &json!({"filename": "../../Jahresbericht (Ü).pdf"}),
             ),
         )
         .await;
@@ -8070,6 +8073,22 @@ mod tests {
             .map(|asset| asset["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec![first_id.as_str(), second_id.as_str()]);
+
+        // A body is literal: a `%` is the character the caller sent, so a name
+        // that looks like an escape is not silently rewritten.
+        for name in ["Q3 100% done.pdf", "a%20b.pdf"] {
+            let (status, renamed) = send(
+                &router,
+                json_request(
+                    "PUT",
+                    &format!("/api/v1/documents/{first_id}/filename"),
+                    &json!({ "filename": name }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+            assert_eq!(renamed["original"]["filename"], name, "{name}");
+        }
 
         // Last write wins, and null restores the unnamed state.
         let (status, renamed) = send(
@@ -8140,7 +8159,6 @@ mod tests {
                 json!({"filename": "evil\nbreak.pdf"}),
                 "a control character",
             ),
-            (json!({"filename": "%FF%FE"}), "bytes that are not text"),
         ] {
             let (status, error) = send(&router, json_request("PUT", &uri, &body)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{why}");

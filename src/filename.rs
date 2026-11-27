@@ -16,8 +16,10 @@
 //!   anything else, so `urllib.parse.quote` is the one-line fix).
 //!
 //! A `%` that is not followed by two hex digits stays a literal `%`, so
-//! `100% pure.pdf` survives both ways. Control characters are refused rather
-//! than stripped: no filesystem permits them, and CR or LF in a response
+//! `100% pure.pdf` survives both ways. A JSON body is never percent-decoded:
+//! it already carries text, so `100%.pdf` and `a%20b.pdf` keep their percent
+//! signs, and only the header needs the escape. Control characters are refused
+//! rather than stripped: no filesystem permits them, and CR or LF in a response
 //! header is a protocol problem, not a naming quirk.
 
 use std::fmt;
@@ -40,9 +42,7 @@ pub enum FilenameError {
 impl fmt::Display for FilenameError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotUtf8 => {
-                formatter.write_str("The filename must be UTF-8 text, optionally percent-encoded")
-            }
+            Self::NotUtf8 => formatter.write_str("The filename must be UTF-8 text"),
             Self::Control => {
                 formatter.write_str("The filename must not contain control characters")
             }
@@ -51,22 +51,53 @@ impl fmt::Display for FilenameError {
     }
 }
 
-/// Decode and sanitize a name received from a client.
+impl FilenameError {
+    /// The message the upload path reports, naming the header it read.
+    ///
+    /// A header value may legitimately be percent-encoded, so the sentence says
+    /// so; a JSON body may not, and uses `Display` instead. Clients that match
+    /// on this text have seen it since the header was introduced, so it does
+    /// not change just because a second entry point appeared.
+    pub fn header_message(&self) -> &'static str {
+        match self {
+            Self::NotUtf8 => "X-Original-Filename must be UTF-8 text, optionally percent-encoded",
+            Self::Control => "X-Original-Filename must not contain control characters",
+            Self::Empty => "X-Original-Filename did not contain a file name",
+        }
+    }
+}
+
+/// Decode and sanitize a name received in a header.
+///
+/// Header values may be percent-encoded for transport, so this path decodes
+/// before sanitizing. A JSON body does not need that; see [`from_json_str`].
+pub fn from_header_bytes(value: &[u8]) -> Result<String, FilenameError> {
+    let decoded = percent_decode(value)?;
+    sanitize(&decoded)
+}
+
+/// Sanitize a name received as a JSON string.
+///
+/// JSON already carries text, so nothing is decoded: `100%.pdf` and
+/// `a%20b.pdf` keep their percent signs, because in a body a `%` is the
+/// character the caller meant. Decoding here would make the two spellings
+/// ambiguous, and would silently rewrite a name that legitimately contains one.
+pub fn from_json_str(value: &str) -> Result<String, FilenameError> {
+    sanitize(value)
+}
+
+/// The rules both entry points share: no control characters, no path, a name
+/// that is actually a name, and the filesystem's length cap.
 ///
 /// Any path is dropped, so a client that sends a full path does not turn the
 /// name into a traversal attempt, and the result is truncated on a character
 /// boundary rather than a byte one, so a Cyrillic name survives intact.
-pub fn from_header_bytes(value: &[u8]) -> Result<String, FilenameError> {
-    let decoded = percent_decode(value)?;
-    if decoded.chars().any(char::is_control) {
+fn sanitize(value: &str) -> Result<String, FilenameError> {
+    if value.chars().any(char::is_control) {
         return Err(FilenameError::Control);
     }
 
-    let name = decoded
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_default()
-        .trim();
+    let name = value.rsplit(['/', '\\']).next().unwrap_or_default().trim();
     if name.is_empty() || name == "." || name == ".." {
         return Err(FilenameError::Empty);
     }
@@ -156,8 +187,8 @@ mod tests {
     use axum::http::HeaderValue;
 
     use super::{
-        FilenameError, ascii_fallback, disposition, from_header_bytes, percent_decode,
-        percent_encode,
+        FilenameError, ascii_fallback, disposition, from_header_bytes, from_json_str,
+        percent_decode, percent_encode,
     };
 
     fn decode(value: &str) -> Result<String, FilenameError> {
@@ -214,6 +245,59 @@ mod tests {
         }
         // ...while an unambiguous escape is still decoded.
         assert_eq!(decode("50%25%20done.pdf"), Ok("50% done.pdf".to_owned()));
+    }
+
+    #[test]
+    fn a_json_body_is_literal_and_never_percent_decoded() {
+        // A body already carries text, so `%` is the character the caller
+        // meant; decoding would turn `a%20b.pdf` into a different name.
+        for name in [
+            "100%.pdf",
+            "50%25 off.pdf",
+            "a%20b.pdf",
+            "%D0%9E%D1%82%D1%87%D0%B5%D1%82.pdf",
+            "Q3 100% done.pdf",
+        ] {
+            assert_eq!(from_json_str(name), Ok(name.to_owned()), "{name}");
+        }
+        // The header keeps decoding, because there the escape is transport.
+        assert_eq!(decode("a%20b.pdf"), Ok("a b.pdf".to_owned()));
+        assert_eq!(decode("100%.pdf"), Ok("100%.pdf".to_owned()));
+    }
+
+    #[test]
+    fn a_json_body_shares_the_rest_of_the_sanitizer() {
+        assert_eq!(
+            from_json_str("../../Jahresbericht (Ü).pdf"),
+            Ok("Jahresbericht (Ü).pdf".to_owned())
+        );
+        assert_eq!(
+            from_json_str("evil\nbreak.pdf"),
+            Err(FilenameError::Control)
+        );
+        assert_eq!(from_json_str(".."), Err(FilenameError::Empty));
+    }
+
+    #[test]
+    fn the_upload_path_keeps_the_messages_it_always_had() {
+        assert_eq!(
+            FilenameError::NotUtf8.header_message(),
+            "X-Original-Filename must be UTF-8 text, optionally percent-encoded"
+        );
+        assert_eq!(
+            FilenameError::Control.header_message(),
+            "X-Original-Filename must not contain control characters"
+        );
+        assert_eq!(
+            FilenameError::Empty.header_message(),
+            "X-Original-Filename did not contain a file name"
+        );
+        // The rename path names the field it takes, and does not claim that a
+        // JSON body may be percent-encoded.
+        assert_eq!(
+            FilenameError::NotUtf8.to_string(),
+            "The filename must be UTF-8 text"
+        );
     }
 
     #[test]
