@@ -1141,6 +1141,27 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Set or clear an active asset's stored original filename.
+    ///
+    /// The state predicate is part of the write, not only of the handler's
+    /// check: a delete that lands between the two must not leave a renamed
+    /// entry in the trash. `false` means no active row matched.
+    pub async fn set_original_name(
+        &self,
+        id: &AssetId,
+        name: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE assets SET original_name = ?
+             WHERE id = ? AND deleted_at IS NULL AND purged_at IS NULL",
+        )
+        .bind(name)
+        .bind(id.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Assets past the retention window that no consumer has pinned. Already
     /// purged tombstones are not candidates again.
     pub async fn purge_candidates(&self, cutoff: i64) -> Result<Vec<String>, StoreError> {

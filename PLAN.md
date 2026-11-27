@@ -292,7 +292,8 @@ collections.
   rather than an empty page: a filter that quietly matches nothing is worse
   than one that says why.
 - `GET /api/v1/{kind}/{id}` — authenticated asset metadata, including its `kind`,
-  original facts, available width renditions, and lifecycle state.
+  original facts, available width renditions with per-format byte sizes, and
+  lifecycle state.
 - `POST /api/v1/{kind}/actions` — authenticated bulk `pin`, `unpin`, `delete`,
   or `restore` for up to 500 caller-supplied ids, validated all-or-nothing.
 - `GET /api/v1/summary` — authenticated counts and stored bytes, trash included,
@@ -308,6 +309,12 @@ collections.
 - `DELETE /api/v1/{kind}/{id}` — authenticated move to the trash.
 - `POST /api/v1/{kind}/{id}/restore` — authenticated restore from the trash.
 - `PUT /api/v1/{kind}/{id}/pin` — authenticated usage registration.
+- `PUT /api/v1/{kind}/{id}/filename` — authenticated edit of the stored
+  original filename, through the upload header's sanitizer but without its
+  percent-decoding: a JSON body is taken literally. `null` clears it; only
+  active assets may be renamed, and a retired one is `409`. The URL does not
+  change, so the original is cached for five minutes with a name-bearing ETag
+  rather than immutably.
 - `PUT /api/v1/{kind}/{id}/data` — authenticated consumer-owned opaque note.
   Atlas caps it, stores it and returns it verbatim; it never reads, validates,
   searches or logs the value, and listings omit it.
@@ -317,7 +324,8 @@ collections.
 - `GET /api/v1/images/{id}/srcset` — authenticated `srcset` for one image, one
   candidate per distinct actual output width, described by the width actually
   produced. Without a `widths` parameter it describes the instance's
-  configured widths.
+  configured widths. Structured `entries` repeat each candidate with the
+  profile width and the per-format sizes behind its negotiated URL.
 - `POST /api/v1/images/{id}/renditions` — authenticated generation of the
   renditions an asset is missing, under the same asset id; with
   `{"re_encode": true}`, a re-encode of every rendition as a new generation.

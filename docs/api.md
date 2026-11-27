@@ -105,6 +105,18 @@ as an attachment instead of being re-encoded into a picture.
   Returns `204`, or `409` if the asset was already purged.
 - `PUT /api/v1/{kind}/{id}/pin` — authenticated usage registration. Body
   `{"pinned": true|false}`; purge skips pinned assets.
+- `PUT /api/v1/{kind}/{id}/filename` — authenticated edit of the stored
+  original filename. Body `{"filename": "..."}` runs the upload header's
+  sanitizer (any path stripped, 255 characters, control characters refused),
+  with one difference: the body is **not** percent-decoded, because JSON
+  already carries text. `100%.pdf` and `a%20b.pdf` are stored exactly as sent,
+  while the same text in `X-Original-Filename` may be an escape. `{"filename":
+  null}` clears it back to the unnamed state. Only active assets can be
+  renamed; a trashed one is `409 asset_retired`, a purged one `409
+  asset_purged`. Public URLs are untouched, because the name was never part of
+  one. The original is served with `Cache-Control: public, max-age=300` and an
+  ETag that covers the name, so a rename reaches a cached copy within five
+  minutes instead of a year.
 - `PUT /api/v1/{kind}/{id}/data` — authenticated consumer-owned note. Body
   `{"data": "..."}`, or `{"data": null}` to clear. Atlas stores it, caps it at
   `ATLAS_MAX_CONSUMER_DATA_BYTES` (64 KiB) and hands it back untouched: it does
@@ -131,9 +143,13 @@ as an attachment instead of being re-encoded into a picture.
   narrower than its largest profile is described honestly without duplicate
   candidates. Without a `widths` parameter it describes the instance's
   configured widths, so it is the answer a consumer gets without knowing the
-  configuration. Errors on an unknown asset (`404`), a non-image, or a width
-  Atlas does not have. Its URLs name the current generation, which the
-  response also reports as `generation`.
+  configuration. The response also carries `entries`, one per candidate, with
+  the profile width, the actual width, and a `bytes` map that gives the stored
+  size of each representation behind the negotiated URL — a string cannot say
+  which format a browser will receive, but a byte budget needs it. Errors on
+  an unknown asset (`404`), a non-image, or a width Atlas does not have. Its
+  URLs name the current generation, which the response also reports as
+  `generation`.
 - `POST /api/v1/images/{id}/renditions` — authenticated generation of the
   renditions an asset is missing. The widths an asset has are fixed when it is
   uploaded, so a deployment that configures the wrong widths leaves assets
@@ -213,6 +229,15 @@ index media *content* — it filters on filenames, media types and lifecycle
 state, and leaves meaning to the consumer — and it never converts or
 re-encodes on a read.
 
+Every rendition entry in asset metadata carries `formats` and a `bytes` map
+keyed by those same names. The URL behind the entry negotiates its
+representation from `Accept` (or `?format=`), so one number would describe a
+file a given client may never receive; the map gives the stored size of each
+representation instead. The values are recorded when the rendition is
+generated, not read from the filesystem on demand: a row whose file is missing
+is an internal error, never a plausible `0`. The `entries` in a `srcset`
+response carry the same maps.
+
 ## How a rendition URL resolves
 
 `/media/{id}/w960` asks for an image **no wider than** 960 pixels, not for a
@@ -290,6 +315,12 @@ cached for an hour, so a page that still uses it picks up a re-encode soon
 after it happens. The asset id never changes; a consumer that stores a srcset
 refreshes it from the re-encode's answer or from
 `GET /api/v1/images/{id}/srcset`.
+
+The original file is the other URL that is not immutable: its bytes never
+change, but its download name can be edited, so `/media/{id}/original` is
+cached for five minutes and its ETag covers the name. A cached copy therefore
+picks up a rename on its next revalidation instead of keeping the old name for
+a year.
 
 ```sh
 curl -X POST -H "Authorization: Bearer $ATLAS_API_TOKEN" \
@@ -407,14 +438,19 @@ restores keep working below the floor — an operator needs them to free space.
 Set the floor to `0` to disable it.
 
 The name is optional metadata and is never used as a path: the file on disk is
-named after the asset ID and the detected format. It arrives as raw UTF-8 or
-percent-encoded, so `Отчет за 2026.pdf`, `Jahresbericht (Ü).pdf` and
-`100% pure.pdf` all survive. Names are truncated at 255 characters, any path is
-stripped, and a name containing control characters is refused with
-`400 invalid_filename`. Delivery sends it as `Content-Disposition: inline;
-filename="…"; filename*=UTF-8''…`, falling back to `asset.pdf` when the upload
-had no name. Consumers that want a different display name should keep it in
-their own database.
+named after the asset ID and the detected format. In the upload header it
+arrives as raw UTF-8 or percent-encoded, so `Отчет за 2026.pdf`,
+`Jahresbericht (Ü).pdf` and `100% pure.pdf` all survive. Names are truncated at
+255 characters, any path is stripped, and a name containing control characters
+is refused with `400 invalid_filename`. Delivery sends it as `Content-Disposition:
+inline; filename="…"; filename*=UTF-8''…`, falling back to `asset.pdf` when the
+upload had no name. The name can be changed later with `PUT
+/api/v1/{kind}/{id}/filename`; a JSON body is literal, so it is not
+percent-decoded the way the header is. The URL does not change with it, so the
+original is cached for five minutes rather than a year, and its ETag covers the
+name: after that window a revalidation returns the new `Content-Disposition`
+instead of a `304` carrying the old one. Consumers that want a separate display
+name should still keep it in their own database.
 
 ## Asking what Atlas can still serve
 
