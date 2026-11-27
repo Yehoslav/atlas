@@ -274,6 +274,10 @@ endpoints (`state` and `trash`) are untyped, because they exist to span
 collections.
 
 - `GET /healthz` — process health.
+- `GET /readyz` — unauthenticated readiness and the compatibility contract:
+  `version`, `api`, rendition widths and formats, `writable` and `free_bytes`
+  on `200`; `version`, `api` and a `reason` on `503` when the metadata
+  database does not answer. `/healthz` stays liveness-only.
 - `POST /api/v1/images` — authenticated raw-body image upload. `Content-Type`
   must be an allowlisted image type and `X-Original-Filename` optionally names
   the file; the request body is streamed to a staging file with limits. Returns

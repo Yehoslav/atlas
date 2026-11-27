@@ -360,6 +360,22 @@ impl Store {
         Ok(store)
     }
 
+    /// A `SELECT 1` against the pool, for the readiness probe.
+    ///
+    /// Deliberately not [`Self::check_integrity`]: that is a startup check,
+    /// and a deploy gate wants to know whether the database answers, not
+    /// whether every page is sound.
+    pub async fn ping(&self) -> Result<(), StoreError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Close the pool so the next query fails, for the readiness test.
+    #[cfg(test)]
+    pub(crate) async fn close(&self) {
+        self.pool.close().await;
+    }
+
     /// Refuse to serve from a database that is corrupt or has orphaned rows.
     ///
     /// Both checks run after migrations, so a failed migration is reported as a
