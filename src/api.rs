@@ -50,6 +50,12 @@ const CACHE_POLICY: &str = "public, max-age=31536000, immutable";
 /// immutable copy would hide the fix exactly where it matters. The URLs the
 /// API hands out name their generation and are cached as immutable.
 const LATEST_CACHE_POLICY: &str = "public, max-age=3600";
+/// For the original file. Its bytes never change, but its
+/// `Content-Disposition` does when the stored name is edited, so it cannot be
+/// immutable: a year-long copy would keep the old download name. Five minutes
+/// lets a rename reach downloaders promptly, and the ETag covers the name, so
+/// the revalidation that follows notices the change.
+const ORIGINAL_CACHE_POLICY: &str = "public, max-age=300";
 /// Deliberately short: the placeholder stands in for an asset that may come back
 /// from the trash, and an immutable one could outlive that restore by a year.
 const PLACEHOLDER_CACHE_POLICY: &str = "public, max-age=60";
@@ -901,36 +907,49 @@ pub(super) async fn rename_asset(
         }
     };
 
-    let asset = load_asset(&state, &id, Some(kind)).await?;
-    match asset.asset.state() {
-        AssetState::Active => {}
-        AssetState::Deleted => {
-            return Err(ApiError::conflict(
-                "asset_retired",
-                "The asset is in the trash; restore it before renaming it.",
-            ));
-        }
-        AssetState::Purged | AssetState::Missing => {
-            return Err(ApiError::conflict(
-                "asset_purged",
-                "The asset was purged and cannot be renamed.",
-            ));
-        }
-    }
+    // The id has to exist in this collection, but its state is decided by the
+    // write itself: the UPDATE carries the active predicate, so a delete or a
+    // purge that lands between this read and the write changes nothing. The
+    // race is therefore the ordinary path, not a second one to handle.
+    load_asset(&state, &id, Some(kind)).await?;
     if !state
         .store
         .set_original_name(&id, filename.as_deref())
         .await
         .map_err(ApiError::internal)?
     {
-        return Err(ApiError::conflict(
-            "asset_retired",
-            "The asset is no longer active; nothing was renamed.",
-        ));
+        // The predicate cannot say which state rejected the write, and a
+        // client needs the trash code and the tombstone code apart, so read
+        // the row back and let its current state answer.
+        let current = load_asset(&state, &id, Some(kind)).await?;
+        return Err(rename_rejected(current.asset.state()));
     }
 
     let asset = load_asset(&state, &id, Some(kind)).await?;
     Ok(Json(AssetResponse::from(&asset)))
+}
+
+/// The conflict a rename reports when the state predicate rejected the write.
+///
+/// The predicate fires for both a trashed and a purged asset, so the row's
+/// current state picks the code. A missing row is already a `404` from
+/// `load_asset`; a state that is active again by the time of the read means
+/// the rename lost to a restore, and nothing was written.
+fn rename_rejected(state: AssetState) -> ApiError {
+    match state {
+        AssetState::Purged => ApiError::conflict(
+            "asset_purged",
+            "The asset was purged and cannot be renamed.",
+        ),
+        AssetState::Deleted => ApiError::conflict(
+            "asset_retired",
+            "The asset is in the trash; restore it before renaming it.",
+        ),
+        _ => ApiError::conflict(
+            "asset_retired",
+            "The asset is no longer active; nothing was renamed.",
+        ),
+    }
 }
 
 /// Answer "which of the ids I already know can you still serve?".
@@ -3005,16 +3024,31 @@ pub(super) async fn get_original(
             .kind
             .unwrap_or_else(|| asset.asset.source_format.kind()),
     );
+    // The bytes are immutable but the download name is not, so the ETag covers
+    // both: without the name a 304 would keep the old `Content-Disposition`
+    // alive in every cache that holds it.
+    let etag = format!(
+        "\"{}-{}\"",
+        asset.asset.sha256,
+        sha256_bytes(
+            asset
+                .asset
+                .original_name
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes()
+        )
+    );
     serve_file(
         &headers,
         &path,
         asset.asset.bytes,
-        &asset.asset.sha256,
+        &etag,
         asset.asset.original_name.as_deref(),
         asset.asset.source_format.mime_type(),
         disposition,
         false,
-        CACHE_POLICY,
+        ORIGINAL_CACHE_POLICY,
     )
     .await
 }
@@ -3073,11 +3107,12 @@ pub(super) async fn get_rendition(
         max_width,
         requested,
     )?;
+    let etag = format!("\"{}\"", selected.sha256);
     serve_file(
         &headers,
         &path,
         selected.bytes,
-        &selected.sha256,
+        &etag,
         None,
         selected.format.mime_type(),
         "inline",
@@ -3481,15 +3516,14 @@ async fn serve_file(
     request_headers: &HeaderMap,
     path: &std::path::Path,
     expected_size: u64,
-    sha256: &str,
+    etag: &str,
     original_name: Option<&str>,
     mime_type: &str,
     disposition: &str,
     vary_accept: bool,
     cache_policy: &'static str,
 ) -> Result<Response, ApiError> {
-    let etag = format!("\"{sha256}\"");
-    if etag_matches(request_headers, &etag) {
+    if etag_matches(request_headers, etag) {
         let mut response = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(ETAG, etag)
@@ -4061,7 +4095,8 @@ mod tests {
         assert_eq!(restored.headers()["content-type"], "application/pdf");
         assert_eq!(
             restored.headers()["cache-control"],
-            "public, max-age=31536000, immutable"
+            "public, max-age=300",
+            "the name can change, so the original is not immutable"
         );
 
         let (status, body) = send(&router, authorized("GET", &asset_uri("documents", &id))).await;
@@ -8233,6 +8268,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The original's URL is stable, but the name in its `Content-Disposition`
+    /// is not, so a cached copy cannot be immutable and the ETag must cover the
+    /// name. A conditional request with the old validator has to answer `200`
+    /// with the new name, not `304` with the old one.
+    #[tokio::test]
+    async fn a_rename_invalidates_the_cached_download_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        let (status, uploaded) = send(
+            &router,
+            upload_named("application/pdf", b"%PDF-1.7\nnamed", "before.pdf"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = uploaded["id"].as_str().unwrap().to_owned();
+
+        let (status, headers, _) = fetch(&router, &format!("/media/{id}/original")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers["cache-control"], "public, max-age=300",
+            "a year-long copy would keep the old name"
+        );
+        assert!(
+            headers["content-disposition"]
+                .to_str()
+                .unwrap()
+                .contains("filename=\"before.pdf\"")
+        );
+        let before = headers["etag"].clone();
+
+        let (status, _) = send(
+            &router,
+            json_request(
+                "PUT",
+                &format!("/api/v1/documents/{id}/filename"),
+                &json!({"filename": "after.pdf"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/media/{id}/original"))
+                    .header("if-none-match", before.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the bytes are the same, but the headers a client would keep are not"
+        );
+        assert_ne!(response.headers()["etag"].as_bytes(), before.as_bytes());
+        assert!(
+            response.headers()["content-disposition"]
+                .to_str()
+                .unwrap()
+                .contains("filename=\"after.pdf\"")
+        );
     }
 
     #[tokio::test]

@@ -114,7 +114,9 @@ as an attachment instead of being re-encoded into a picture.
   null}` clears it back to the unnamed state. Only active assets can be
   renamed; a trashed one is `409 asset_retired`, a purged one `409
   asset_purged`. Public URLs are untouched, because the name was never part of
-  one.
+  one. The original is served with `Cache-Control: public, max-age=300` and an
+  ETag that covers the name, so a rename reaches a cached copy within five
+  minutes instead of a year.
 - `PUT /api/v1/{kind}/{id}/data` — authenticated consumer-owned note. Body
   `{"data": "..."}`, or `{"data": null}` to clear. Atlas stores it, caps it at
   `ATLAS_MAX_CONSUMER_DATA_BYTES` (64 KiB) and hands it back untouched: it does
@@ -314,6 +316,12 @@ after it happens. The asset id never changes; a consumer that stores a srcset
 refreshes it from the re-encode's answer or from
 `GET /api/v1/images/{id}/srcset`.
 
+The original file is the other URL that is not immutable: its bytes never
+change, but its download name can be edited, so `/media/{id}/original` is
+cached for five minutes and its ETag covers the name. A cached copy therefore
+picks up a rename on its next revalidation instead of keeping the old name for
+a year.
+
 ```sh
 curl -X POST -H "Authorization: Bearer $ATLAS_API_TOKEN" \
   -H 'Content-Type: application/json' -d '{"re_encode": true}' \
@@ -438,7 +446,10 @@ is refused with `400 invalid_filename`. Delivery sends it as `Content-Dispositio
 inline; filename="…"; filename*=UTF-8''…`, falling back to `asset.pdf` when the
 upload had no name. The name can be changed later with `PUT
 /api/v1/{kind}/{id}/filename`; a JSON body is literal, so it is not
-percent-decoded the way the header is. Consumers that want a separate display
+percent-decoded the way the header is. The URL does not change with it, so the
+original is cached for five minutes rather than a year, and its ETag covers the
+name: after that window a revalidation returns the new `Content-Disposition`
+instead of a `304` carrying the old one. Consumers that want a separate display
 name should still keep it in their own database.
 
 ## Asking what Atlas can still serve
