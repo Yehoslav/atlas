@@ -113,6 +113,15 @@ clients rather than as part of the Atlas crate:
 To change Atlas itself, read [`CONTRIBUTING.md`](CONTRIBUTING.md) — the
 toolchain, the checks, and the working conventions.
 
+## Dependencies
+
+The service is a single Rust binary. At runtime it needs an ImageMagick 7 with
+the codecs and LCMS support described in
+[`CONTRIBUTING.md`](CONTRIBUTING.md); SQLite is compiled into the binary. Free
+space is read with `statvfs` through the `rustix` crate, which is pure Rust and
+adds no native build step or external command — shelling out to `df` would mean
+parsing human output.
+
 ## Status
 
 Atlas is a prototype, and it says so in its API. The HTTP contract is pre-1.0

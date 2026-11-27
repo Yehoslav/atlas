@@ -32,7 +32,7 @@ design record — the decisions and the reasoning behind them — is
 
 | Path | What is in it |
 | --- | --- |
-| `src/` | The service: `api.rs` (routes and responses), `store.rs` (SQLite), `media.rs` (ImageMagick), `model.rs`, `config.rs`, `ident.rs` (asset ids), `filename.rs` (upload names), `lib.rs` (wiring). |
+| `src/` | The service: `api.rs` (routes and responses), `store.rs` (SQLite), `media.rs` (ImageMagick), `disk.rs` (free space), `model.rs`, `config.rs`, `ident.rs` (asset ids), `filename.rs` (upload names), `lib.rs` (wiring). |
 | `migrations/` | Additive SQL migrations, applied at startup. `migrations/README.md` explains the SQLite constraints that shape them. |
 | `examples/family-album/` | A Flask consumer with its own database: the integration contract from the site side. |
 | `examples/cms-admin/` | A Rust consumer with no database at all: the same API seen from an operator's side. |

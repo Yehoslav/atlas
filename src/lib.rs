@@ -1,5 +1,6 @@
 mod api;
 pub mod config;
+mod disk;
 mod error;
 mod filename;
 mod ident;
@@ -80,6 +81,24 @@ impl AppState {
             Ok(0) => {}
             Ok(purged) => tracing::info!(purged, "purged expired trashed assets at startup"),
             Err(error) => tracing::error!(%error, "startup trash purge failed"),
+        }
+
+        // A restart onto a full disk must still start, serve reads, and let the
+        // operator purge: warning is the whole response here. Writes refuse
+        // themselves when they see the floor, which is the one place refusing
+        // is safe.
+        match disk::space(&state.config.data_dir) {
+            Ok(space) if space.free_bytes < state.config.min_free_bytes => {
+                tracing::warn!(
+                    free_bytes = space.free_bytes,
+                    min_free_bytes = state.config.min_free_bytes,
+                    "data directory is below the configured free-space floor; uploads and re-renders will be refused"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, "cannot read free space for the data directory");
+            }
         }
 
         // Jobs the previous process left queued or running continue here,

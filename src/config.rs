@@ -15,6 +15,9 @@ pub struct Config {
     pub max_image_bytes: u64,
     pub max_document_bytes: u64,
     pub max_consumer_data_bytes: u64,
+    /// Free space the data volume must keep before an upload is refused.
+    /// Zero disables the check.
+    pub min_free_bytes: u64,
     pub max_image_pixels: u64,
     pub max_image_dimension: u32,
     pub variant_widths: Vec<u32>,
@@ -129,6 +132,12 @@ impl Config {
                 )?,
                 "ATLAS_MAX_CONSUMER_DATA_BYTES",
             )?,
+            min_free_bytes: setting(
+                &file.min_free_bytes,
+                "ATLAS_MIN_FREE_BYTES",
+                1024 * 1024 * 1024,
+                parse_u64,
+            )?,
             max_image_pixels: positive(
                 setting(
                     &file.max_image_pixels,
@@ -201,6 +210,7 @@ struct FileConfig {
     max_image_bytes: Option<u64>,
     max_document_bytes: Option<u64>,
     max_consumer_data_bytes: Option<u64>,
+    min_free_bytes: Option<u64>,
     max_image_pixels: Option<u64>,
     max_image_dimension: Option<u32>,
     variant_widths: Option<Vec<u32>>,
@@ -414,6 +424,8 @@ mod tests {
             "ATLAS_ID_LENGTH",
             "ATLAS_MAX_IMAGE_BYTES",
             "ATLAS_MAX_DOCUMENT_BYTES",
+            "ATLAS_MAX_CONSUMER_DATA_BYTES",
+            "ATLAS_MIN_FREE_BYTES",
             "ATLAS_MAX_IMAGE_PIXELS",
             "ATLAS_MAX_IMAGE_DIMENSION",
             "ATLAS_VARIANT_WIDTHS",
@@ -461,6 +473,7 @@ mod tests {
             variant_widths = [400, 800]
             max_image_bytes = 1234
             max_consumer_data_bytes = 8192
+            min_free_bytes = 4096
             conversion_concurrency = 3
             "#,
         );
@@ -472,6 +485,7 @@ mod tests {
         assert_eq!(config.variant_widths, vec![400, 800]);
         assert_eq!(config.max_image_bytes, 1234);
         assert_eq!(config.max_consumer_data_bytes, 8192);
+        assert_eq!(config.min_free_bytes, 4096);
         assert_eq!(config.conversion_concurrency, 3);
     }
 
@@ -607,5 +621,28 @@ mod tests {
             Config::from_env().is_err(),
             "zero days would purge instantly"
         );
+    }
+
+    #[test]
+    fn min_free_bytes_defaults_to_one_gibibyte_and_zero_disables_the_floor() {
+        let _guard = env_lock();
+        base_env();
+        assert_eq!(
+            Config::from_env().unwrap().min_free_bytes,
+            1024 * 1024 * 1024
+        );
+
+        set_var("ATLAS_MIN_FREE_BYTES", "0");
+        assert_eq!(
+            Config::from_env().unwrap().min_free_bytes,
+            0,
+            "zero is the documented way to disable the upload floor"
+        );
+
+        set_var("ATLAS_MIN_FREE_BYTES", "2048");
+        assert_eq!(Config::from_env().unwrap().min_free_bytes, 2048);
+
+        set_var("ATLAS_MIN_FREE_BYTES", "lots");
+        assert!(Config::from_env().is_err());
     }
 }

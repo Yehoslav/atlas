@@ -296,7 +296,8 @@ collections.
 - `POST /api/v1/{kind}/actions` — authenticated bulk `pin`, `unpin`, `delete`,
   or `restore` for up to 500 caller-supplied ids, validated all-or-nothing.
 - `GET /api/v1/summary` — authenticated counts and stored bytes, trash included,
-  and the rendition widths the instance generates.
+  the rendition widths the instance generates, and the data volume's free and
+  total bytes plus the upload floor.
 - `GET /api/v1/formats` — authenticated accepted media types per collection,
   the `mime` groups they answer to, and whether renditions are generated.
   One media type per format in `formats`, every accepted spelling in
@@ -354,6 +355,14 @@ uploads, or arbitrary URL transformations.
 ## Upload validation and processing limits
 
 - Stream request bodies to disk; never buffer an entire upload in memory.
+- Before the body is read, refuse an upload with `507 insufficient_storage`
+  when the data volume has less than `ATLAS_MIN_FREE_BYTES` free (1 GiB by
+  default; `0` disables). A re-render checks the same floor before converting,
+  because it writes new rendition files too. The probe is a live `statvfs`, and
+  the floor is fail-fast, not a reservation: a disk that fills mid-write still
+  produces a clean error. Startup warns below the floor but still starts, so a
+  restart onto a full disk can serve reads and be purged. `summary` reports the
+  same free and total figures and the floor.
 - Defaults: 20 MiB per image, 50 MiB per document, 40 megapixels, and 12,000
   pixels maximum on either image edge. Configure byte/pixel limits with
   environment variables.
@@ -381,8 +390,9 @@ uploads, or arbitrary URL transformations.
 HTTP errors use a small JSON envelope. Relevant statuses include `401`
 unauthorized, `409` when a purged asset cannot be restored, `413` upload too
 large, `415` unsupported/mismatched media type, `422` invalid or
-unprocessable media, and `406` when no stored format matches the request's
-`Accept` header. Two `404` codes separate "no such asset"
+unprocessable media, `507 insufficient_storage` when the data volume is below
+its configured free-space floor, and `406` when no stored format matches the
+request's `Accept` header. Two `404` codes separate "no such asset"
 (`asset_not_found`) from "that asset holds no rendition this narrow"
 (`rendition_not_found`, which lists the stored widths); a third
 (`job_not_found`) covers an unknown re-render job id. Metadata that records a

@@ -73,12 +73,19 @@ as an attachment instead of being re-encoded into a picture.
   one unknown id, a duplicate, or an action the current state does not allow
   rejects the whole batch with `400` and changes nothing.
 - `GET /api/v1/summary` — authenticated counts and stored bytes for the whole
-  instance, including the trash, and the `rendition_widths` the instance
-  generates. A cheap dashboard number, not a listing. The widths are there
-  because the configuration is otherwise invisible: a consumer can only find
-  them out by listing every asset and reading the renditions of each one,
-  which is how a deployment with the wrong widths finds out that every one of
-  its assets is missing a width its site needs.
+  instance, including the trash, the `rendition_widths` the instance
+  generates, and the data volume's `data_dir_free_bytes`,
+  `data_dir_total_bytes`, and `min_free_bytes`, the free-space floor below
+  which uploads are refused. A cheap dashboard number, not a listing. The
+  widths are there because the configuration is otherwise invisible: a
+  consumer can only find them out by listing every asset and reading the
+  renditions of each one, which is how a deployment with the wrong widths
+  finds out that every one of its assets is missing a width its site needs.
+  The free-space figures are a live reading; `min_free_bytes` is the configured
+  floor, reported so a caller can show headroom without duplicating a
+  deployment setting it cannot read. Both free-space fields are `null` if the
+  filesystem cannot be read: the counts are still useful without them. The
+  floor itself is described under [Configuration](configuration.md).
 - `GET /api/v1/formats` — authenticated list of what each collection accepts,
   the `mime` groups they answer to, and whether they get renditions. Derived
   from the same table the upload path validates against, so it cannot
@@ -389,6 +396,15 @@ already existed in that collection and this is that asset — identical content 
 the same asset, because URLs are immutable and content is what identifies one. A
 duplicate costs a hash rather than an image conversion, and a retry after a
 timeout gets the same asset instead of a second copy.
+
+When the data volume has less than `ATLAS_MIN_FREE_BYTES` (1 GiB by default)
+free, an upload is refused with `507 insufficient_storage` before the body is
+read, so a bulk import on a filling disk fails fast instead of streaming into
+staging. A re-render writes new rendition files, so it is refused the same way
+before it starts converting. The threshold is a guard, not a reservation: a
+disk that fills during a write still produces a clean error. Reads, deletes and
+restores keep working below the floor — an operator needs them to free space.
+Set the floor to `0` to disable it.
 
 The name is optional metadata and is never used as a path: the file on disk is
 named after the asset ID and the detected format. It arrives as raw UTF-8 or
