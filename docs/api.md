@@ -513,7 +513,9 @@ curl -X POST \
 - **The queue is bounded.** At most 200 accepted uploads may wait to convert.
   Past that an async upload is `503 upload_queue_full`, checked before the body
   is read; a synchronous upload is not affected. Conversions run under the same
-  `ATLAS_CONVERSION_CONCURRENCY` and time limits as everything else.
+  `ATLAS_CONVERSION_CONCURRENCY` and time limits as everything else, and the
+  backlog does not queue ahead of them: a synchronous upload or a re-render
+  waits behind at most one async conversion per permit, not the whole queue.
 - **Images only.** A document is stored untouched, so there is nothing to
   detach: `POST /api/v1/documents?async=true` is `400 async_not_supported`.
 

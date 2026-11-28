@@ -575,7 +575,8 @@ pub(super) async fn upload_document(
 ///
 /// Accepted work is a promise with bytes on disk behind it, so it is bounded
 /// the way intake is: past the cap the answer is `503`, and synchronous
-/// uploads, which wait for nobody's queue, keep working.
+/// uploads keep working: the backlog waits behind its own slots, so a
+/// synchronous conversion waits for at most one conversion per permit.
 pub(crate) const MAX_PENDING_UPLOADS: usize = 200;
 
 /// The query an upload accepts. Uploads are raw bodies, so the one flag rides
@@ -3704,6 +3705,16 @@ async fn convert_and_promote(
             job.id
         )));
     }
+
+    // Taken before anything is staged, so the backlog waits here and not in
+    // the conversion permits' queue, where it would sit ahead of every
+    // synchronous upload and re-render that arrives after it.
+    let _slot = state
+        .upload_job_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(ApiError::internal)?;
 
     let staging_dir = state.staging_dir(&job.asset_id);
     let _ = fs::remove_dir_all(&staging_dir).await;
@@ -8967,6 +8978,51 @@ mod tests {
         // The kept original goes once the job is terminal.
         let uploads = directory.path().join("atlas/uploads").join(&job_id);
         assert!(!uploads.exists(), "the job's original outlived the job");
+    }
+
+    /// The async backlog waits behind its own slots, not in the conversion
+    /// permits' queue: a synchronous upload that arrives after three accepted
+    /// uploads converts as soon as the one already queued is done.
+    #[tokio::test]
+    async fn a_sync_upload_does_not_wait_behind_the_async_backlog() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let held = hold_conversions(&state).await;
+        let router = app(state.clone());
+
+        let mut jobs = Vec::new();
+        for size in ["400x300", "401x300", "402x300"] {
+            let image = write_test_image(&directory.path().join(format!("{size}.png")), size);
+            jobs.push(accept_async_upload(&router, image).await.1);
+        }
+        // Let the first job reach the conversion permits' queue.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(state.upload_job_slots.available_permits(), 0);
+
+        let sync = tokio::spawn({
+            let router = router.clone();
+            let image = write_test_image(&directory.path().join("sync.png"), "403x300");
+            async move { send(&router, upload_request("image/png", image)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(held);
+
+        let (status, created) = sync.await.unwrap();
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let (_, last) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/uploads/{}", jobs[2])),
+        )
+        .await;
+        assert_eq!(
+            last["state"], "converting",
+            "the sync upload waited for the whole backlog"
+        );
+        for job in &jobs {
+            assert_eq!(wait_for_upload_job(&router, job).await["state"], "ready");
+        }
     }
 
     /// A process that dies mid-conversion leaves the job `converting` with its

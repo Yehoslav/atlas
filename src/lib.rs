@@ -41,6 +41,11 @@ pub struct AppState {
     pub(crate) image_processor: ImageProcessor,
     pub(crate) upload_slots: Arc<Semaphore>,
     pub(crate) conversion_slots: Arc<Semaphore>,
+    /// How many async uploads may convert or wait for a conversion permit at
+    /// once: as many as there are permits. The rest of the backlog waits
+    /// here, so a synchronous upload or a re-render queues behind at most
+    /// one conversion per permit, not behind every accepted upload.
+    pub(crate) upload_job_slots: Arc<Semaphore>,
     asset_conversion_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     /// Serializes accepting an async upload against the queue cap and
     /// promoting one against the hash check. Both are a read and a write that
@@ -87,6 +92,7 @@ impl AppState {
             image_processor,
             upload_slots: Arc::new(Semaphore::new(2)),
             conversion_slots: Arc::new(Semaphore::new(conversion_concurrency)),
+            upload_job_slots: Arc::new(Semaphore::new(conversion_concurrency)),
             asset_conversion_locks: Arc::new(Mutex::new(HashMap::new())),
             upload_jobs_lock: Arc::new(Mutex::new(())),
             max_pending_uploads: api::MAX_PENDING_UPLOADS,
