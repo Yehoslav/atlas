@@ -516,6 +516,8 @@ curl -X POST \
   `ATLAS_CONVERSION_CONCURRENCY` and time limits as everything else, and the
   backlog does not queue ahead of them: a synchronous upload or a re-render
   waits behind at most one async conversion per permit, not the whole queue.
+  The free-space floor is checked again right before a job writes its
+  renditions; below it the job fails with `insufficient_storage`.
 - **Images only.** A document is stored untouched, so there is nothing to
   detach: `POST /api/v1/documents?async=true` is `400 async_not_supported`.
 

@@ -3715,6 +3715,10 @@ async fn convert_and_promote(
         .acquire_owned()
         .await
         .map_err(ApiError::internal)?;
+    // Intake checked the floor, but the renditions are written now, maybe
+    // long after: the job is held to it again right before it writes, the
+    // way a re-render is.
+    ensure_free_space(state)?;
 
     let staging_dir = state.staging_dir(&job.asset_id);
     let _ = fs::remove_dir_all(&staging_dir).await;
@@ -9068,6 +9072,32 @@ mod tests {
         )
         .await;
         assert_eq!(again, job);
+    }
+
+    /// The floor is checked again when a job converts, not only at intake:
+    /// a job that would write its renditions below it fails with `507`'s
+    /// code instead, and its kept original goes.
+    #[tokio::test]
+    async fn an_async_upload_below_the_floor_fails_when_it_converts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        let first = AppState::new(config.clone()).await.unwrap();
+        let _dead = hold_conversions(&first).await;
+        let (_, job_id) = accept_async_upload(
+            &app(first),
+            write_test_image(&directory.path().join("floor.png"), "400x300"),
+        )
+        .await;
+
+        // The disk filled while the job waited: the next process converts it
+        // under a floor no volume can meet.
+        config.min_free_bytes = u64::MAX;
+        let router = app(AppState::new(config.clone()).await.unwrap());
+        let job = wait_for_upload_job(&router, &job_id).await;
+        assert_eq!(job["state"], "failed", "{job}");
+        assert_eq!(job["error"]["code"], "insufficient_storage", "{job}");
+        assert_eq!(image_total(&router).await, 0);
+        assert!(!config.data_dir.join("uploads").join(&job_id).exists());
     }
 
     /// Two async uploads of the same bytes, both accepted before either
