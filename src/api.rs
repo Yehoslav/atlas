@@ -34,7 +34,10 @@ use crate::{
     error::{ApiError, ErrorResponse},
     filename,
     ident::AssetId,
-    media::{MediaError, detect_multiframe, sha256_bytes, sha256_file, validate_signature},
+    media::{
+        ImageDimensions, MediaError, detect_multiframe, sha256_bytes, sha256_file,
+        validate_signature,
+    },
     model::{
         AssetRecord, AssetState, Kind, RenditionFormat, RenditionRecord, SourceFormat, StoredAsset,
     },
@@ -764,33 +767,8 @@ async fn create_asset(
     }
 
     let (dimensions, renditions) = if kind.generates_renditions() {
-        let _permit = state
-            .conversion_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(ApiError::internal)?;
-        let processed = tokio::time::timeout(state.config.image_processing_timeout, async {
-            let dimensions = state
-                .image_processor
-                .inspect(&original_path, source_format, staging_dir)
-                .await?;
-            let renditions = state
-                .image_processor
-                .generate(
-                    &original_path,
-                    source_format,
-                    dimensions,
-                    &state.config.variant_widths,
-                    staging_dir,
-                )
-                .await?;
-            Ok::<_, MediaError>((dimensions, renditions))
-        })
-        .await
-        .map_err(|_| ApiError::invalid("Image processing exceeded its time limit."))?
-        .map_err(map_media_error)?;
-        let (dimensions, renditions) = processed;
+        let (dimensions, renditions) =
+            convert_original(state, &original_path, source_format, staging_dir).await?;
         (Some(dimensions), renditions)
     } else {
         (None, Vec::new())
@@ -860,6 +838,44 @@ async fn create_asset(
     schedule_purge(state);
 
     Ok((StatusCode::CREATED, Json(AssetResponse::from(&stored))))
+}
+
+/// Inspect an original and write its renditions beside it in `staging_dir`,
+/// under a conversion permit and the per-image time limit. The synchronous
+/// upload and the detached one convert through this, so they share one set
+/// of bounds.
+async fn convert_original(
+    state: &AppState,
+    original_path: &std::path::Path,
+    source_format: SourceFormat,
+    staging_dir: &std::path::Path,
+) -> Result<(ImageDimensions, Vec<RenditionRecord>), ApiError> {
+    let _permit = state
+        .conversion_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(ApiError::internal)?;
+    tokio::time::timeout(state.config.image_processing_timeout, async {
+        let dimensions = state
+            .image_processor
+            .inspect(original_path, source_format, staging_dir)
+            .await?;
+        let renditions = state
+            .image_processor
+            .generate(
+                original_path,
+                source_format,
+                dimensions,
+                &state.config.variant_widths,
+                staging_dir,
+            )
+            .await?;
+        Ok::<_, MediaError>((dimensions, renditions))
+    })
+    .await
+    .map_err(|_| ApiError::invalid("Image processing exceeded its time limit."))?
+    .map_err(map_media_error)
 }
 
 /// Sweep expired trash in the background. There is no scheduler, so an upload is

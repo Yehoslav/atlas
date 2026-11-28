@@ -336,6 +336,7 @@ fn escape_like(value: &str) -> String {
 
 /// Outcome of an insert, distinguishing a lost ID race from a real failure so
 /// the caller can retry with a freshly generated ID.
+#[derive(Debug, Eq, PartialEq)]
 pub enum InsertOutcome {
     Created,
     DuplicateId,
@@ -433,6 +434,21 @@ impl Store {
         renditions: &[RenditionRecord],
     ) -> Result<InsertOutcome, StoreError> {
         let mut transaction = self.pool.begin().await?;
+        let outcome = Self::insert_asset_rows(&mut transaction, asset, renditions).await?;
+        if outcome == InsertOutcome::Created {
+            transaction.commit().await?;
+        }
+        Ok(outcome)
+    }
+
+    /// The asset row and its renditions, inside a caller's transaction. A
+    /// lost id race is reported before anything else is written, and the
+    /// caller rolls back by dropping the transaction.
+    async fn insert_asset_rows(
+        connection: &mut sqlx::SqliteConnection,
+        asset: &AssetRecord,
+        renditions: &[RenditionRecord],
+    ) -> Result<InsertOutcome, StoreError> {
         let insert = sqlx::query(
             "INSERT INTO assets (id, source_format, bytes, sha256, width, height, created_at,
                                  original_name, kind)
@@ -447,7 +463,7 @@ impl Store {
         .bind(asset.created_at)
         .bind(&asset.original_name)
         .bind(asset.kind.map(Kind::key))
-        .execute(&mut *transaction)
+        .execute(&mut *connection)
         .await;
 
         if let Err(error) = insert {
@@ -472,11 +488,10 @@ impl Store {
             .bind(i64::try_from(rendition.bytes).unwrap_or(i64::MAX))
             .bind(&rendition.sha256)
             .bind(&rendition.file_name)
-            .execute(&mut *transaction)
+            .execute(&mut *connection)
             .await?;
         }
 
-        transaction.commit().await?;
         Ok(InsertOutcome::Created)
     }
 
