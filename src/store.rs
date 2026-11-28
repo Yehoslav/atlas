@@ -1004,7 +1004,11 @@ impl Store {
         job: &NewUploadJob<'_>,
         cap: usize,
     ) -> Result<CreateUploadJob, StoreError> {
-        let mut transaction = self.pool.begin().await?;
+        // Immediate, because it reads before it writes: a deferred
+        // transaction would fail with `SQLITE_BUSY_SNAPSHOT`, which the busy
+        // timeout does not retry, if any other connection committed between
+        // the two.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let converting: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM upload_jobs WHERE state = 'converting'")
                 .fetch_one(&mut *transaction)
@@ -1099,7 +1103,10 @@ impl Store {
         renditions: &[RenditionRecord],
         updated_at: i64,
     ) -> Result<PromoteUpload, StoreError> {
-        let mut transaction = self.pool.begin().await?;
+        // Immediate for the reason `create_upload_job` is: a sync upload or a
+        // metadata edit committing between the reads and the insert would
+        // otherwise fail a conversion that already succeeded.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let state: Option<String> =
             sqlx::query_scalar("SELECT state FROM upload_jobs WHERE id = ?")
                 .bind(job_id)

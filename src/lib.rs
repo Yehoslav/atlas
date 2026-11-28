@@ -44,8 +44,9 @@ pub struct AppState {
     asset_conversion_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     /// Serializes accepting an async upload against the queue cap and
     /// promoting one against the hash check. Both are a read and a write that
-    /// must not interleave with another of their kind, and SQLite's deferred
-    /// transactions alone would let them.
+    /// must not interleave with another of their kind. Their transactions are
+    /// immediate, so SQLite serializes them too; the lock makes this
+    /// process's own jobs queue here rather than on the busy timeout.
     pub(crate) upload_jobs_lock: Arc<Mutex<()>>,
     /// How many accepted async uploads may wait to convert at once.
     pub(crate) max_pending_uploads: usize,
