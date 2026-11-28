@@ -40,7 +40,9 @@ as an attachment instead of being re-encoded into a picture.
   `image/avif`, `image/jxl` or `image/heic`, and
   the optional `X-Original-Filename` header names it. Streams to disk, generates
   the configured renditions, and returns an asset ID, original metadata, and
-  rendition URLs.
+  rendition URLs. With `?async=true` the bytes are checked the same way but the
+  conversion runs detached: the answer is `202` with the reserved `id` and a
+  `job_id`. See [Uploading without waiting](#uploading-without-waiting).
   A HEIC photograph may also be declared as `image/heif`: freedesktop.org
   makes `image/heif` the canonical type for a `.heic` file and keeps
   `image/heic` as its alias, so a browser, a file manager and a command line
@@ -235,6 +237,11 @@ as an attachment instead of being re-encoded into a picture.
   failures are results, not job failures.
 - `GET /api/v1/images/re-render/{job_id}` — authenticated status of one
   re-render job, as described above. An unknown or malformed id is `404
+  job_not_found`.
+- `GET /api/v1/uploads/{job_id}` — authenticated status of one async upload:
+  `state` (`converting`, `ready`, `failed`), the reserved `id`, on `ready` the
+  `asset` a synchronous upload would have answered with, and on `failed` the
+  `error` it would have answered with. An unknown or malformed id is `404
   job_not_found`.
 
 Uploads are content-addressed within their collection. If the exact bytes are
@@ -464,6 +471,51 @@ before it starts converting. The threshold is a guard, not a reservation: a
 disk that fills during a write still produces a clean error. Reads, deletes and
 restores keep working below the floor — an operator needs them to free space.
 Set the floor to `0` to disable it.
+
+### Uploading without waiting
+
+A synchronous image upload holds the request for every rendition, which for a
+gallery or a feed import is minutes per batch and a proxy timeout away from
+sending the bytes again. Add `?async=true` and the request ends once the bytes
+are known to be acceptable:
+
+```sh
+curl -X POST \
+  -H "Authorization: Bearer $ATLAS_API_TOKEN" \
+  -H 'Content-Type: image/jpeg' \
+  --data-binary @harbour.jpg \
+  'http://127.0.0.1:3000/api/v1/images?async=true'
+# 202 {"id":"4f2k9xq7m1b8w3z0pd","job_id":"q81mz0c4x7a2w9k3ef"}
+```
+
+- **Refusal stays synchronous.** The byte limit, the signature check, the
+  multi-frame refusal and the disk floor all run before the `202`, with the
+  same statuses as a synchronous upload. A decoded-size limit is only known
+  once ImageMagick reads the file, so that one fails the job instead.
+- **Nothing partial is visible.** The `id` is reserved, not published: every
+  metadata route and every `/media` URL answers `404` for it until the job is
+  `ready`, and then the asset appears with all its renditions at once.
+- **Poll the job.** `GET /api/v1/uploads/{job_id}` answers `converting`, then
+  `ready` with `asset` — the same body a `201` carries — or `failed` with
+  `error` — the code and message a synchronous upload of the same bytes would
+  have answered with. The status is a one-shot resource: it carries no `ETag`
+  and is not meant to be cached.
+- **Duplicates.** Bytes already live in the collection answer `200` with that
+  asset at once, as a synchronous upload does; there is nothing to convert.
+  Identical bytes accepted twice before either converted are reconciled when
+  they are published: the second one becomes `ready` with the first one's
+  asset, marked `"deduplicated": true`, and its own reserved id stays unused.
+  Use `asset.id` from the poll, not the `id` from the `202`, in your records.
+- **A restart does not lose the upload.** The original is kept until the job
+  finishes; a job interrupted mid-conversion converts again at startup and is
+  published once, under the same id. Finished jobs are pruned after the trash
+  retention window.
+- **The queue is bounded.** At most 200 accepted uploads may wait to convert.
+  Past that an async upload is `503 upload_queue_full`, checked before the body
+  is read; a synchronous upload is not affected. Conversions run under the same
+  `ATLAS_CONVERSION_CONCURRENCY` and time limits as everything else.
+- **Images only.** A document is stored untouched, so there is nothing to
+  detach: `POST /api/v1/documents?async=true` is `400 async_not_supported`.
 
 The name is optional metadata and is never used as a path: the file on disk is
 named after the asset ID and the detected format. In the upload header it

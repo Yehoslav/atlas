@@ -323,7 +323,10 @@ asset the database does not know about (harmless — startup recovery removes
 unindexed directories) rather than missing one (broken delivery until the next
 upload). Note that files copied while Atlas is running can be mid-upload; the
 staging directory is never published, so ignore it and let startup recovery
-clear it.
+clear it. The `uploads` directory holds the originals of async uploads still
+waiting to convert; back it up with the database if those uploads should
+survive a restore, since a restored job without its original fails instead
+of converting.
 
 **Restore drill.** Stop Atlas, restore both halves, start it, and check:
 

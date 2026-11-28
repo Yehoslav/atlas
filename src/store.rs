@@ -173,6 +173,94 @@ pub struct ReRenderJobItemRow {
     pub error_message: Option<String>,
 }
 
+/// The lifecycle of an asynchronous upload conversion.
+///
+/// There is no `queued` state apart from `converting`: an accepted upload is
+/// either waiting for a conversion permit or holding one, and the difference
+/// is not something a consumer can act on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UploadJobState {
+    Converting,
+    Ready,
+    Failed,
+}
+
+impl UploadJobState {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Converting => "converting",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "converting" => Some(Self::Converting),
+            "ready" => Some(Self::Ready),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One accepted upload as stored: what intake learned about the bytes, the id
+/// it reserved, and how the conversion ended.
+#[derive(Clone, Debug)]
+pub struct UploadJobRow {
+    pub id: String,
+    pub asset_id: AssetId,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub state: UploadJobState,
+    pub source_format: SourceFormat,
+    pub bytes: u64,
+    pub sha256: String,
+    pub original_name: Option<String>,
+    /// The asset a `ready` job resolved to.
+    pub result_id: Option<AssetId>,
+    pub deduplicated: bool,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+/// The fields intake hands to a new upload job.
+pub struct NewUploadJob<'a> {
+    pub id: &'a str,
+    pub asset_id: &'a AssetId,
+    pub created_at: i64,
+    pub source_format: SourceFormat,
+    pub bytes: u64,
+    pub sha256: &'a str,
+    pub original_name: Option<&'a str>,
+}
+
+/// Why an upload job was or was not written.
+#[derive(Debug, Eq, PartialEq)]
+pub enum CreateUploadJob {
+    Created,
+    /// The reserved asset id is already an asset or another job's: generate
+    /// a new one and try again.
+    DuplicateId,
+    /// As many uploads as the cap allows are already waiting to convert.
+    Full,
+}
+
+/// How promoting a converted upload ended.
+#[derive(Debug, Eq, PartialEq)]
+pub enum PromoteUpload {
+    /// The asset row and its renditions are committed under the reserved id.
+    Created,
+    /// A live image with the same bytes was committed while this one was
+    /// converting; the job resolved to it and nothing was inserted.
+    Deduplicated(AssetId),
+    /// The reserved id was taken by an asset after the job reserved it.
+    DuplicateId,
+    /// The job is no longer converting — promoted or failed already — so
+    /// nothing was written. A second promotion is refused here.
+    NotConverting,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Order {
     Asc,
@@ -905,6 +993,199 @@ impl Store {
         Ok(result.rows_affected() as usize)
     }
 
+    /// Accept an upload for detached conversion, unless the queue is full or
+    /// the reserved id is already somebody's.
+    ///
+    /// The count and the insert share one transaction, and the caller holds
+    /// the process's upload-jobs lock around it, so the cap is exact rather
+    /// than a number two concurrent intakes can both slip under.
+    pub async fn create_upload_job(
+        &self,
+        job: &NewUploadJob<'_>,
+        cap: usize,
+    ) -> Result<CreateUploadJob, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let converting: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_jobs WHERE state = 'converting'")
+                .fetch_one(&mut *transaction)
+                .await?;
+        if converting >= i64::try_from(cap).unwrap_or(i64::MAX) {
+            return Ok(CreateUploadJob::Full);
+        }
+        let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM assets WHERE id = ?)")
+            .bind(job.asset_id.as_str())
+            .fetch_one(&mut *transaction)
+            .await?;
+        if taken {
+            return Ok(CreateUploadJob::DuplicateId);
+        }
+        let insert = sqlx::query(
+            "INSERT INTO upload_jobs
+                 (id, asset_id, created_at, updated_at, state, source_format, bytes, sha256,
+                  original_name)
+             VALUES (?, ?, ?, ?, 'converting', ?, ?, ?, ?)",
+        )
+        .bind(job.id)
+        .bind(job.asset_id.as_str())
+        .bind(job.created_at)
+        .bind(job.created_at)
+        .bind(job.source_format.key())
+        .bind(i64::try_from(job.bytes).unwrap_or(i64::MAX))
+        .bind(job.sha256)
+        .bind(job.original_name)
+        .execute(&mut *transaction)
+        .await;
+        if let Err(error) = insert {
+            return if Self::is_unique_violation(&error) {
+                Ok(CreateUploadJob::DuplicateId)
+            } else {
+                Err(StoreError::Database(error))
+            };
+        }
+        transaction.commit().await?;
+        Ok(CreateUploadJob::Created)
+    }
+
+    /// How many accepted uploads are waiting to convert, for refusing a new
+    /// one before its body is read. [`Self::create_upload_job`] repeats the
+    /// count where it is authoritative.
+    pub async fn converting_upload_count(&self) -> Result<usize, StoreError> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_jobs WHERE state = 'converting'")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// One upload job, or `None` if Atlas has never heard of the id.
+    pub async fn upload_job(&self, id: &str) -> Result<Option<UploadJobRow>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, asset_id, created_at, updated_at, state, source_format, bytes, sha256,
+                    original_name, result_id, deduplicated, error_code, error_message
+             FROM upload_jobs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(upload_job_from_row).transpose()
+    }
+
+    /// Uploads a restarted process converts again: every job still
+    /// `converting`, oldest first, so they are promoted in the order they
+    /// were accepted.
+    pub async fn converting_upload_jobs(&self) -> Result<Vec<UploadJobRow>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, asset_id, created_at, updated_at, state, source_format, bytes, sha256,
+                    original_name, result_id, deduplicated, error_code, error_message
+             FROM upload_jobs WHERE state = 'converting' ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(upload_job_from_row).collect()
+    }
+
+    /// Publish a converted upload: the asset row, its renditions and the
+    /// job's `ready` state in one transaction, so a poll never sees `ready`
+    /// without the asset and the asset never exists without its job saying
+    /// so.
+    ///
+    /// The hash is checked again here, against assets committed while this
+    /// one converted, and the caller holds the upload-jobs lock: two async
+    /// uploads of the same bytes converge on the first one promoted.
+    pub async fn promote_upload_job(
+        &self,
+        job_id: &str,
+        asset: &AssetRecord,
+        renditions: &[RenditionRecord],
+        updated_at: i64,
+    ) -> Result<PromoteUpload, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM upload_jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if state.as_deref() != Some(UploadJobState::Converting.key()) {
+            return Ok(PromoteUpload::NotConverting);
+        }
+
+        let kind = asset.kind.unwrap_or(Kind::Image);
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM assets
+             WHERE sha256 = ? AND kind = ? AND deleted_at IS NULL
+             ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(&asset.sha256)
+        .bind(kind.key())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let existing = existing.and_then(|id| AssetId::parse(&id).ok());
+
+        let (result_id, deduplicated) = match &existing {
+            Some(existing) => (existing.clone(), true),
+            None => {
+                match Self::insert_asset_rows(&mut transaction, asset, renditions).await? {
+                    InsertOutcome::Created => {}
+                    InsertOutcome::DuplicateId => return Ok(PromoteUpload::DuplicateId),
+                }
+                (asset.id.clone(), false)
+            }
+        };
+        sqlx::query(
+            "UPDATE upload_jobs SET state = 'ready', result_id = ?, deduplicated = ?,
+                                    updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(result_id.as_str())
+        .bind(deduplicated)
+        .bind(updated_at)
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(match existing {
+            Some(existing) => PromoteUpload::Deduplicated(existing),
+            None => PromoteUpload::Created,
+        })
+    }
+
+    /// Record why a conversion failed. Only a converting job moves, so a late
+    /// failure cannot overwrite a promotion.
+    pub async fn fail_upload_job(
+        &self,
+        id: &str,
+        updated_at: i64,
+        code: &str,
+        message: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE upload_jobs SET state = 'failed', error_code = ?, error_message = ?,
+                                    updated_at = ?
+             WHERE id = ? AND state = 'converting'",
+        )
+        .bind(code)
+        .bind(message)
+        .bind(updated_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Drop terminal upload jobs last touched before `before`, the same
+    /// retention bargain re-render jobs make. Converting jobs are never
+    /// touched: their reserved id is a promise still being kept.
+    pub async fn prune_upload_jobs(&self, before: i64) -> Result<usize, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM upload_jobs
+             WHERE state IN ('ready', 'failed') AND updated_at < ?",
+        )
+        .bind(before)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() as usize)
+    }
+
     /// SQLite extended result codes for a primary-key or unique constraint failure.
     fn is_unique_violation(error: &sqlx::Error) -> bool {
         match error {
@@ -1446,6 +1727,38 @@ impl Store {
             "no rendition is stored as {file_name}"
         );
     }
+}
+
+/// Decode an upload job row. A row that does not parse is corruption, not a
+/// miss: a status poll must not read a damaged job as an unknown one.
+fn upload_job_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<UploadJobRow, StoreError> {
+    let id: String = row.try_get("id")?;
+    let corrupt = |what: &str| StoreError::Corrupt(format!("upload job {id:?} has {what}"));
+    let asset_id = AssetId::parse(&row.try_get::<String, _>("asset_id")?)
+        .map_err(|_| corrupt("an invalid asset id"))?;
+    let state = row.try_get::<String, _>("state")?;
+    let state = UploadJobState::from_key(&state).ok_or_else(|| corrupt("an unknown state"))?;
+    let source_format = SourceFormat::from_database(&row.try_get::<String, _>("source_format")?)
+        .ok_or_else(|| corrupt("an unknown source format"))?;
+    let result_id = row
+        .try_get::<Option<String>, _>("result_id")?
+        .map(|value| AssetId::parse(&value).map_err(|_| corrupt("an invalid result id")))
+        .transpose()?;
+    Ok(UploadJobRow {
+        asset_id,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        state,
+        source_format,
+        bytes: row.try_get::<i64, _>("bytes")?.max(0) as u64,
+        sha256: row.try_get("sha256")?,
+        original_name: row.try_get("original_name")?,
+        result_id,
+        deduplicated: row.try_get::<bool, _>("deduplicated")?,
+        error_code: row.try_get("error_code")?,
+        error_message: row.try_get("error_message")?,
+        id,
+    })
 }
 
 /// Build an `AssetRecord` from a row that selected the asset columns.

@@ -42,6 +42,13 @@ pub struct AppState {
     pub(crate) upload_slots: Arc<Semaphore>,
     pub(crate) conversion_slots: Arc<Semaphore>,
     asset_conversion_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    /// Serializes accepting an async upload against the queue cap and
+    /// promoting one against the hash check. Both are a read and a write that
+    /// must not interleave with another of their kind, and SQLite's deferred
+    /// transactions alone would let them.
+    pub(crate) upload_jobs_lock: Arc<Mutex<()>>,
+    /// How many accepted async uploads may wait to convert at once.
+    pub(crate) max_pending_uploads: usize,
     pub(crate) last_purge: Arc<Mutex<Option<Instant>>>,
     /// The OpenAPI document, built once in `app()` from the same handlers the
     /// router serves. Empty until then, which is why the handler expects it.
@@ -55,6 +62,7 @@ impl AppState {
         create_private_dir(&config.data_dir.join("staging"), true).await?;
         create_private_dir(&config.data_dir.join("assets"), true).await?;
         create_private_dir(&config.data_dir.join("trash"), true).await?;
+        create_private_dir(&config.data_dir.join("uploads"), true).await?;
 
         let store = Store::connect(&config.data_dir.join("atlas.sqlite3")).await?;
         recover_incomplete_storage(&config.data_dir, &store).await?;
@@ -79,6 +87,8 @@ impl AppState {
             upload_slots: Arc::new(Semaphore::new(2)),
             conversion_slots: Arc::new(Semaphore::new(conversion_concurrency)),
             asset_conversion_locks: Arc::new(Mutex::new(HashMap::new())),
+            upload_jobs_lock: Arc::new(Mutex::new(())),
+            max_pending_uploads: api::MAX_PENDING_UPLOADS,
             last_purge: Arc::new(Mutex::new(None)),
             openapi: Arc::new(OnceLock::new()),
         };
@@ -111,6 +121,7 @@ impl AppState {
         // before the service answers requests: the connection that started
         // them is long gone, which is the point of a job.
         api::resume_re_render_jobs(state.clone()).await;
+        api::resume_upload_jobs(state.clone()).await;
 
         Ok(state)
     }
@@ -121,6 +132,13 @@ impl AppState {
 
     pub(crate) fn staging_dir(&self, id: &AssetId) -> PathBuf {
         self.config.data_dir.join("staging").join(id.as_str())
+    }
+
+    /// Where an accepted async upload keeps its original until the job is
+    /// terminal. Outside `staging/`, which startup empties, so a crash
+    /// mid-conversion converts the same bytes again.
+    pub(crate) fn upload_job_dir(&self, job_id: &str) -> PathBuf {
+        self.config.data_dir.join("uploads").join(job_id)
     }
 
     pub(crate) fn trash_dir(&self, id: &AssetId) -> PathBuf {
@@ -252,7 +270,8 @@ async fn remove_path(path: &Path) -> std::io::Result<()> {
 /// Bring the stored files back in line with the index after a crash.
 ///
 /// Staging is always discarded, and a directory with no row is un-published
-/// work. Anything else is moved back to where its row says it belongs, so an
+/// work. An async upload's original survives only while its job is still
+/// converting, which is what lets the job resume. Anything else is moved back to where its row says it belongs, so an
 /// interrupted delete or restore converges. The trash itself is left alone: a
 /// trashed asset is a deliberate state, not a crash artifact, and only the
 /// retention sweep discards it.
@@ -264,6 +283,26 @@ async fn recover_incomplete_storage(
     let mut entries = tokio::fs::read_dir(&staging_dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         remove_path(&entry.path()).await?;
+    }
+
+    // An upload waiting to convert keeps its original; anything else here is
+    // left over from a job that already finished, or from an intake that
+    // crashed between moving its bytes and writing its row.
+    let converting: std::collections::HashSet<String> = store
+        .converting_upload_jobs()
+        .await?
+        .into_iter()
+        .map(|job| job.id)
+        .collect();
+    let mut entries = tokio::fs::read_dir(data_dir.join("uploads")).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let keep = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| converting.contains(name));
+        if !keep {
+            remove_path(&entry.path()).await?;
+        }
     }
 
     let states = store.asset_states().await?;
@@ -376,6 +415,7 @@ pub fn app(state: AppState) -> Router {
         .routes(routes!(api::refresh_renditions))
         .routes(routes!(api::re_render_images))
         .routes(routes!(api::get_re_render_job))
+        .routes(routes!(api::get_upload_job))
         .routes(routes!(api::asset_states))
         .routes(routes!(api::assets_by_hash))
         .routes(routes!(api::summary))
