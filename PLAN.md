@@ -336,6 +336,28 @@ collections.
 - `GET /api/v1/trash` — authenticated listing of trashed and purged assets from
   both collections, paged with `limit` (default 200, max 500) and `offset`, with
   a `total`.
+- `POST /api/v1/backups` — authenticated creation of a consistent tar bundle:
+  a `VACUUM INTO` database snapshot first, then `assets/` and `trash/`, a
+  manifest, a per-live-directory check, and a `201` with id, size and manifest.
+  A concurrent backup is `409`; a volume that cannot hold another copy is
+  `507`. Purges are paused for the duration.
+- `GET /api/v1/backups` — authenticated listing of stored bundles with id, size
+  and creation time. No automatic retention.
+- `GET /api/v1/backups/{id}/archive` — authenticated streamed download as
+  `application/x-tar` with a UTC `Content-Disposition` name and byte ranges.
+- `DELETE /api/v1/backups/{id}` — authenticated removal of a stored bundle.
+- `POST /api/v1/backups/restore` — authenticated raw-body upload of a bundle,
+  streamed to staging under `ATLAS_BACKUP_UPLOAD_MAX_BYTES`. Members are
+  allowlisted to `manifest.json`, `atlas.sqlite3`, `assets/…` and `trash/…`;
+  traversal, links, devices, truncation, a bad SHA-256, a database failing
+  `integrity_check`/`foreign_key_check`, a newer schema, or a snapshot naming
+  missing directories are refused. A valid bundle answers counts,
+  configuration differences and the data-loss warning, and touches nothing
+  live.
+- `POST /api/v1/backups/restore/{upload_id}/apply` — authenticated all-or-
+  nothing swap of the staged database and directories by rename, then
+  migrations and the startup recovery path. A failed swap restores the
+  previous files; a failure before that point leaves the instance untouched.
 - `GET /api/v1/images/{id}/srcset` — authenticated `srcset` for one image, one
   candidate per distinct actual output width, described by the width actually
   produced. Without a `widths` parameter it describes the instance's

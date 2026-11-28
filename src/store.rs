@@ -1,5 +1,6 @@
-use std::{collections::HashMap, error::Error, fmt, path::Path};
+use std::{collections::HashMap, error::Error, fmt, path::Path, sync::Arc, time::Duration};
 
+use arc_swap::ArcSwap;
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -14,7 +15,9 @@ use crate::{
 
 #[derive(Clone)]
 pub struct Store {
-    pool: SqlitePool,
+    /// Swappable so a restore can close the database, replace its file and
+    /// reopen it without rebuilding every `AppState` clone that holds a store.
+    pool: Arc<ArcSwap<SqlitePool>>,
 }
 
 /// A row reported by `PRAGMA foreign_key_check`.
@@ -343,21 +346,48 @@ pub enum InsertOutcome {
 
 impl Store {
     pub async fn connect(path: &Path) -> Result<Self, StoreError> {
+        let pool = Self::open_pool(path).await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        let store = Self {
+            pool: Arc::new(ArcSwap::from_pointee(pool)),
+        };
+        store.check_integrity().await?;
+        Ok(store)
+    }
+
+    async fn open_pool(path: &Path) -> Result<SqlitePool, StoreError> {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(std::time::Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
+            .busy_timeout(Duration::from_secs(5));
+        Ok(SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
-            .await?;
+            .await?)
+    }
 
+    /// Close the current pool, so a restore can replace the database file.
+    ///
+    /// The caller must have stopped every request and job that reads the
+    /// store; closing only makes later queries fail.
+    pub async fn close_pool(&self) {
+        self.pool.load_full().close().await;
+    }
+
+    /// Reopen the database at `path`, applying migrations and the startup
+    /// integrity checks. Used after a restore swaps the file in.
+    pub async fn reload(&self, path: &Path) -> Result<(), StoreError> {
+        self.close_pool().await;
+        let pool = Self::open_pool(path).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        let store = Self { pool };
-        store.check_integrity().await?;
-        Ok(store)
+        let candidate = Self {
+            pool: Arc::new(ArcSwap::from_pointee(pool)),
+        };
+        candidate.check_integrity().await?;
+        self.pool.store(candidate.pool.load_full());
+        Ok(())
     }
 
     /// A `SELECT 1` against the pool, for the readiness probe.
@@ -366,14 +396,14 @@ impl Store {
     /// and a deploy gate wants to know whether the database answers, not
     /// whether every page is sound.
     pub async fn ping(&self) -> Result<(), StoreError> {
-        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        sqlx::query("SELECT 1").execute(&**self.pool.load()).await?;
         Ok(())
     }
 
     /// Close the pool so the next query fails, for the readiness test.
     #[cfg(test)]
     pub(crate) async fn close(&self) {
-        self.pool.close().await;
+        self.pool.load().close().await;
     }
 
     /// Refuse to serve from a database that is corrupt or has orphaned rows.
@@ -383,7 +413,7 @@ impl Store {
     /// here rather than silently read.
     pub async fn check_integrity(&self) -> Result<(), StoreError> {
         let rows = sqlx::query("PRAGMA integrity_check")
-            .fetch_all(&self.pool)
+            .fetch_all(&**self.pool.load())
             .await?;
         let report: Vec<String> = rows
             .iter()
@@ -412,7 +442,7 @@ impl Store {
 
     pub async fn foreign_key_violations(&self) -> Result<Vec<ForeignKeyViolation>, StoreError> {
         let rows = sqlx::query("PRAGMA foreign_key_check")
-            .fetch_all(&self.pool)
+            .fetch_all(&**self.pool.load())
             .await?;
         Ok(rows
             .iter()
@@ -432,7 +462,7 @@ impl Store {
         asset: &AssetRecord,
         renditions: &[RenditionRecord],
     ) -> Result<InsertOutcome, StoreError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.load().begin().await?;
         let insert = sqlx::query(
             "INSERT INTO assets (id, source_format, bytes, sha256, width, height, created_at,
                                  original_name, kind)
@@ -497,7 +527,7 @@ impl Store {
         if renditions.is_empty() {
             return Ok(());
         }
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.load().begin().await?;
         for rendition in renditions {
             sqlx::query(
                 "INSERT INTO renditions
@@ -536,7 +566,7 @@ impl Store {
         renditions: &[RenditionRecord],
     ) -> Result<Option<u32>, StoreError> {
         let next = generation + 1;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.load().begin().await?;
         let bumped = sqlx::query(
             "UPDATE assets SET generation = ? WHERE id = ? AND generation = ? AND deleted_at IS NULL",
         )
@@ -640,7 +670,7 @@ impl Store {
         )
         .bind(asset_id.as_str())
         .bind(i64::from(generation))
-        .fetch_all(&self.pool)
+        .fetch_all(&**self.pool.load())
         .await?;
         Ok(rows
             .into_iter()
@@ -665,7 +695,7 @@ impl Store {
         )
         .bind(after)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&**self.pool.load())
         .await?;
         let ids: Vec<AssetId> = rows
             .into_iter()
@@ -684,7 +714,7 @@ impl Store {
             "SELECT COUNT(*) FROM assets WHERE kind = 'image' AND deleted_at IS NULL AND id > ?",
         )
         .bind(last)
-        .fetch_one(&self.pool)
+        .fetch_one(&**self.pool.load())
         .await?
         .try_get(0)?;
         Ok((ids, remaining))
@@ -700,7 +730,7 @@ impl Store {
         created_at: i64,
         items: &[(AssetId, Option<u32>)],
     ) -> Result<(), StoreError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.load().begin().await?;
         sqlx::query(
             "INSERT INTO re_render_jobs (id, created_at, updated_at, state)
              VALUES (?, ?, ?, 'queued')",
@@ -738,7 +768,7 @@ impl Store {
              FROM re_render_jobs WHERE id = ?",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&**self.pool.load())
         .await?;
         let Some(row) = row else {
             return Ok(None);
@@ -760,7 +790,7 @@ impl Store {
              FROM re_render_job_items WHERE job_id = ? ORDER BY position ASC",
         )
         .bind(id)
-        .fetch_all(&self.pool)
+        .fetch_all(&**self.pool.load())
         .await?;
         let items = rows
             .into_iter()
@@ -791,7 +821,7 @@ impl Store {
             "SELECT id FROM re_render_jobs
              WHERE state IN ('queued', 'running') ORDER BY created_at ASC",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&**self.pool.load())
         .await?;
         rows.into_iter()
             .map(|row| row.try_get::<String, _>("id").map_err(StoreError::Database))
@@ -812,7 +842,7 @@ impl Store {
         )
         .bind(updated_at)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&**self.pool.load())
         .await?;
         Ok(result.rows_affected())
     }
@@ -842,12 +872,12 @@ impl Store {
         .bind(error_message)
         .bind(job_id)
         .bind(position)
-        .execute(&self.pool)
+        .execute(&**self.pool.load())
         .await?;
         sqlx::query("UPDATE re_render_jobs SET updated_at = ? WHERE id = ?")
             .bind(updated_at)
             .bind(job_id)
-            .execute(&self.pool)
+            .execute(&**self.pool.load())
             .await?;
         Ok(())
     }
@@ -869,7 +899,7 @@ impl Store {
         .bind(error)
         .bind(updated_at)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&**self.pool.load())
         .await?;
         Ok(())
     }
@@ -885,7 +915,7 @@ impl Store {
              WHERE state IN ('completed', 'failed') AND updated_at < ?",
         )
         .bind(before)
-        .execute(&self.pool)
+        .execute(&**self.pool.load())
         .await?;
         Ok(result.rows_affected() as usize)
     }
@@ -904,7 +934,7 @@ impl Store {
     /// against the index at startup.
     pub async fn asset_states(&self) -> Result<HashMap<String, AssetState>, StoreError> {
         let rows = sqlx::query("SELECT id, deleted_at, purged_at FROM assets")
-            .fetch_all(&self.pool)
+            .fetch_all(&**self.pool.load())
             .await?;
         Ok(rows
             .into_iter()
@@ -936,7 +966,7 @@ impl Store {
         )
         .bind(sha256)
         .bind(kind.key())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&**self.pool.load())
         .await?;
         Ok(row
             .and_then(|row| row.try_get::<String, _>("id").ok())
@@ -980,7 +1010,7 @@ impl Store {
         // wins a tie, matching `find_live_by_sha256`.
         query.push(" ORDER BY (deleted_at IS NULL AND purged_at IS NULL) DESC, created_at ASC");
 
-        let rows = query.build().fetch_all(&self.pool).await?;
+        let rows = query.build().fetch_all(&**self.pool.load()).await?;
         let mut best: HashMap<(String, &'static str), HashMatch> = HashMap::new();
         let mut unreadable: HashMap<String, String> = HashMap::new();
         for row in rows {
@@ -1046,7 +1076,11 @@ impl Store {
         let total: i64 = {
             let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM assets");
             push_filters(&mut count, &query);
-            count.build().fetch_one(&self.pool).await?.try_get(0)?
+            count
+                .build()
+                .fetch_one(&**self.pool.load())
+                .await?
+                .try_get(0)?
         };
 
         let direction = match query.order {
@@ -1075,7 +1109,7 @@ impl Store {
         page.push_bind(query.limit);
         page.push(" OFFSET ");
         page.push_bind(query.offset);
-        let rows = page.build().fetch_all(&self.pool).await?;
+        let rows = page.build().fetch_all(&**self.pool.load()).await?;
 
         let mut assets = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1102,7 +1136,7 @@ impl Store {
             "SELECT kind, COUNT(*) AS count, COALESCE(SUM(bytes), 0) AS bytes
              FROM assets GROUP BY kind",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&**self.pool.load())
         .await?;
         Ok(rows
             .into_iter()
@@ -1140,7 +1174,7 @@ impl Store {
         }
         separated.push_unseparated(") ORDER BY max_width ASC, format ASC");
 
-        let rows = query.build().fetch_all(&self.pool).await?;
+        let rows = query.build().fetch_all(&**self.pool.load()).await?;
         let mut by_asset: HashMap<String, Vec<RenditionRecord>> = HashMap::new();
         for row in rows {
             if let Some((asset_id, rendition)) = to_rendition(row) {
@@ -1171,7 +1205,7 @@ impl Store {
         }
         separated.push_unseparated(")");
 
-        let rows = query.build().fetch_all(&self.pool).await?;
+        let rows = query.build().fetch_all(&**self.pool.load()).await?;
         Ok(rows
             .into_iter()
             .filter_map(|row| {
@@ -1193,7 +1227,7 @@ impl Store {
         // between them, pairing one generation's number with the next one's
         // rows, and a `?g=` URL would then serve, and cache for a year, bytes
         // it never named.
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.load().begin().await?;
         let row = sqlx::query(
             "SELECT id, source_format, bytes, sha256, width, height, created_at,
                     original_name, kind, deleted_at, purged_at, pinned, consumer_data,
@@ -1238,7 +1272,7 @@ impl Store {
             sqlx::query("UPDATE assets SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL")
                 .bind(now)
                 .bind(id.as_str())
-                .execute(&self.pool)
+                .execute(&**self.pool.load())
                 .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -1249,7 +1283,7 @@ impl Store {
              WHERE id = ? AND deleted_at IS NOT NULL",
         )
         .bind(id.as_str())
-        .execute(&self.pool)
+        .execute(&**self.pool.load())
         .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -1267,7 +1301,7 @@ impl Store {
         let result = sqlx::query("UPDATE assets SET consumer_data = ? WHERE id = ?")
             .bind(data)
             .bind(id.as_str())
-            .execute(&self.pool)
+            .execute(&**self.pool.load())
             .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -1276,7 +1310,7 @@ impl Store {
         let result = sqlx::query("UPDATE assets SET pinned = ? WHERE id = ?")
             .bind(pinned)
             .bind(id.as_str())
-            .execute(&self.pool)
+            .execute(&**self.pool.load())
             .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -1297,7 +1331,7 @@ impl Store {
         )
         .bind(name)
         .bind(id.as_str())
-        .execute(&self.pool)
+        .execute(&**self.pool.load())
         .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -1312,7 +1346,7 @@ impl Store {
              ORDER BY deleted_at ASC",
         )
         .bind(cutoff)
-        .fetch_all(&self.pool)
+        .fetch_all(&**self.pool.load())
         .await?;
         Ok(rows
             .into_iter()
@@ -1325,7 +1359,7 @@ impl Store {
     /// tombstone that still advertised rendition URLs would report URLs whose
     /// bytes no longer exist.
     pub async fn mark_purged(&self, id: &AssetId, now: i64) -> Result<bool, StoreError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.load().begin().await?;
         sqlx::query("DELETE FROM renditions WHERE asset_id = ?")
             .bind(id.as_str())
             .execute(&mut *transaction)
@@ -1347,7 +1381,7 @@ impl Store {
     pub async fn trashed_count(&self) -> Result<i64, StoreError> {
         Ok(
             sqlx::query("SELECT COUNT(*) FROM assets WHERE deleted_at IS NOT NULL")
-                .fetch_one(&self.pool)
+                .fetch_one(&**self.pool.load())
                 .await?
                 .try_get::<i64, _>(0)?
                 .max(0),
@@ -1373,7 +1407,7 @@ impl Store {
         )
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.pool)
+        .fetch_all(&**self.pool.load())
         .await?;
 
         let mut assets = Vec::with_capacity(rows.len());
@@ -1401,7 +1435,7 @@ impl Store {
         sqlx::query("UPDATE assets SET deleted_at = ? WHERE id = ?")
             .bind(deleted_at)
             .bind(id.as_str())
-            .execute(&self.pool)
+            .execute(&**self.pool.load())
             .await
             .expect("the asset row exists");
     }
@@ -1423,13 +1457,102 @@ impl Store {
         .bind(sha256)
         .bind(id.as_str())
         .bind(file_name)
-        .execute(&self.pool)
+        .execute(&**self.pool.load())
         .await
         .expect("the rendition row can be updated");
         assert!(
             result.rows_affected() > 0,
             "no rendition is stored as {file_name}"
         );
+    }
+}
+
+/// What a database snapshot says about itself, for a backup manifest or a
+/// restore validation report.
+#[derive(Clone, Debug)]
+pub struct DatabaseInspection {
+    /// The newest applied migration. A snapshot from a newer Atlas is refused.
+    pub schema_version: i64,
+    pub assets: i64,
+    pub renditions: i64,
+    pub superseded_renditions: i64,
+    /// Ids the snapshot calls live, whose directories must be in the bundle.
+    pub live_asset_ids: Vec<String>,
+}
+
+/// The newest migration this build carries.
+pub fn latest_schema_version() -> i64 {
+    crate::MIGRATION_FILES
+        .iter()
+        .filter_map(|name| name.split('_').next()?.parse::<i64>().ok())
+        .max()
+        .unwrap_or(0)
+}
+
+impl Store {
+    /// Take a consistent, compacted copy of the live database with `VACUUM
+    /// INTO`. WAL mode means copying `atlas.sqlite3` would miss committed rows
+    /// still in the `-wal` file; this is the only snapshot that is a cut.
+    pub async fn snapshot_to(&self, path: &Path) -> Result<(), StoreError> {
+        let escaped = path.to_string_lossy().replace('\'', "''");
+        sqlx::query(&format!("VACUUM INTO '{escaped}'"))
+            .execute(&**self.pool.load())
+            .await?;
+        Ok(())
+    }
+
+    /// Check and describe a database snapshot without touching the live store.
+    ///
+    /// Read-only on purpose: a restore upload is untrusted input, and opening
+    /// it read-only means validation can never migrate or change it before an
+    /// apply is asked for.
+    pub async fn inspect_snapshot(path: &Path) -> Result<DatabaseInspection, StoreError> {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        let store = Self {
+            pool: Arc::new(ArcSwap::from_pointee(pool)),
+        };
+        store.check_integrity().await?;
+
+        let schema_version: i64 =
+            sqlx::query("SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations")
+                .fetch_one(&**store.pool.load())
+                .await?
+                .try_get(0)?;
+        let assets: i64 = sqlx::query("SELECT COUNT(*) FROM assets")
+            .fetch_one(&**store.pool.load())
+            .await?
+            .try_get(0)?;
+        let renditions: i64 = sqlx::query("SELECT COUNT(*) FROM renditions")
+            .fetch_one(&**store.pool.load())
+            .await?
+            .try_get(0)?;
+        let superseded_renditions: i64 = sqlx::query("SELECT COUNT(*) FROM superseded_renditions")
+            .fetch_one(&**store.pool.load())
+            .await?
+            .try_get(0)?;
+        let rows = sqlx::query("SELECT id FROM assets WHERE deleted_at IS NULL ORDER BY id")
+            .fetch_all(&**store.pool.load())
+            .await?;
+        let live_asset_ids = rows
+            .into_iter()
+            .map(|row| row.try_get::<String, _>(0).map_err(StoreError::Database))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(DatabaseInspection {
+            schema_version,
+            assets,
+            renditions,
+            superseded_renditions,
+            live_asset_ids,
+        })
     }
 }
 
@@ -1634,7 +1757,7 @@ mod tests {
             .unwrap();
 
         // Written with enforcement off: only a migration or a bug can do this.
-        let mut connection = store.pool.acquire().await.unwrap();
+        let mut connection = store.pool.load().acquire().await.unwrap();
         sqlx::query("PRAGMA foreign_keys = OFF")
             .execute(&mut *connection)
             .await
@@ -1665,7 +1788,7 @@ mod tests {
     /// constraint, and `DROP TABLE assets` would fire the `renditions`
     /// `ON DELETE CASCADE` if foreign keys were still enforced.
     async fn rebuild_assets_with_note_column(store: &Store, guard: bool) {
-        let mut connection = store.pool.acquire().await.unwrap();
+        let mut connection = store.pool.load().acquire().await.unwrap();
         if guard {
             // Outside the transaction: SQLite ignores the pragma inside one,
             // and the pragma applies to this connection only.
@@ -1911,7 +2034,7 @@ mod tests {
         )
         .bind("a".repeat(64))
         .bind("b".repeat(64))
-        .fetch_all(&store.pool)
+        .fetch_all(&**store.pool.load())
         .await
         .unwrap();
         let plan: Vec<String> = rows
@@ -1935,7 +2058,7 @@ mod tests {
         let names: Vec<String> = sqlx::query(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'assets'",
         )
-        .fetch_all(&store.pool)
+        .fetch_all(&**store.pool.load())
         .await
         .unwrap()
         .iter()
@@ -1957,7 +2080,7 @@ mod tests {
         .bind(id)
         .bind(hash)
         .bind(kind)
-        .execute(&store.pool)
+        .execute(&**store.pool.load())
         .await
         .unwrap();
     }
@@ -2116,7 +2239,7 @@ mod tests {
         let (store, id) = store_with_asset(directory.path()).await;
         sqlx::query("UPDATE renditions SET file_name = NULL WHERE asset_id = ?")
             .bind(id.as_str())
-            .execute(&store.pool)
+            .execute(&**store.pool.load())
             .await
             .unwrap();
 
@@ -2148,7 +2271,7 @@ mod tests {
              VALUES (?, 320, 320, 240, 'jxl2', 7, 'abc', 'w320.jxl2')",
         )
         .bind(id.as_str())
-        .execute(&store.pool)
+        .execute(&**store.pool.load())
         .await
         .unwrap();
 
@@ -2162,7 +2285,7 @@ mod tests {
              WHERE asset_id = ? AND generation = 1 ORDER BY format",
         )
         .bind(id.as_str())
-        .fetch_all(&store.pool)
+        .fetch_all(&**store.pool.load())
         .await
         .unwrap();
         assert_eq!(
@@ -2290,7 +2413,7 @@ mod tests {
         store.insert_asset(&record(&id), &[]).await.unwrap();
         sqlx::query("UPDATE assets SET id = 'bad-id' WHERE id = ?")
             .bind(id.as_str())
-            .execute(&store.pool)
+            .execute(&**store.pool.load())
             .await
             .unwrap();
 
@@ -2400,7 +2523,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("UPDATE re_render_jobs SET updated_at = 500 WHERE id = 'jobone'")
-            .execute(&store.pool)
+            .execute(&**store.pool.load())
             .await
             .unwrap();
         assert_eq!(store.prune_re_render_jobs(600).await.unwrap(), 1);
@@ -2413,7 +2536,7 @@ mod tests {
         // The pruned job's items went with it through the cascade.
         let orphans: i64 =
             sqlx::query("SELECT COUNT(*) FROM re_render_job_items WHERE job_id = 'jobone'")
-                .fetch_one(&store.pool)
+                .fetch_one(&**store.pool.load())
                 .await
                 .unwrap()
                 .try_get(0)

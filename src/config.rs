@@ -15,6 +15,9 @@ pub struct Config {
     pub max_image_bytes: u64,
     pub max_document_bytes: u64,
     pub max_consumer_data_bytes: u64,
+    /// The largest restore archive Atlas will accept, streamed to staging.
+    /// Must exceed the source instance's data size; 0 is not allowed.
+    pub backup_upload_max_bytes: u64,
     /// Free space the data volume must keep before an upload is refused.
     /// Zero disables the check.
     pub min_free_bytes: u64,
@@ -132,6 +135,15 @@ impl Config {
                 )?,
                 "ATLAS_MAX_CONSUMER_DATA_BYTES",
             )?,
+            backup_upload_max_bytes: positive(
+                setting(
+                    &file.backup_upload_max_bytes,
+                    "ATLAS_BACKUP_UPLOAD_MAX_BYTES",
+                    4 * 1024 * 1024 * 1024,
+                    parse_u64,
+                )?,
+                "ATLAS_BACKUP_UPLOAD_MAX_BYTES",
+            )?,
             min_free_bytes: setting(
                 &file.min_free_bytes,
                 "ATLAS_MIN_FREE_BYTES",
@@ -210,6 +222,7 @@ struct FileConfig {
     max_image_bytes: Option<u64>,
     max_document_bytes: Option<u64>,
     max_consumer_data_bytes: Option<u64>,
+    backup_upload_max_bytes: Option<u64>,
     min_free_bytes: Option<u64>,
     max_image_pixels: Option<u64>,
     max_image_dimension: Option<u32>,
@@ -425,6 +438,7 @@ mod tests {
             "ATLAS_MAX_IMAGE_BYTES",
             "ATLAS_MAX_DOCUMENT_BYTES",
             "ATLAS_MAX_CONSUMER_DATA_BYTES",
+            "ATLAS_BACKUP_UPLOAD_MAX_BYTES",
             "ATLAS_MIN_FREE_BYTES",
             "ATLAS_MAX_IMAGE_PIXELS",
             "ATLAS_MAX_IMAGE_DIMENSION",
@@ -456,6 +470,7 @@ mod tests {
         assert_eq!(config.listen_addr, "127.0.0.1:3000");
         assert_eq!(config.id_length, super::DEFAULT_LENGTH);
         assert_eq!(config.max_consumer_data_bytes, 64 * 1024);
+        assert_eq!(config.backup_upload_max_bytes, 4 * 1024 * 1024 * 1024);
         assert_eq!(config.variant_widths, vec![320, 640, 960, 1280]);
         assert_eq!(config.conversion_concurrency, 1);
     }
@@ -473,6 +488,7 @@ mod tests {
             variant_widths = [400, 800]
             max_image_bytes = 1234
             max_consumer_data_bytes = 8192
+            backup_upload_max_bytes = 12345
             min_free_bytes = 4096
             conversion_concurrency = 3
             "#,
@@ -485,6 +501,7 @@ mod tests {
         assert_eq!(config.variant_widths, vec![400, 800]);
         assert_eq!(config.max_image_bytes, 1234);
         assert_eq!(config.max_consumer_data_bytes, 8192);
+        assert_eq!(config.backup_upload_max_bytes, 12345);
         assert_eq!(config.min_free_bytes, 4096);
         assert_eq!(config.conversion_concurrency, 3);
     }

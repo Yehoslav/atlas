@@ -121,9 +121,11 @@ the codecs and LCMS support described in
 [`CONTRIBUTING.md`](CONTRIBUTING.md); SQLite is compiled into the binary. Free
 space is read with `statvfs` through the `rustix` crate, which is pure Rust and
 adds no native build step or external command — shelling out to `df` would mean
-parsing human output. The OpenAPI document is generated with `utoipa` and
-`utoipa-axum`, both pure Rust and compile-time only: they add no runtime
-process and no native library.
+parsing human output. Backup bundles are written and read with the pure-Rust
+`tar` crate, and the database handle is swapped atomically on restore with
+`arc-swap`; neither adds a runtime process or a native library. The OpenAPI
+document is generated with `utoipa` and `utoipa-axum`, both pure Rust and
+compile-time only: they add no runtime process and no native library.
 
 ## Status
 
