@@ -966,6 +966,10 @@ pub(super) async fn delete_asset(
 /// same order of operations, not just the same outcome.
 async fn delete_inner(state: &AppState, id: &AssetId) -> Result<(), ApiError> {
     let _asset_guard = state.lock_asset_conversion(id).await;
+    // A backup holds this write side while it copies. Keeping the move out of
+    // that window is what makes the snapshot's live/trashed state match the
+    // directory side of the bundle.
+    let _lifecycle = state.lifecycle_lock.read().await;
     let asset = load_asset(state, id, None).await?;
     if asset.asset.state() != AssetState::Active {
         return Ok(());
@@ -1019,6 +1023,7 @@ pub(super) async fn restore_asset(
 /// recovery resolves back into the trash.
 async fn restore_inner(state: &AppState, id: &AssetId) -> Result<(), ApiError> {
     let _asset_guard = state.lock_asset_conversion(id).await;
+    let _lifecycle = state.lifecycle_lock.read().await;
     let asset = load_asset(state, id, None).await?;
     match asset.asset.state() {
         AssetState::Active => return Ok(()),

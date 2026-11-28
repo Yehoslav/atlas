@@ -1476,8 +1476,11 @@ pub struct DatabaseInspection {
     pub assets: i64,
     pub renditions: i64,
     pub superseded_renditions: i64,
-    /// Ids the snapshot calls live, whose directories must be in the bundle.
+    /// Ids the snapshot calls live, whose directories must be in `assets/`.
     pub live_asset_ids: Vec<String>,
+    /// Ids in the trash whose bytes have not been purged, whose directories
+    /// must be in `trash/`.
+    pub trashed_asset_ids: Vec<String>,
 }
 
 /// The newest migration this build carries.
@@ -1510,6 +1513,10 @@ impl Store {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .read_only(true)
+            // `immutable` forbids SQLite from creating `-wal`/`-shm` beside
+            // an untrusted upload, so validation cannot change the file it is
+            // inspecting.
+            .immutable(true)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
@@ -1545,6 +1552,16 @@ impl Store {
             .into_iter()
             .map(|row| row.try_get::<String, _>(0).map_err(StoreError::Database))
             .collect::<Result<Vec<_>, _>>()?;
+        let rows = sqlx::query(
+            "SELECT id FROM assets
+             WHERE deleted_at IS NOT NULL AND purged_at IS NULL ORDER BY id",
+        )
+        .fetch_all(&**store.pool.load())
+        .await?;
+        let trashed_asset_ids = rows
+            .into_iter()
+            .map(|row| row.try_get::<String, _>(0).map_err(StoreError::Database))
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(DatabaseInspection {
             schema_version,
@@ -1552,6 +1569,7 @@ impl Store {
             renditions,
             superseded_renditions,
             live_asset_ids,
+            trashed_asset_ids,
         })
     }
 }

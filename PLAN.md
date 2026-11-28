@@ -340,7 +340,8 @@ collections.
   a `VACUUM INTO` database snapshot first, then `assets/` and `trash/`, a
   manifest, a per-live-directory check, and a `201` with id, size and manifest.
   A concurrent backup is `409`; a volume that cannot hold another copy is
-  `507`. Purges are paused for the duration.
+  `507`. Purges and the delete/restore-from-trash directory moves are held for
+  the duration.
 - `GET /api/v1/backups` — authenticated listing of stored bundles with id, size
   and creation time. No automatic retention.
 - `GET /api/v1/backups/{id}/archive` — authenticated streamed download as
@@ -351,7 +352,7 @@ collections.
   allowlisted to `manifest.json`, `atlas.sqlite3`, `assets/…` and `trash/…`;
   traversal, links, devices, truncation, a bad SHA-256, a database failing
   `integrity_check`/`foreign_key_check`, a newer schema, or a snapshot naming
-  missing directories are refused. A valid bundle answers counts,
+  missing live or trashed directories are refused. A valid bundle answers counts,
   configuration differences and the data-loss warning, and touches nothing
   live.
 - `POST /api/v1/backups/restore/{upload_id}/apply` — authenticated all-or-

@@ -26,11 +26,11 @@ use axum::{
         HeaderMap, StatusCode,
         header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     },
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use serde::{Deserialize, Serialize};
 use tar::{Archive, Builder, EntryType, Header, HeaderMode};
-use tokio::fs as async_fs;
+use tokio::{fs as async_fs, io::AsyncWriteExt};
 
 use crate::{AppState, api, disk, error::ApiError, ident::AssetId, media::sha256_file};
 
@@ -38,6 +38,9 @@ use crate::{AppState, api, disk, error::ApiError, ident::AssetId, media::sha256_
 const FORMAT_VERSION: u32 = 1;
 const MANIFEST_MEMBER: &str = "manifest.json";
 const DATABASE_MEMBER: &str = "atlas.sqlite3";
+/// Kept in the data directory root, not under `staging/`, because startup must
+/// see it before it opens a database or sweeps staging.
+const RESTORE_JOURNAL: &str = "restore.journal";
 const ASSETS_MEMBER: &str = "assets";
 const TRASH_MEMBER: &str = "trash";
 
@@ -52,6 +55,11 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const BACKUP_CACHE_POLICY: &str = "private, no-store";
 
 /// The manifest stored as the first-class description of a bundle.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RestoreJournal {
+    upload_id: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub(crate) struct BackupManifest {
     pub format_version: u32,
@@ -121,7 +129,6 @@ pub(crate) struct RestoreReport {
 #[derive(Serialize, utoipa::ToSchema)]
 pub(crate) struct AppliedRestore {
     pub upload_id: String,
-    pub restored: bool,
     pub counts: BackupCounts,
     pub warnings: Vec<String>,
 }
@@ -140,7 +147,14 @@ pub(crate) async fn create_backup(
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<CreatedBackup>), ApiError> {
     api::authorize(&state, &headers)?;
-    create(&state).await
+    // Detach the work from this connection. A client that disconnects must not
+    // drop the backup or restore gate while the copy is still running.
+    tokio::spawn(async move {
+        let _gate = state.restore_gate.read().await;
+        create(&state).await
+    })
+    .await
+    .map_err(ApiError::internal)?
 }
 
 async fn create(state: &AppState) -> Result<(StatusCode, Json<CreatedBackup>), ApiError> {
@@ -148,9 +162,12 @@ async fn create(state: &AppState) -> Result<(StatusCode, Json<CreatedBackup>), A
     let _backup_guard = state.backup_lock.clone().try_lock_owned().map_err(|_| {
         ApiError::conflict(
             "backup_in_progress",
-            "Another backup is already running; wait for it to finish.",
+            "A backup or trash purge is already running; wait for it to finish.",
         )
     })?;
+
+    // Keep delete and restore-from-trash out of the snapshot-and-copy window.
+    let _lifecycle = state.lifecycle_lock.write().await;
 
     ensure_backup_space(state).await?;
 
@@ -223,6 +240,7 @@ async fn create_inner(
     let snapshot_for_tar = snapshot.to_owned();
     let tar_path = tar_path.to_owned();
     let live_ids = inspection.live_asset_ids.clone();
+    let trashed_ids = inspection.trashed_asset_ids.clone();
     let manifest_for_tar = manifest.clone();
     let bytes = tokio::task::spawn_blocking(move || {
         write_bundle(
@@ -231,6 +249,7 @@ async fn create_inner(
             &tar_path,
             &manifest_for_tar,
             &live_ids,
+            &trashed_ids,
         )
     })
     .await
@@ -267,7 +286,7 @@ pub(crate) async fn list_backups(
         let Some(name) = name.to_str() else {
             continue;
         };
-        let Some(id) = name.strip_suffix(".tar").filter(|id| is_backup_id(id)) else {
+        let Some(id) = name.strip_suffix(".tar").filter(|id| is_short_id(id)) else {
             continue;
         };
         let metadata = match entry.metadata().await {
@@ -454,13 +473,20 @@ pub(crate) async fn apply_restore(
 ) -> Result<Json<AppliedRestore>, ApiError> {
     api::authorize(&state, &headers)?;
     let upload_id = parse_upload_id(&upload_id)?;
-    // The request layer already holds a read guard for everything except this
-    // route; taking the write guard here waits for every in-flight request.
-    let _gate = state.restore_gate.write().await;
-    apply(&state, &upload_id).await
+    // Detach the swap from the connection: a disconnect must not release the
+    // write gate or abort the file moves halfway through.
+    tokio::spawn(async move {
+        // The request layer already holds a read guard for everything except
+        // this route; taking the write guard here waits for every in-flight
+        // request.
+        let _gate = state.restore_gate.write().await;
+        apply_inner(&state, &upload_id).await
+    })
+    .await
+    .map_err(ApiError::internal)?
 }
 
-async fn apply(state: &AppState, upload_id: &str) -> Result<Json<AppliedRestore>, ApiError> {
+async fn apply_inner(state: &AppState, upload_id: &str) -> Result<Json<AppliedRestore>, ApiError> {
     let directory = state.restore_staging_dir(upload_id);
     let tree = directory.join("tree");
     let report_path = directory.join("report.json");
@@ -487,12 +513,24 @@ async fn apply(state: &AppState, upload_id: &str) -> Result<Json<AppliedRestore>
             "The staged database no longer matches the validated upload.",
         ));
     }
-    verify_live_directories(&tree, &inspection.live_asset_ids)?;
+    verify_directories(
+        &tree,
+        &inspection.live_asset_ids,
+        &inspection.trashed_asset_ids,
+    )?;
 
     let data_dir = state.config.data_dir.clone();
     let live_db = data_dir.join(DATABASE_MEMBER);
     let rollback = directory.join("rollback");
     async_fs::create_dir_all(&rollback)
+        .await
+        .map_err(ApiError::internal)?;
+
+    // From here on a crash is recoverable only if startup can tell that a
+    // swap was in progress. The journal is written and fsynced before any
+    // live path moves, and removed only after the new database is open and
+    // verified.
+    write_journal(&data_dir, upload_id)
         .await
         .map_err(ApiError::internal)?;
 
@@ -505,8 +543,10 @@ async fn apply(state: &AppState, upload_id: &str) -> Result<Json<AppliedRestore>
         if let Err(rollback_error) = swap_back(&data_dir, &rollback, &live_db).await {
             tracing::error!(
                 ?rollback_error,
-                "restore swap failed and rollback also failed"
+                "restore swap failed and rollback also failed; leaving the journal for startup"
             );
+        } else {
+            let _ = remove_journal(&data_dir).await;
         }
         if let Err(reload_error) = state.store.reload(&live_db).await {
             tracing::error!(%reload_error, "could not reopen the old database after a failed restore");
@@ -525,12 +565,35 @@ async fn apply(state: &AppState, upload_id: &str) -> Result<Json<AppliedRestore>
                 "The restored database failed and the previous files could not be restored; stop Atlas and recover from the deployment runbook.",
             ));
         }
+        let _ = remove_journal(&data_dir).await;
         if let Err(reload_error) = state.store.reload(&live_db).await {
             tracing::error!(%reload_error, "could not reopen the old database after rollback");
         }
         return Err(invalid_backup(format!(
             "The restored database could not be opened: {error}"
         )));
+    }
+
+    // The new database opened and passed its checks. Removing the journal is
+    // the commit point: from here a restart keeps the restored instance.
+    if let Err(error) = remove_journal(&data_dir).await {
+        tracing::error!(%error, "could not commit the restore journal; rolling back");
+        if let Err(rollback_error) = swap_back(&data_dir, &rollback, &live_db).await {
+            tracing::error!(
+                ?rollback_error,
+                "restore rollback failed after journal commit error"
+            );
+            return Err(ApiError::internal(
+                "The restore could not be committed and the previous files could not be restored; stop Atlas and recover from the deployment runbook.",
+            ));
+        }
+        let _ = remove_journal(&data_dir).await;
+        if let Err(reload_error) = state.store.reload(&live_db).await {
+            tracing::error!(%reload_error, "could not reopen the old database after a commit failure");
+        }
+        return Err(ApiError::internal(
+            "The restore could not be committed; the previous instance was restored.",
+        ));
     }
 
     // The new rows and directories are live. Startup recovery reconciles
@@ -547,30 +610,21 @@ async fn apply(state: &AppState, upload_id: &str) -> Result<Json<AppliedRestore>
     );
     Ok(Json(AppliedRestore {
         upload_id: upload_id.to_owned(),
-        restored: true,
         counts: report.counts.clone(),
         warnings: report.warnings,
     }))
 }
 
-/// Move the live database and asset directories aside, then move the staged
-/// ones in. Every rename stays on the data directory's filesystem, so the
-/// sequence is fast and each step is individually reversible.
+/// Move the live directories and database aside, then move the staged ones
+/// in. The staged database rename is the last step and the commit point; the
+/// journal still exists until the new database has been opened and checked, so
+/// a crash anywhere in this sequence is rolled back at startup.
 async fn swap_in(
     data_dir: &Path,
     tree: &Path,
     rollback: &Path,
     live_db: &Path,
 ) -> Result<(), ApiError> {
-    for suffix in ["", "-wal", "-shm"] {
-        let from = PathBuf::from(format!("{}{suffix}", live_db.display()));
-        if async_fs::symlink_metadata(&from).await.is_ok() {
-            let to = rollback.join(format!("atlas.sqlite3{suffix}"));
-            async_fs::rename(&from, &to)
-                .await
-                .map_err(ApiError::internal)?;
-        }
-    }
     for name in [ASSETS_MEMBER, TRASH_MEMBER] {
         let live = data_dir.join(name);
         let saved = rollback.join(name);
@@ -590,21 +644,34 @@ async fn swap_in(
                 .map_err(ApiError::internal)?;
         }
     }
+
+    // The old database goes aside after the directories, so if a crash
+    // happens before this point the live database is still the old one and
+    // the journal can simply restore the directories.
+    for suffix in ["", "-wal", "-shm"] {
+        let from = PathBuf::from(format!("{}{suffix}", live_db.display()));
+        if async_fs::symlink_metadata(&from).await.is_ok() {
+            let to = rollback.join(format!("atlas.sqlite3{suffix}"));
+            async_fs::rename(&from, &to)
+                .await
+                .map_err(ApiError::internal)?;
+        }
+    }
+    // Commit point: the database that matches the directories just moved in.
     async_fs::rename(tree.join(DATABASE_MEMBER), live_db)
         .await
         .map_err(ApiError::internal)?;
-    // The pool is about to open the file in WAL mode.
-    async_fs::remove_file(data_dir.join("atlas.sqlite3-wal"))
-        .await
-        .ok();
-    async_fs::remove_file(data_dir.join("atlas.sqlite3-shm"))
-        .await
-        .ok();
     Ok(())
 }
 
 /// Put the previous database and directories back after a failed swap.
 async fn swap_back(data_dir: &Path, rollback: &Path, live_db: &Path) -> Result<(), ApiError> {
+    swap_back_io(data_dir, rollback, live_db)
+        .await
+        .map_err(ApiError::internal)
+}
+
+async fn swap_back_io(data_dir: &Path, rollback: &Path, live_db: &Path) -> io::Result<()> {
     // Only touch the live database if the swap actually moved it aside. A
     // failure before that point leaves the old file where it is.
     let saved_main = rollback.join("atlas.sqlite3");
@@ -620,9 +687,7 @@ async fn swap_back(data_dir: &Path, rollback: &Path, live_db: &Path) -> Result<(
             let saved = rollback.join(format!("atlas.sqlite3{suffix}"));
             if async_fs::symlink_metadata(&saved).await.is_ok() {
                 let live = PathBuf::from(format!("{}{suffix}", live_db.display()));
-                async_fs::rename(&saved, &live)
-                    .await
-                    .map_err(ApiError::internal)?;
+                async_fs::rename(&saved, &live).await?;
             }
         }
     }
@@ -633,15 +698,100 @@ async fn swap_back(data_dir: &Path, rollback: &Path, live_db: &Path) -> Result<(
             // The staged directory is live; discard it before restoring the
             // previous one under the same name.
             if async_fs::symlink_metadata(&live).await.is_ok() {
-                async_fs::remove_dir_all(&live)
-                    .await
-                    .map_err(ApiError::internal)?;
+                async_fs::remove_dir_all(&live).await?;
             }
-            async_fs::rename(&saved, &live)
-                .await
-                .map_err(ApiError::internal)?;
+            async_fs::rename(&saved, &live).await?;
         }
     }
+    Ok(())
+}
+
+fn journal_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(RESTORE_JOURNAL)
+}
+
+async fn write_journal(data_dir: &Path, upload_id: &str) -> io::Result<()> {
+    let bytes = serde_json::to_vec(&RestoreJournal {
+        upload_id: upload_id.to_owned(),
+    })
+    .map_err(io::Error::other)?;
+    let path = journal_path(data_dir);
+    let mut file = async_fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path)
+        .await?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    sync_dir(data_dir).await
+}
+
+async fn remove_journal(data_dir: &Path) -> io::Result<()> {
+    match async_fs::remove_file(journal_path(data_dir)).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    sync_dir(data_dir).await
+}
+
+async fn sync_dir(path: &Path) -> io::Result<()> {
+    async_fs::File::open(path).await?.sync_all().await
+}
+
+/// Finish or undo a swap that was interrupted by a crash, before the database
+/// is opened and before staging is swept.
+///
+/// The journal is written before any live path moves and removed only after
+/// the new database has been opened and checked. Its presence therefore means
+/// "roll back": the previous database and directories are still under the
+/// upload's `rollback/` directory. If nothing was moved, the live files are
+/// already correct and only the journal is discarded.
+pub(crate) async fn recover_interrupted_restore(
+    data_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = journal_path(data_dir);
+    let bytes = match async_fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Box::new(error)),
+    };
+    let journal: RestoreJournal = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("restore journal {} is invalid: {error}", path.display()))?;
+    if !is_short_id(&journal.upload_id) {
+        return Err(format!(
+            "restore journal names an invalid upload id: {}",
+            journal.upload_id
+        )
+        .into());
+    }
+
+    let rollback = data_dir
+        .join("staging")
+        .join("restores")
+        .join(&journal.upload_id)
+        .join("rollback");
+    let live_db = data_dir.join(DATABASE_MEMBER);
+
+    tracing::warn!(
+        upload = %journal.upload_id,
+        "found an unfinished restore; rolling the swap back"
+    );
+    if async_fs::symlink_metadata(&rollback).await.is_ok() {
+        swap_back_io(data_dir, &rollback, &live_db).await?;
+    }
+    if async_fs::symlink_metadata(&live_db).await.is_err() {
+        return Err(
+            "an unfinished restore left no live database and no rollback copy; recover from the deployment runbook"
+                .into(),
+        );
+    }
+    remove_journal(data_dir).await?;
+    tracing::warn!(
+        upload = %journal.upload_id,
+        "rolled back the unfinished restore"
+    );
     Ok(())
 }
 
@@ -722,7 +872,11 @@ async fn validate(
             "The database row counts do not match the manifest.",
         ));
     }
-    verify_live_directories(&tree, &inspection.live_asset_ids)?;
+    verify_directories(
+        &tree,
+        &inspection.live_asset_ids,
+        &inspection.trashed_asset_ids,
+    )?;
 
     let configuration_differences = configuration_differences(&manifest.instance, state);
     let warnings = vec![
@@ -778,20 +932,27 @@ fn configuration_differences(instance: &InstanceFacts, state: &AppState) -> Vec<
     differences
 }
 
-/// Every live asset directory the database names must be present in the
-/// bundle. Extra directories are fine: startup recovery sweeps them.
-fn verify_live_directories(tree: &Path, live_ids: &[String]) -> Result<(), ApiError> {
+/// Every directory the database names must be present on the side its state
+/// says: a live row in `assets/`, a trashed (not purged) row in `trash/`.
+/// Extra directories are fine: startup recovery sweeps them.
+fn verify_directories(
+    tree: &Path,
+    live_ids: &[String],
+    trashed_ids: &[String],
+) -> Result<(), ApiError> {
     let mut missing = Vec::new();
-    for raw in live_ids {
-        let Ok(id) = AssetId::parse(raw) else {
-            return Err(invalid_backup(format!(
-                "The database names an invalid asset id: {raw}."
-            )));
-        };
-        let directory = tree.join(ASSETS_MEMBER).join(id.as_str());
-        match fs::metadata(&directory) {
-            Ok(metadata) if metadata.is_dir() => {}
-            _ => missing.push(raw.clone()),
+    for (location, ids) in [(ASSETS_MEMBER, live_ids), (TRASH_MEMBER, trashed_ids)] {
+        for raw in ids {
+            let Ok(id) = AssetId::parse(raw) else {
+                return Err(invalid_backup(format!(
+                    "The database names an invalid asset id: {raw}."
+                )));
+            };
+            let directory = tree.join(location).join(id.as_str());
+            match fs::metadata(&directory) {
+                Ok(metadata) if metadata.is_dir() => {}
+                _ => missing.push(format!("{location}/{raw}")),
+            }
         }
     }
     if !missing.is_empty() {
@@ -802,7 +963,7 @@ fn verify_live_directories(tree: &Path, live_ids: &[String]) -> Result<(), ApiEr
             .collect::<Vec<_>>()
             .join(", ");
         return Err(invalid_backup(format!(
-            "The bundle is missing {} live asset director{} the database names: {shown}{}.",
+            "The bundle is missing {} asset director{} the database names: {shown}{}.",
             missing.len(),
             if missing.len() == 1 { "y" } else { "ies" },
             if missing.len() > 5 { ", …" } else { "" }
@@ -885,6 +1046,7 @@ fn write_bundle(
     tar_path: &Path,
     manifest: &BackupManifest,
     live_ids: &[String],
+    trashed_ids: &[String],
 ) -> io::Result<u64> {
     let file = File::create(tar_path)?;
     let mut builder = Builder::new(file);
@@ -893,6 +1055,7 @@ fn write_bundle(
 
     append_file(&mut builder, snapshot, DATABASE_MEMBER)?;
     let mut added_assets = HashSet::new();
+    let mut added_trash = HashSet::new();
     append_tree(
         &mut builder,
         &data_dir.join(ASSETS_MEMBER),
@@ -903,26 +1066,31 @@ fn write_bundle(
         &mut builder,
         &data_dir.join(TRASH_MEMBER),
         TRASH_MEMBER,
-        None,
+        Some(&mut added_trash),
     )?;
 
-    let missing: Vec<&str> = live_ids
-        .iter()
-        .map(String::as_str)
-        .filter(|id| !added_assets.contains(*id))
-        .collect();
-    if !missing.is_empty() {
-        return Err(io::Error::other(format!(
-            "the snapshot names {} live asset director{} that are not on disk: {}",
-            missing.len(),
-            if missing.len() == 1 { "y" } else { "ies" },
-            missing
-                .iter()
-                .take(5)
-                .copied()
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+    for (label, expected, added) in [
+        ("live", live_ids, &added_assets),
+        ("trashed", trashed_ids, &added_trash),
+    ] {
+        let missing: Vec<&str> = expected
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !added.contains(*id))
+            .collect();
+        if !missing.is_empty() {
+            return Err(io::Error::other(format!(
+                "the snapshot names {} {label} asset director{} that are not on disk: {}",
+                missing.len(),
+                if missing.len() == 1 { "y" } else { "ies" },
+                missing
+                    .iter()
+                    .take(5)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
     }
 
     let manifest_json = serde_json::to_vec_pretty(manifest)
@@ -1018,9 +1186,7 @@ fn append_tree(
                     entry.path().display()
                 )));
             }
-            if member == ASSETS_MEMBER
-                && let Some(ids) = asset_ids.as_deref_mut()
-            {
+            if let Some(ids) = asset_ids.as_deref_mut() {
                 ids.insert(name.to_owned());
             }
         }
@@ -1226,7 +1392,7 @@ fn restore_not_found() -> ApiError {
 }
 
 fn parse_backup_id(value: &str) -> Result<String, ApiError> {
-    if is_backup_id(value) {
+    if is_short_id(value) {
         Ok(value.to_owned())
     } else {
         Err(backup_not_found())
@@ -1234,7 +1400,7 @@ fn parse_backup_id(value: &str) -> Result<String, ApiError> {
 }
 
 fn parse_upload_id(value: &str) -> Result<String, ApiError> {
-    if is_backup_id(value) {
+    if is_short_id(value) {
         Ok(value.to_owned())
     } else {
         Err(restore_not_found())
@@ -1243,7 +1409,7 @@ fn parse_upload_id(value: &str) -> Result<String, ApiError> {
 
 /// Backup and upload ids are random 16-character lowercase hex, which cannot
 /// carry a path separator or a parent component.
-fn is_backup_id(value: &str) -> bool {
+fn is_short_id(value: &str) -> bool {
     value.len() == 16
         && value
             .bytes()
@@ -1289,12 +1455,6 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, m, d)
 }
 
-impl IntoResponse for RestoreReport {
-    fn into_response(self) -> Response {
-        Json(self).into_response()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{io::Write, path::Path, time::Duration};
@@ -1309,9 +1469,7 @@ mod tests {
 
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-    use super::{
-        civil_from_days, extract_bundle, safe_member_path, utc_stamp, verify_live_directories,
-    };
+    use super::{civil_from_days, extract_bundle, safe_member_path, utc_stamp, verify_directories};
     use crate::{AppState, Config, app, store::Store};
 
     #[test]
@@ -1617,7 +1775,6 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{applied}");
-        assert_eq!(applied["restored"], true);
 
         let (status, listing) = send(&router, request("GET", "/api/v1/documents?limit=10")).await;
         assert_eq!(status, StatusCode::OK, "{listing}");
@@ -1684,6 +1841,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_crash_mid_swap_is_rolled_back_before_the_database_opens() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = test_config(directory.path().join("atlas"));
+        let state = AppState::new(config.clone()).await.unwrap();
+        let router = app(state.clone());
+        let kept = upload_document(&router, b"%PDF-1.4\ncrashed").await;
+        state.store.close_pool().await;
+
+        let data_dir = config.data_dir.clone();
+        let upload_id = "abcdefabcdefabcd";
+        super::write_journal(&data_dir, upload_id).await.unwrap();
+
+        // Simulate a crash after the old directories and database were moved
+        // aside, but before the staged database became live.
+        let rollback = data_dir
+            .join("staging/restores")
+            .join(upload_id)
+            .join("rollback");
+        std::fs::create_dir_all(&rollback).unwrap();
+        std::fs::rename(data_dir.join("assets"), rollback.join("assets")).unwrap();
+        std::fs::create_dir_all(data_dir.join("assets")).unwrap();
+        std::fs::rename(data_dir.join("trash"), rollback.join("trash")).unwrap();
+        std::fs::create_dir_all(data_dir.join("trash")).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let live = data_dir.join(format!("atlas.sqlite3{suffix}"));
+            if live.exists() {
+                std::fs::rename(&live, rollback.join(format!("atlas.sqlite3{suffix}"))).unwrap();
+            }
+        }
+        assert!(!data_dir.join("atlas.sqlite3").exists());
+        drop(router);
+        drop(state);
+
+        // Starting Atlas must undo the swap before opening a database that
+        // `create_if_missing` would otherwise recreate empty.
+        let state = AppState::new(config).await.unwrap();
+        assert!(!super::journal_path(&data_dir).exists());
+        let id = crate::ident::AssetId::parse(&kept).unwrap();
+        assert!(state.store.get_asset(&id).await.unwrap().is_some());
+        assert!(
+            data_dir
+                .join("assets")
+                .join(&kept)
+                .join("original.pdf")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn a_newer_schema_is_reported_so_validation_can_refuse_it() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("newer.sqlite3");
@@ -1726,9 +1932,13 @@ mod tests {
         let tree = directory.path().join("tree");
         std::fs::create_dir_all(tree.join("assets/abcdefghijklmnop")).unwrap();
         let ids = vec!["abcdefghijklmnop".to_owned()];
-        assert!(verify_live_directories(&tree, &ids).is_ok());
+        assert!(verify_directories(&tree, &ids, &[]).is_ok());
         std::fs::remove_dir(tree.join("assets/abcdefghijklmnop")).unwrap();
-        assert!(verify_live_directories(&tree, &ids).is_err());
+        assert!(verify_directories(&tree, &ids, &[]).is_err());
+        std::fs::create_dir_all(tree.join("trash/abcdefghijklmnop")).unwrap();
+        assert!(verify_directories(&tree, &[], &ids).is_ok());
+        std::fs::remove_dir(tree.join("trash/abcdefghijklmnop")).unwrap();
+        assert!(verify_directories(&tree, &[], &ids).is_err());
     }
 
     #[tokio::test]

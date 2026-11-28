@@ -177,8 +177,8 @@ as an attachment instead of being re-encoded into a picture.
   configuration differences, and the warning that everything after the
   snapshot will be lost. Traversal, symlinks, devices, unexpected members,
   truncation, a wrong SHA-256, a database failing `integrity_check` or
-  `foreign_key_check`, a newer schema, and a database naming missing asset
-  directories are refused before an upload id exists.
+  `foreign_key_check`, a newer schema, and a database naming missing live or
+  trashed asset directories are refused before an upload id exists.
 - `POST /api/v1/backups/restore/{upload_id}/apply` — authenticated swap of the
   validated upload. Requests are held while the database and directories are
   replaced by rename; the new database is opened, migrations and the startup
@@ -695,11 +695,12 @@ backup bundle therefore pairs both halves in one `application/x-tar`:
   layout. `staging/` and the generated sRGB profile are excluded.
 
 Creation refuses when another backup is running or when the volume cannot hold
-a second copy. Purges are paused for the duration, because a sweep that
-removed a trashed directory between the snapshot and the copy would ship a
-bundle that cannot restore. After the copy, every live asset directory the
-snapshot names is checked once; a missing one fails the backup loudly instead
-of producing a broken bundle. Extra directories uploaded after the snapshot
+a second copy. Purges, deletes and restores from the trash are held for the
+duration, because a sweep or a directory move between the snapshot and the copy
+would ship a bundle whose database and files disagree. After the copy, every
+directory the snapshot names is checked once — live rows in `assets/`, trashed
+rows in `trash/`; a missing one fails the backup loudly instead of producing a
+broken bundle. Extra directories uploaded after the snapshot
 are harmless: startup recovery sweeps them after a restore.
 
 Restore is a replacement at a point in time, never a merge. Upload the archive
@@ -711,7 +712,9 @@ apply, and the startup recovery path runs before serving resumes. Asset IDs
 are restored as-is, so public URLs do not change. A database from a newer
 Atlas is refused rather than opened: downgrading a schema is not a restore.
 The refusals are `422 invalid_backup`, except a newer schema, which is `409
-backup_schema_too_new` with the version in the message.
+backup_schema_too_new` with the version in the message. An interrupted swap is
+undone by a journal at startup before the database is opened. The apply gate
+holds other requests, including `/readyz`, while the swap runs.
 
 Scheduling is deliberately outside Atlas. A systemd timer or cron job can call
 `POST /api/v1/backups`, download the archive, and prune old bundles; Atlas

@@ -20,6 +20,7 @@ use std::{
 use axum::{
     Router,
     extract::{Request, State},
+    http::Method,
     middleware::Next,
     response::Response,
 };
@@ -58,6 +59,12 @@ pub struct AppState {
     /// guard, so the file swap happens with no request reading or writing the
     /// store it is replacing.
     pub(crate) restore_gate: Arc<tokio::sync::RwLock<()>>,
+    /// A backup holds the write side while it snapshots and copies; delete and
+    /// restore-from-trash hold the read side across their rename and row
+    /// update. Without this, an asset could move between `assets/` and
+    /// `trash/` after the snapshot and land only on the wrong side of the
+    /// bundle.
+    pub(crate) lifecycle_lock: Arc<tokio::sync::RwLock<()>>,
     /// The OpenAPI document, built once in `app()` from the same handlers the
     /// router serves. Empty until then, which is why the handler expects it.
     pub(crate) openapi: Arc<OnceLock<utoipa::openapi::OpenApi>>,
@@ -71,6 +78,12 @@ impl AppState {
         create_private_dir(&config.data_dir.join("assets"), true).await?;
         create_private_dir(&config.data_dir.join("trash"), true).await?;
         create_private_dir(&config.data_dir.join("backups"), true).await?;
+
+        // A restore that crashed mid-swap leaves a journal. Finish or undo the
+        // swap before opening a database, so a missing file cannot become a
+        // freshly created empty one and a later recovery cannot delete the
+        // asset directories that belong to it.
+        backup::recover_interrupted_restore(&config.data_dir).await?;
 
         let store = Store::connect(&config.data_dir.join("atlas.sqlite3")).await?;
         recover_incomplete_storage(&config.data_dir, &store).await?;
@@ -98,6 +111,7 @@ impl AppState {
             last_purge: Arc::new(Mutex::new(None)),
             backup_lock: Arc::new(Mutex::new(())),
             restore_gate: Arc::new(tokio::sync::RwLock::new(())),
+            lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
             openapi: Arc::new(OnceLock::new()),
         };
 
@@ -451,15 +465,21 @@ pub fn app(state: AppState) -> Router {
     ))
 }
 
-/// Block normal requests while a restore applies. The apply handler is the one
-/// exception, because it is the caller that closes and reopens the store.
+/// Block normal requests while a restore applies.
+///
+/// The apply route manages the write side itself, and backup creation takes
+/// the read side inside its detached task. Both are exempt here so a
+/// disconnect cannot drop a gate that the detached work still needs, and so a
+/// fair writer cannot deadlock between the middleware and the task.
 async fn hold_restore_gate(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if path.starts_with("/api/v1/backups/restore/") && path.ends_with("/apply") {
+    let is_apply = path.starts_with("/api/v1/backups/restore/") && path.ends_with("/apply");
+    let is_backup_create = request.method() == Method::POST && path == "/api/v1/backups";
+    if is_apply || is_backup_create {
         return next.run(request).await;
     }
     let _guard = state.restore_gate.read().await;

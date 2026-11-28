@@ -75,8 +75,8 @@ Placed at `examples/family-album/`.
 - [x] **Backup and restore over the HTTP API.** Create, list, download and
       delete tar bundles that pair the snapshot with `assets/` and `trash/`;
       upload and validate a bundle, then apply it as an all-or-nothing
-      replacement. Creation pauses purges and verifies every live directory
-      the snapshot names. Restore uploads are streamed under
+      replacement. Creation holds purges and delete/restore-from-trash moves,
+      and verifies every live and trashed directory the snapshot names. Restore uploads are streamed under
       `ATLAS_BACKUP_UPLOAD_MAX_BYTES`, extracted with an allowlist and path
       checks, and checked for integrity, foreign keys, a newer schema, and
       missing asset directories. Scheduling stays outside Atlas.
