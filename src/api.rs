@@ -34,13 +34,17 @@ use crate::{
     error::{ApiError, ErrorResponse},
     filename,
     ident::AssetId,
-    media::{MediaError, detect_multiframe, sha256_bytes, sha256_file, validate_signature},
+    media::{
+        ImageDimensions, MediaError, detect_multiframe, sha256_bytes, sha256_file,
+        validate_signature,
+    },
     model::{
         AssetRecord, AssetState, Kind, RenditionFormat, RenditionRecord, SourceFormat, StoredAsset,
     },
     store::{
-        DEFAULT_LIST_LIMIT, InsertOutcome, ListQuery, MAX_LIST_LIMIT, Order, ReRenderJobOutcome,
-        ReRenderJobState, Sort, StateFilter, StoreError,
+        CreateUploadJob, DEFAULT_LIST_LIMIT, InsertOutcome, ListQuery, MAX_LIST_LIMIT,
+        NewUploadJob, Order, PromoteUpload, ReRenderJobOutcome, ReRenderJobState, Sort,
+        StateFilter, StoreError, UploadJobRow, UploadJobState,
     },
 };
 
@@ -527,19 +531,22 @@ impl From<&StoredAsset> for TrashEntryResponse {
     post,
     path = "/api/v1/images",
     request_body(content(("image/*")), description = "The file bytes."),
+    params(UploadQuery),
     responses((status = 201, description = "Created.", body = AssetResponse),
         (status = 200, description = "The bytes are already live here; deduplicated.", body = AssetResponse),
+        (status = 202, description = "With `async=true`: accepted; poll the job until the asset is ready.", body = UploadAcceptedResponse),
         (status = 400, description = "Invalid request.", body = ErrorResponse),
         (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
         (status = 413, description = "The upload is larger than the limit.", body = ErrorResponse),
         (status = 415, description = "Unsupported media type.", body = ErrorResponse),
         (status = 422, description = "The bytes are not valid media.", body = ErrorResponse),
+        (status = 503, description = "At upload capacity, or with `async=true`, the queue of uploads waiting to convert is full.", body = ErrorResponse),
         (status = 507, description = "The data volume is below the free-space floor.", body = ErrorResponse))
 )]
 pub(super) async fn upload_image(
     State(state): State<AppState>,
     request: Request,
-) -> Result<(StatusCode, Json<AssetResponse>), ApiError> {
+) -> Result<Response, ApiError> {
     upload_into(state, Kind::Image, request).await
 }
 
@@ -560,8 +567,28 @@ pub(super) async fn upload_image(
 pub(super) async fn upload_document(
     State(state): State<AppState>,
     request: Request,
-) -> Result<(StatusCode, Json<AssetResponse>), ApiError> {
+) -> Result<Response, ApiError> {
     upload_into(state, Kind::Document, request).await
+}
+
+/// How many accepted async uploads may wait to convert at once.
+///
+/// Accepted work is a promise with bytes on disk behind it, so it is bounded
+/// the way intake is: past the cap the answer is `503`, and synchronous
+/// uploads keep working: the backlog waits behind its own slots, so a
+/// synchronous conversion waits for at most one conversion per permit.
+pub(crate) const MAX_PENDING_UPLOADS: usize = 200;
+
+/// The query an upload accepts. Uploads are raw bodies, so the one flag rides
+/// in the URL rather than in JSON the way re-render's `async` does.
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(super) struct UploadQuery {
+    /// Images only. `true` answers `202` once intake has checked the bytes,
+    /// and converts them detached from the request.
+    #[serde(rename = "async")]
+    #[param(rename = "async")]
+    asynchronous: Option<bool>,
 }
 
 /// The upload itself, shared by both collections.
@@ -569,13 +596,24 @@ pub(super) async fn upload_document(
 /// The collection comes from the route, so the classification is a property of
 /// the call site rather than a header the caller asserts: posting a PDF to
 /// `/api/v1/images` is refused, not quietly stored.
-async fn upload_into(
-    state: AppState,
-    kind: Kind,
-    request: Request,
-) -> Result<(StatusCode, Json<AssetResponse>), ApiError> {
+async fn upload_into(state: AppState, kind: Kind, request: Request) -> Result<Response, ApiError> {
     let state = &state;
     authorize(state, request.headers())?;
+    let query = Query::<UploadQuery>::try_from_uri(request.uri()).map_err(|error| {
+        ApiError::bad_request(
+            "invalid_query",
+            format!("The query string is not valid for an upload: {error}"),
+        )
+    })?;
+    let asynchronous = query.asynchronous.unwrap_or(false);
+    if asynchronous && !kind.generates_renditions() {
+        // A document is stored untouched: intake is the whole request, and
+        // there is nothing to detach.
+        return Err(ApiError::bad_request(
+            "async_not_supported",
+            "async applies to images only; a document upload has no conversion to detach.",
+        ));
+    }
     let headers = request.headers();
     let content_type = headers
         .get(CONTENT_TYPE)
@@ -641,6 +679,20 @@ async fn upload_into(
     // would let the disk fill.
     ensure_free_space(state)?;
 
+    // Refused before the body is read, like the disk floor: a full queue
+    // must not cost the client the bytes. The count is checked again where
+    // the job is written, which is where it is exact.
+    if asynchronous
+        && state
+            .store
+            .converting_upload_count()
+            .await
+            .map_err(ApiError::internal)?
+            >= state.max_pending_uploads
+    {
+        return Err(upload_queue_full());
+    }
+
     let _upload_permit = state
         .upload_slots
         .clone()
@@ -653,10 +705,13 @@ async fn upload_into(
         .map_err(ApiError::internal)?;
     let result = create_asset(
         state,
-        id,
-        kind,
-        source_format,
-        original_name,
+        Intake {
+            id,
+            kind,
+            source_format,
+            original_name,
+            asynchronous,
+        },
         request.into_body(),
         &staging_dir,
     )
@@ -693,16 +748,37 @@ fn ensure_free_space(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn create_asset(
-    state: &AppState,
+fn upload_queue_full() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "upload_queue_full",
+        "Too many async uploads are waiting to convert. Retry once some are ready, \
+         or upload without async.",
+    )
+}
+
+/// What the route and headers decided about an upload before its body is read.
+struct Intake {
     id: AssetId,
     kind: Kind,
     source_format: SourceFormat,
     original_name: Option<String>,
+    asynchronous: bool,
+}
+
+async fn create_asset(
+    state: &AppState,
+    intake: Intake,
     body: Body,
     staging_dir: &std::path::Path,
-) -> Result<(StatusCode, Json<AssetResponse>), ApiError> {
+) -> Result<Response, ApiError> {
+    let Intake {
+        id,
+        kind,
+        source_format,
+        original_name,
+        asynchronous,
+    } = intake;
     let upload_path = staging_dir.join("upload.part");
     let limit = if source_format.is_image() {
         state.config.max_image_bytes
@@ -757,40 +833,33 @@ async fn create_asset(
             .await
             .map_err(ApiError::internal)?;
         // 200 rather than 201: nothing was created, and saying so is the point.
+        // An async upload answers the same way: there is nothing to convert.
         return Ok((
             StatusCode::OK,
             Json(AssetResponse::from(&asset).deduplicated()),
-        ));
+        )
+            .into_response());
+    }
+
+    if asynchronous {
+        return accept_upload_job(
+            state,
+            AcceptedUpload {
+                asset_id: id,
+                source_format,
+                bytes,
+                sha256: original_sha256,
+                original_name,
+            },
+            staging_dir,
+            &original_path,
+        )
+        .await;
     }
 
     let (dimensions, renditions) = if kind.generates_renditions() {
-        let _permit = state
-            .conversion_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(ApiError::internal)?;
-        let processed = tokio::time::timeout(state.config.image_processing_timeout, async {
-            let dimensions = state
-                .image_processor
-                .inspect(&original_path, source_format, staging_dir)
-                .await?;
-            let renditions = state
-                .image_processor
-                .generate(
-                    &original_path,
-                    source_format,
-                    dimensions,
-                    &state.config.variant_widths,
-                    staging_dir,
-                )
-                .await?;
-            Ok::<_, MediaError>((dimensions, renditions))
-        })
-        .await
-        .map_err(|_| ApiError::invalid("Image processing exceeded its time limit."))?
-        .map_err(map_media_error)?;
-        let (dimensions, renditions) = processed;
+        let (dimensions, renditions) =
+            convert_original(state, &original_path, source_format, staging_dir).await?;
         (Some(dimensions), renditions)
     } else {
         (None, Vec::new())
@@ -859,7 +928,45 @@ async fn create_asset(
 
     schedule_purge(state);
 
-    Ok((StatusCode::CREATED, Json(AssetResponse::from(&stored))))
+    Ok((StatusCode::CREATED, Json(AssetResponse::from(&stored))).into_response())
+}
+
+/// Inspect an original and write its renditions beside it in `staging_dir`,
+/// under a conversion permit and the per-image time limit. The synchronous
+/// upload and the detached one convert through this, so they share one set
+/// of bounds.
+async fn convert_original(
+    state: &AppState,
+    original_path: &std::path::Path,
+    source_format: SourceFormat,
+    staging_dir: &std::path::Path,
+) -> Result<(ImageDimensions, Vec<RenditionRecord>), ApiError> {
+    let _permit = state
+        .conversion_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(ApiError::internal)?;
+    tokio::time::timeout(state.config.image_processing_timeout, async {
+        let dimensions = state
+            .image_processor
+            .inspect(original_path, source_format, staging_dir)
+            .await?;
+        let renditions = state
+            .image_processor
+            .generate(
+                original_path,
+                source_format,
+                dimensions,
+                &state.config.variant_widths,
+                staging_dir,
+            )
+            .await?;
+        Ok::<_, MediaError>((dimensions, renditions))
+    })
+    .await
+    .map_err(|_| ApiError::invalid("Image processing exceeded its time limit."))?
+    .map_err(map_media_error)
 }
 
 /// Sweep expired trash in the background. There is no scheduler, so an upload is
@@ -3383,6 +3490,414 @@ pub(super) async fn get_re_render_job(
         error: job.error,
         progress,
         results,
+    }))
+}
+
+/// What intake learned about an upload that is about to convert detached.
+struct AcceptedUpload {
+    asset_id: AssetId,
+    source_format: SourceFormat,
+    bytes: u64,
+    sha256: String,
+    original_name: Option<String>,
+}
+
+/// The answer to an async upload: the id the asset will have and the job to
+/// poll until it does.
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct UploadAcceptedResponse {
+    /// The asset id, reserved. Every metadata and media route answers `404`
+    /// for it until the job is `ready`.
+    id: String,
+    job_id: String,
+}
+
+/// An async upload's state, and on `ready` the asset a synchronous upload
+/// would have answered with.
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct UploadJobResponse {
+    job_id: String,
+    /// The asset id the `202` reserved.
+    id: String,
+    /// `converting`, `ready` or `failed`.
+    state: String,
+    created_at: i64,
+    updated_at: i64,
+    /// Set only in the `failed` state: the error a synchronous upload of the
+    /// same bytes would have answered with.
+    error: Option<UploadJobErrorResponse>,
+    /// Set only in the `ready` state. Its `id` is the reserved one, unless
+    /// identical bytes were promoted first while this upload converted; then
+    /// it is that asset, marked `deduplicated`, and the reserved id stays
+    /// unused.
+    asset: Option<AssetResponse>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct UploadJobErrorResponse {
+    code: String,
+    message: String,
+}
+
+/// Write an accepted upload's job row and start converting it detached.
+///
+/// Intake has already done everything that can refuse the upload on its
+/// bytes, so the `202` is a promise: the original moves out of staging into
+/// the job's own directory, which startup recovery keeps while the job is
+/// converting, and only then is the row written. A crash before the row
+/// leaves a directory recovery removes; a crash after it leaves a job the
+/// next process converts.
+async fn accept_upload_job(
+    state: &AppState,
+    upload: AcceptedUpload,
+    staging_dir: &std::path::Path,
+    original_path: &std::path::Path,
+) -> Result<Response, ApiError> {
+    let job_id = AssetId::generate(state.config.id_length)
+        .map_err(ApiError::internal)?
+        .to_string();
+    let job_dir = state.upload_job_dir(&job_id);
+    fs::create_dir(&job_dir).await.map_err(ApiError::internal)?;
+    let kept = job_dir.join(format!("original.{}", upload.source_format.extension()));
+    let written = async {
+        fs::rename(original_path, &kept)
+            .await
+            .map_err(ApiError::internal)?;
+        let created_at = crate::unix_now().map_err(ApiError::internal)?;
+        let mut asset_id = upload.asset_id;
+        let mut attempts = 0_usize;
+        loop {
+            let outcome = {
+                let _guard = state.upload_jobs_lock.lock().await;
+                state
+                    .store
+                    .create_upload_job(
+                        &NewUploadJob {
+                            id: &job_id,
+                            asset_id: &asset_id,
+                            created_at,
+                            source_format: upload.source_format,
+                            bytes: upload.bytes,
+                            sha256: &upload.sha256,
+                            original_name: upload.original_name.as_deref(),
+                        },
+                        state.max_pending_uploads,
+                    )
+                    .await
+                    .map_err(ApiError::internal)?
+            };
+            match outcome {
+                CreateUploadJob::Created => return Ok((asset_id, created_at)),
+                CreateUploadJob::Full => return Err(upload_queue_full()),
+                CreateUploadJob::DuplicateId if attempts < MAX_ID_ATTEMPTS => {
+                    attempts += 1;
+                    asset_id =
+                        AssetId::generate(state.config.id_length).map_err(ApiError::internal)?;
+                }
+                CreateUploadJob::DuplicateId => {
+                    return Err(ApiError::internal(
+                        "could not reserve a unique asset ID after repeated collisions",
+                    ));
+                }
+            }
+        }
+    }
+    .await;
+    let (asset_id, created_at) = match written {
+        Ok(written) => written,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&job_dir).await;
+            return Err(error);
+        }
+    };
+    // The staging directory is empty now; its original lives with the job.
+    let _ = fs::remove_dir_all(staging_dir).await;
+
+    prune_old_upload_jobs(state, created_at).await;
+    tracing::info!(job = %job_id, asset = %asset_id, "accepted an async upload");
+    tokio::spawn(run_upload_job(state.clone(), job_id.clone()));
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(UploadAcceptedResponse {
+            id: asset_id.to_string(),
+            job_id,
+        }),
+    )
+        .into_response())
+}
+
+/// Convert one accepted upload and publish it, detached from every
+/// connection.
+///
+/// The job's original is never consumed: conversion works on a hard link in
+/// a fresh staging directory, so a crash anywhere before the promotion
+/// commits leaves the job converting with its bytes intact, and the next
+/// process starts over from them. The promotion itself refuses a job that
+/// is no longer converting, so a job is published once however often it is
+/// run.
+async fn run_upload_job(state: AppState, job_id: String) {
+    let job = match state.store.upload_job(&job_id).await {
+        Ok(Some(job)) if job.state == UploadJobState::Converting => job,
+        Ok(_) => {
+            tracing::debug!(job = %job_id, "upload job is not converting; not starting it");
+            return;
+        }
+        Err(error) => {
+            tracing::error!(job = %job_id, %error, "could not read the upload job");
+            return;
+        }
+    };
+
+    let terminal = match convert_and_promote(&state, &job).await {
+        Ok(PromoteUpload::Created) => {
+            tracing::info!(job = %job.id, asset = %job.asset_id, "async upload is ready");
+            schedule_purge(&state);
+            true
+        }
+        Ok(PromoteUpload::Deduplicated(existing)) => {
+            tracing::info!(job = %job.id, asset = %existing, "async upload matched an asset promoted first");
+            true
+        }
+        Ok(PromoteUpload::NotConverting | PromoteUpload::DuplicateId) => true,
+        Err(error) => {
+            tracing::error!(job = %job.id, code = error.code(), error = error.detail(), "async upload failed");
+            record_upload_failure(&state, &job.id, &error).await
+        }
+    };
+    // A job that could not be marked terminal keeps its original, so the next
+    // process can try again rather than finding the bytes gone.
+    if terminal {
+        let _ = fs::remove_dir_all(state.upload_job_dir(&job.id)).await;
+    }
+}
+
+/// Record a failed conversion; `true` when the job is now terminal.
+async fn record_upload_failure(state: &AppState, job_id: &str, error: &ApiError) -> bool {
+    let now = match crate::unix_now() {
+        Ok(now) => now,
+        Err(clock) => {
+            tracing::error!(job = %job_id, error = %clock, "cannot timestamp the upload failure");
+            return false;
+        }
+    };
+    match state
+        .store
+        .fail_upload_job(job_id, now, error.code(), error.detail())
+        .await
+    {
+        Ok(()) => true,
+        Err(store) => {
+            tracing::error!(job = %job_id, error = %store, "could not record the upload failure");
+            false
+        }
+    }
+}
+
+async fn convert_and_promote(
+    state: &AppState,
+    job: &UploadJobRow,
+) -> Result<PromoteUpload, ApiError> {
+    let file_name = format!("original.{}", job.source_format.extension());
+    let original = state.upload_job_dir(&job.id).join(&file_name);
+    if fs::symlink_metadata(&original).await.is_err() {
+        return Err(ApiError::internal(format!(
+            "upload job {} lost its original before it converted",
+            job.id
+        )));
+    }
+
+    // Taken before anything is staged, so the backlog waits here and not in
+    // the conversion permits' queue, where it would sit ahead of every
+    // synchronous upload and re-render that arrives after it.
+    let _slot = state
+        .upload_job_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(ApiError::internal)?;
+    // Intake checked the floor, but the renditions are written now, maybe
+    // long after: the job is held to it again right before it writes, the
+    // way a re-render is.
+    ensure_free_space(state)?;
+
+    let staging_dir = state.staging_dir(&job.asset_id);
+    let _ = fs::remove_dir_all(&staging_dir).await;
+    fs::create_dir(&staging_dir)
+        .await
+        .map_err(ApiError::internal)?;
+    let staged = async {
+        let staged_original = staging_dir.join(&file_name);
+        fs::hard_link(&original, &staged_original)
+            .await
+            .map_err(ApiError::internal)?;
+        convert_original(state, &staged_original, job.source_format, &staging_dir).await
+    }
+    .await;
+    let (dimensions, renditions) = match staged {
+        Ok(converted) => converted,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging_dir).await;
+            return Err(error);
+        }
+    };
+
+    let record = AssetRecord {
+        id: job.asset_id.clone(),
+        source_format: job.source_format,
+        bytes: job.bytes,
+        sha256: job.sha256.clone(),
+        width: Some(dimensions.width),
+        height: Some(dimensions.height),
+        // Accepted, not converted: a batch keeps the order it was uploaded
+        // in, whatever order its conversions finish.
+        created_at: job.created_at,
+        original_name: job.original_name.clone(),
+        kind: Some(Kind::Image),
+        deleted_at: None,
+        purged_at: None,
+        pinned: false,
+        consumer_data: None,
+        generation: 1,
+    };
+
+    let final_dir = state.asset_dir(&job.asset_id);
+    if let Err(error) = fs::rename(&staging_dir, &final_dir).await {
+        let _ = fs::remove_dir_all(&staging_dir).await;
+        return Err(ApiError::internal(error));
+    }
+    let promoted = async {
+        let now = crate::unix_now().map_err(ApiError::internal)?;
+        let _guard = state.upload_jobs_lock.lock().await;
+        state
+            .store
+            .promote_upload_job(&job.id, &record, &renditions, now)
+            .await
+            .map_err(ApiError::internal)
+    }
+    .await;
+    match promoted {
+        Ok(PromoteUpload::Created) => Ok(PromoteUpload::Created),
+        Ok(PromoteUpload::DuplicateId) => {
+            let _ = fs::remove_dir_all(&final_dir).await;
+            Err(ApiError::internal(format!(
+                "the reserved asset id {} was taken before upload job {} was promoted",
+                job.asset_id, job.id
+            )))
+        }
+        // Nothing was published under the reserved id, so the files that were
+        // about to be are not anybody's.
+        Ok(other) => {
+            let _ = fs::remove_dir_all(&final_dir).await;
+            Ok(other)
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&final_dir).await;
+            Err(error)
+        }
+    }
+}
+
+/// Bound how long finished upload jobs are kept, on the trash retention
+/// window like re-render jobs.
+async fn prune_old_upload_jobs(state: &AppState, now: i64) {
+    let retention = i64::from(state.config.trash_retention_days) * 86_400;
+    match state.store.prune_upload_jobs(now - retention).await {
+        Ok(0) => {}
+        Ok(pruned) => tracing::info!(pruned, "pruned old upload jobs"),
+        Err(error) => tracing::error!(%error, "upload job prune failed"),
+    }
+}
+
+/// Convert again every upload the previous process accepted but did not
+/// publish, called once from `AppState::new` before the service answers
+/// requests. Recovery has already emptied staging and removed unindexed
+/// asset directories, so each job starts over from its kept original.
+pub(crate) async fn resume_upload_jobs(state: AppState) {
+    if let Ok(now) = crate::unix_now() {
+        prune_old_upload_jobs(&state, now).await;
+    }
+    match state.store.converting_upload_jobs().await {
+        Ok(jobs) => {
+            for job in jobs {
+                tracing::info!(job = %job.id, asset = %job.asset_id, "resuming async upload");
+                tokio::spawn(run_upload_job(state.clone(), job.id));
+            }
+        }
+        Err(error) => tracing::error!(%error, "could not list upload jobs to resume"),
+    }
+}
+
+/// An async upload's state, by job id.
+#[utoipa::path(
+    get,
+    path = "/api/v1/uploads/{job_id}",
+    params(("job_id" = String, Path)),
+    responses((status = 200, description = "The upload job, and on `ready` its asset.", body = UploadJobResponse),
+        (status = 401, description = "Missing or invalid token.", body = ErrorResponse),
+        (status = 404, description = "No such job.", body = ErrorResponse))
+)]
+pub(super) async fn get_upload_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> Result<Json<UploadJobResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    let not_found = || {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            "The upload job was not found.",
+        )
+    };
+    let id = AssetId::parse(&job_id).map_err(|_| not_found())?;
+    let job = state
+        .store
+        .upload_job(id.as_str())
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(not_found)?;
+
+    let asset = match (job.state, &job.result_id) {
+        (UploadJobState::Ready, Some(result_id)) => {
+            let stored = state
+                .store
+                .get_asset(result_id)
+                .await
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "upload job {} is ready with asset {result_id}, which has no row",
+                        job.id
+                    ))
+                })?;
+            let response = AssetResponse::from(&stored);
+            Some(if job.deduplicated {
+                response.deduplicated()
+            } else {
+                response
+            })
+        }
+        (UploadJobState::Ready, None) => {
+            return Err(ApiError::internal(format!(
+                "upload job {} is ready without an asset",
+                job.id
+            )));
+        }
+        _ => None,
+    };
+    let error = match (job.error_code, job.error_message) {
+        (Some(code), Some(message)) => Some(UploadJobErrorResponse { code, message }),
+        _ => None,
+    };
+
+    Ok(Json(UploadJobResponse {
+        job_id: job.id,
+        id: job.asset_id.to_string(),
+        state: job.state.key().to_owned(),
+        created_at: job.created_at,
+        updated_at: job.updated_at,
+        error,
+        asset,
     }))
 }
 
@@ -6883,6 +7398,7 @@ mod tests {
             "/api/v1/openapi.json",
             "/api/v1/summary",
             "/api/v1/trash",
+            "/api/v1/uploads/{job_id}",
             "/api/v1/{kind}/actions",
             "/api/v1/{kind}/{id}",
             "/api/v1/{kind}/{id}/data",
@@ -8357,6 +8873,404 @@ mod tests {
         );
         assert_eq!(job["results"][0]["outcome"], "re_encoded");
         assert_eq!(job["results"][0]["generation"], 2);
+    }
+
+    /// An image upload that asks to convert detached.
+    fn async_upload_request(content_type: &str, body: Vec<u8>) -> Request<Body> {
+        let mut request = upload_request(content_type, body);
+        *request.uri_mut() = "/api/v1/images?async=true".parse().unwrap();
+        request
+    }
+
+    /// Accept an async PNG upload and return `(id, job_id)`.
+    async fn accept_async_upload(router: &Router, body: Vec<u8>) -> (String, String) {
+        let (status, accepted) = send(router, async_upload_request("image/png", body)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+        (
+            accepted["id"].as_str().unwrap().to_owned(),
+            accepted["job_id"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// Poll an upload job until it is `ready` or `failed`, as a consumer
+    /// whose upload request is long gone would.
+    async fn wait_for_upload_job(router: &Router, job_id: &str) -> serde_json::Value {
+        let uri = format!("/api/v1/uploads/{job_id}");
+        for _ in 0..600 {
+            let (status, job) = send(router, authorized("GET", &uri)).await;
+            assert_eq!(status, StatusCode::OK, "{job}");
+            if matches!(job["state"].as_str(), Some("ready" | "failed")) {
+                return job;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("upload job {job_id} did not reach a terminal state in 30s");
+    }
+
+    async fn image_total(router: &Router) -> i64 {
+        let (status, listing) = send(router, authorized("GET", "/api/v1/images")).await;
+        assert_eq!(status, StatusCode::OK, "{listing}");
+        listing["total"].as_i64().unwrap()
+    }
+
+    /// Every conversion permit, held so accepted uploads stay `converting`
+    /// for as long as a test needs to look at them.
+    async fn hold_conversions(state: &AppState) -> tokio::sync::OwnedSemaphorePermit {
+        let permits = u32::try_from(state.config.conversion_concurrency).unwrap();
+        state
+            .conversion_slots
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .unwrap()
+    }
+
+    /// Nothing partial is visible: until the job is `ready`, the reserved id
+    /// is unknown to every metadata and media route, and once it is, the job
+    /// answers with the body a synchronous `201` would have.
+    #[tokio::test]
+    async fn an_async_upload_is_invisible_until_it_is_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let held = hold_conversions(&state).await;
+        let router = app(state);
+
+        let (id, job_id) = accept_async_upload(
+            &router,
+            write_test_image(&directory.path().join("async.png"), "400x300"),
+        )
+        .await;
+        assert!(AssetId::parse(&id).is_ok());
+        assert_ne!(id, job_id);
+
+        let (status, error) = send(&router, authorized("GET", &asset_uri("images", &id))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+        assert_eq!(error["error"]["code"], "asset_not_found");
+        let (status, _, _) = fetch(&router, &format!("/media/{id}/original")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = fetch(&router, &format!("/media/{id}/w320")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(image_total(&router).await, 0);
+
+        let (status, job) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/uploads/{job_id}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{job}");
+        assert_eq!(job["state"], "converting");
+        assert_eq!(job["id"], id.as_str());
+        assert!(job["asset"].is_null());
+        assert!(job["error"].is_null());
+
+        drop(held);
+        let job = wait_for_upload_job(&router, &job_id).await;
+        assert_eq!(job["state"], "ready", "{job}");
+        assert_eq!(job["asset"]["id"], id.as_str());
+        assert!(job["asset"].get("deduplicated").is_none(), "{job}");
+        assert!(!job["asset"]["renditions"].as_array().unwrap().is_empty());
+
+        let (status, asset) = send(&router, authorized("GET", &asset_uri("images", &id))).await;
+        assert_eq!(status, StatusCode::OK, "{asset}");
+        assert_eq!(asset["renditions"], job["asset"]["renditions"]);
+        assert_eq!(asset["original"], job["asset"]["original"]);
+        let (status, _, _) = fetch(&router, &format!("/media/{id}/w320")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The kept original goes once the job is terminal.
+        let uploads = directory.path().join("atlas/uploads").join(&job_id);
+        assert!(!uploads.exists(), "the job's original outlived the job");
+    }
+
+    /// The async backlog waits behind its own slots, not in the conversion
+    /// permits' queue: a synchronous upload that arrives after three accepted
+    /// uploads converts as soon as the one already queued is done.
+    #[tokio::test]
+    async fn a_sync_upload_does_not_wait_behind_the_async_backlog() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let held = hold_conversions(&state).await;
+        let router = app(state.clone());
+
+        let mut jobs = Vec::new();
+        for size in ["400x300", "401x300", "402x300"] {
+            let image = write_test_image(&directory.path().join(format!("{size}.png")), size);
+            jobs.push(accept_async_upload(&router, image).await.1);
+        }
+        // Let the first job reach the conversion permits' queue.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(state.upload_job_slots.available_permits(), 0);
+
+        let sync = tokio::spawn({
+            let router = router.clone();
+            let image = write_test_image(&directory.path().join("sync.png"), "403x300");
+            async move { send(&router, upload_request("image/png", image)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(held);
+
+        let (status, created) = sync.await.unwrap();
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let (_, last) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/uploads/{}", jobs[2])),
+        )
+        .await;
+        assert_eq!(
+            last["state"], "converting",
+            "the sync upload waited for the whole backlog"
+        );
+        for job in &jobs {
+            assert_eq!(wait_for_upload_job(&router, job).await["state"], "ready");
+        }
+    }
+
+    /// A process that dies mid-conversion leaves the job `converting` with its
+    /// original kept; the next one converts it again and publishes it once,
+    /// under the id the client was given.
+    #[tokio::test]
+    async fn an_async_upload_resumes_after_a_restart_and_is_promoted_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = test_config(directory.path().join("atlas"));
+        let first = AppState::new(config.clone()).await.unwrap();
+        // The first process never gets to convert: its permits stay taken
+        // until the test ends, as if it had died holding them.
+        let _dead = hold_conversions(&first).await;
+        let (id, job_id) = accept_async_upload(
+            &app(first),
+            write_test_image(&directory.path().join("resume.png"), "400x300"),
+        )
+        .await;
+
+        // What a crash after the rename and before the commit leaves behind:
+        // a published-looking directory with no row.
+        let stray = config.data_dir.join("assets").join(&id);
+        std::fs::create_dir(&stray).unwrap();
+        std::fs::write(stray.join("original.png"), b"half-written").unwrap();
+
+        let router = app(AppState::new(config.clone()).await.unwrap());
+        let job = wait_for_upload_job(&router, &job_id).await;
+        assert_eq!(job["state"], "ready", "{job}");
+        assert_eq!(job["asset"]["id"], id.as_str());
+        assert_eq!(image_total(&router).await, 1);
+        let (status, _, body) = fetch(&router, &format!("/media/{id}/original")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(body, b"half-written");
+        let (status, _, _) = fetch(&router, &format!("/media/{id}/w320")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A third start finds nothing left to do.
+        let router = app(AppState::new(config).await.unwrap());
+        assert_eq!(image_total(&router).await, 1);
+        let (_, again) = send(
+            &router,
+            authorized("GET", &format!("/api/v1/uploads/{job_id}")),
+        )
+        .await;
+        assert_eq!(again, job);
+    }
+
+    /// The floor is checked again when a job converts, not only at intake:
+    /// a job that would write its renditions below it fails with `507`'s
+    /// code instead, and its kept original goes.
+    #[tokio::test]
+    async fn an_async_upload_below_the_floor_fails_when_it_converts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        let first = AppState::new(config.clone()).await.unwrap();
+        let _dead = hold_conversions(&first).await;
+        let (_, job_id) = accept_async_upload(
+            &app(first),
+            write_test_image(&directory.path().join("floor.png"), "400x300"),
+        )
+        .await;
+
+        // The disk filled while the job waited: the next process converts it
+        // under a floor no volume can meet.
+        config.min_free_bytes = u64::MAX;
+        let router = app(AppState::new(config.clone()).await.unwrap());
+        let job = wait_for_upload_job(&router, &job_id).await;
+        assert_eq!(job["state"], "failed", "{job}");
+        assert_eq!(job["error"]["code"], "insufficient_storage", "{job}");
+        assert_eq!(image_total(&router).await, 0);
+        assert!(!config.data_dir.join("uploads").join(&job_id).exists());
+    }
+
+    /// Two async uploads of the same bytes, both accepted before either
+    /// converted, converge on one asset at promotion.
+    #[tokio::test]
+    async fn concurrent_identical_async_uploads_converge_on_one_asset() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        let held = hold_conversions(&state).await;
+        let router = app(state);
+        let bytes = write_test_image(&directory.path().join("twin.png"), "400x300");
+
+        let (first_id, first_job) = accept_async_upload(&router, bytes.clone()).await;
+        let (second_id, second_job) = accept_async_upload(&router, bytes).await;
+        assert_ne!(first_id, second_id);
+
+        drop(held);
+        let first = wait_for_upload_job(&router, &first_job).await;
+        let second = wait_for_upload_job(&router, &second_job).await;
+        assert_eq!(first["state"], "ready", "{first}");
+        assert_eq!(second["state"], "ready", "{second}");
+        assert_eq!(first["asset"]["id"], second["asset"]["id"]);
+        let deduplicated = [&first, &second]
+            .iter()
+            .filter(|job| job["asset"]["deduplicated"] == true)
+            .count();
+        assert_eq!(deduplicated, 1, "{first} {second}");
+        assert_eq!(image_total(&router).await, 1);
+
+        // The id the deduplicated job reserved was never published.
+        let (winner, loser) = if first["asset"]["deduplicated"] == true {
+            (&second_id, &first_id)
+        } else {
+            (&first_id, &second_id)
+        };
+        assert_eq!(first["asset"]["id"], winner.as_str());
+        let (status, _) = send(&router, authorized("GET", &asset_uri("images", loser))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Refusal stays synchronous: bytes, signature and frame count are
+    /// checked before the `202`, and nothing is queued for a refused upload.
+    #[tokio::test]
+    async fn async_intake_refuses_before_accepting() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = test_config(directory.path().join("atlas"));
+        let router = app(AppState::new(config.clone()).await.unwrap());
+
+        let (status, error) = send(
+            &router,
+            async_upload_request("image/png", vec![0; 1024 * 1024 + 1]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+
+        let png = write_test_image(&directory.path().join("liar.png"), "40x30");
+        let (status, error) = send(&router, async_upload_request("image/jpeg", png)).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{error}");
+
+        if let Some(animated) = write_test_animation(
+            &directory.path().join("anim.png"),
+            "60x40",
+            "APNG",
+            crate::model::SourceFormat::Png,
+        ) {
+            let (status, error) = send(&router, async_upload_request("image/png", animated)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+            assert_eq!(error["error"]["code"], "multi_frame_unsupported");
+        }
+
+        let mut document = upload_request("application/pdf", b"%PDF-1.7\n".to_vec());
+        *document.uri_mut() = "/api/v1/documents?async=true".parse().unwrap();
+        let (status, error) = send(&router, document).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["error"]["code"], "async_not_supported");
+
+        let mut unclear = upload_request("image/png", b"irrelevant".to_vec());
+        *unclear.uri_mut() = "/api/v1/images?async=maybe".parse().unwrap();
+        let (status, error) = send(&router, unclear).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["error"]["code"], "invalid_query");
+
+        let uploads = std::fs::read_dir(config.data_dir.join("uploads")).unwrap();
+        assert_eq!(uploads.count(), 0, "a refused upload left a job behind");
+        assert_eq!(image_total(&router).await, 0);
+    }
+
+    /// A conversion that fails after the `202` fails the job with the error a
+    /// synchronous upload of the same bytes answers with.
+    #[tokio::test]
+    async fn an_async_conversion_failure_is_reported_on_the_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path().join("atlas"));
+        config.max_image_dimension = 200;
+        let router = app(AppState::new(config.clone()).await.unwrap());
+        let wide = write_test_image(&directory.path().join("wide.png"), "400x100");
+
+        let (status, refused) = send(&router, upload_request("image/png", wide.clone())).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+
+        let (id, job_id) = accept_async_upload(&router, wide).await;
+        let job = wait_for_upload_job(&router, &job_id).await;
+        assert_eq!(job["state"], "failed", "{job}");
+        assert!(job["asset"].is_null());
+        assert_eq!(job["error"]["code"], refused["error"]["code"]);
+        assert_eq!(job["error"]["message"], refused["error"]["message"]);
+        let (status, _) = send(&router, authorized("GET", &asset_uri("images", &id))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!config.data_dir.join("uploads").join(&job_id).exists());
+    }
+
+    /// Past the cap an async upload is `503`, and a synchronous upload, which
+    /// waits in nobody's queue, still works.
+    #[tokio::test]
+    async fn a_full_async_queue_refuses_async_uploads_but_not_synchronous_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap();
+        state.max_pending_uploads = 1;
+        let held = hold_conversions(&state).await;
+        let router = app(state);
+
+        let (_, job_id) = accept_async_upload(
+            &router,
+            write_test_image(&directory.path().join("queued.png"), "400x300"),
+        )
+        .await;
+        let (status, error) = send(
+            &router,
+            async_upload_request(
+                "image/png",
+                write_test_image(&directory.path().join("refused.png"), "500x300"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+        assert_eq!(error["error"]["code"], "upload_queue_full");
+
+        let synchronous = tokio::spawn({
+            let router = router.clone();
+            let bytes = write_test_image(&directory.path().join("sync.png"), "300x200");
+            async move { send(&router, upload_request("image/png", bytes)).await }
+        });
+        drop(held);
+        let (status, created) = synchronous.await.unwrap();
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(
+            wait_for_upload_job(&router, &job_id).await["state"],
+            "ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_upload_job_is_not_found() {
+        let directory = tempfile::tempdir().unwrap();
+        let router = app(AppState::new(test_config(directory.path().join("atlas")))
+            .await
+            .unwrap());
+        for job_id in [
+            AssetId::generate(18).unwrap().to_string(),
+            "Not-An-Id".to_owned(),
+        ] {
+            let (status, error) = send(
+                &router,
+                authorized("GET", &format!("/api/v1/uploads/{job_id}")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+            assert_eq!(error["error"]["code"], "job_not_found");
+        }
     }
 
     /// Rejected values are quoted, escaped and bounded: they are arbitrary

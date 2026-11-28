@@ -747,6 +747,49 @@ def check_api(checks: Checks) -> None:
         by_canonical["total"],
     )
 
+    print("\n== async upload ==", flush=True)
+    # The conversion is detached: the 202 hands out an id that is not an
+    # asset yet, and the asset appears whole once the job is ready. Like
+    # the heif section, this adds an asset, so it runs after the counts.
+    status, accepted = checks.request(
+        "POST",
+        "/api/v1/images?async=true",
+        png_bytes(1000, 700),
+        {"Content-Type": "image/png", "X-Original-Filename": "harbour.png"},
+    )
+    checks.ok("async upload accepted", status, 202)
+    async_id = accepted.get("id") or ""
+    upload_job = accepted.get("job_id") or ""
+    checks.true("  with an id and a job id", bool(async_id) and bool(upload_job))
+    upload: dict = {}
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        status, upload = checks.request("GET", f"/api/v1/uploads/{upload_job}")
+        if status != 200 or upload.get("state") in ("ready", "failed"):
+            break
+        time.sleep(0.2)
+    checks.ok("upload job ready", upload.get("state"), "ready")
+    checks.ok(
+        "  under the reserved id", (upload.get("asset") or {}).get("id"), async_id
+    )
+    status, published = checks.request("GET", f"/api/v1/images/{async_id}")
+    checks.ok("  and published", status, 200)
+    checks.ok(
+        "  with every rendition",
+        [r["width"] for r in published.get("renditions", [])],
+        [320, 640, 960, 1000],
+    )
+    checks.ok(
+        "a document cannot be async",
+        checks.request(
+            "POST",
+            "/api/v1/documents?async=true",
+            PDF,
+            {"Content-Type": "application/pdf"},
+        )[0],
+        400,
+    )
+
     print("\n== bulk actions ==", flush=True)
     checks.ok(
         "bulk pin",

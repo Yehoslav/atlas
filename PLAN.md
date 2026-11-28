@@ -128,6 +128,27 @@ media files and media metadata only.
   process runs its own accepted work under the same conversion bounds as
   everything else, with no external queue and no multi-instance coordination —
   those remain deferred.
+
+  A first-time image upload may be detached the same way (issue #30), because
+  a gallery or a feed import otherwise holds one request per image for every
+  rendition. `POST /api/v1/images?async=true` runs the whole synchronous
+  intake — streaming with limits, signature, frame count, hash and the dedup
+  check against live assets — so refusal stays immediate, and only conversion
+  and promotion detach. The answer is `202` with a reserved asset id and a job
+  id. Publication stays atomic: the asset row, its renditions and the job's
+  `ready` state are one transaction, so until then the id is a `404`
+  everywhere, exactly as a still-converting synchronous upload is invisible.
+  The original waits in `uploads/{job_id}/` rather than in staging, which
+  startup empties, so a restart converts it again from the same bytes; the
+  promotion refuses a job that is no longer converting, so it publishes once.
+  The hash is checked again inside that transaction, under an in-process lock,
+  so identical async uploads accepted before either converted converge on the
+  first one published; a synchronous upload racing them is the same best
+  effort it always was. At most 200 accepted uploads may wait (`503` beyond),
+  the same overload posture as the two-upload intake bound, which still
+  governs intake. Documents have nothing to convert and do not take the
+  flag. The original is the one thing an async upload keeps on disk outside
+  the asset directories, and only while its job is converting.
 - Renditions are converted to sRGB through the source's embedded ICC profile
   before metadata is stripped, so a Display P3 phone photo keeps its colours
   instead of being relabelled. The target is a compact sRGB profile embedded in
@@ -351,6 +372,10 @@ collections.
   selection is accepted as a job: `202` with a `job_id` (up to 1000 items),
   polled at `GET /api/v1/images/re-render/{job_id}` for state, progress and
   per-asset results, surviving restarts and resuming from pending items.
+- `POST /api/v1/images?async=true` — the image upload with conversion
+  detached: intake and refusal stay synchronous, the answer is `202` with the
+  reserved `id` and a `job_id`, and `GET /api/v1/uploads/{job_id}` reports
+  `converting`, `ready` with the asset, or `failed` with the error.
 - `GET /media/{id}/original` — public, unmodified original.
 - `GET /media/{id}/w{max_width}` — public rendition with format selected from
   `Accept`; JXL, AVIF, WebP, then an acceptable JPEG/PNG fallback. A `format`
@@ -399,8 +424,9 @@ uploads, or arbitrary URL transformations.
 - Bound uploads to two concurrent requests, image conversions to the configured
   concurrency (default one, maximum eight), each ImageMagick invocation to 45
   seconds, and all processing for one image to 120 seconds. Asynchronous
-  re-render jobs run under exactly those bounds — there is no separate pool
-  and no persistent job queue beyond the accepted work's own SQLite rows.
+  re-render jobs and async upload conversions run under exactly those bounds —
+  there is no separate pool and no persistent job queue beyond the accepted
+  work's own SQLite rows. At most 200 async uploads may wait to convert.
 - Originals and generated renditions are staged together, then atomically
   promoted before metadata is committed. Startup removes incomplete staging
   data and unindexed asset directories after a crash.
@@ -418,7 +444,8 @@ its configured free-space floor, and `406` when no stored format matches the
 request's `Accept` header. Two `404` codes separate "no such asset"
 (`asset_not_found`) from "that asset holds no rendition this narrow"
 (`rendition_not_found`, which lists the stored widths); a third
-(`job_not_found`) covers an unknown re-render job id. Metadata that records a
+(`job_not_found`) covers an unknown re-render or upload job id, and `503
+upload_queue_full` refuses an async upload past the queue cap. Metadata that records a
 file that is not on disk is a `500`, not a `404`: the request was valid and
 storage is damaged.
 
@@ -515,8 +542,9 @@ do with media, and only a consumer with its own content database can answer.
 - PDF/office rendering, OCR, and document conversion
 - Video transcoding and thumbnail pipelines
 - Remote object storage, multiple service instances, multi-tenancy, and
-  distributed job queues. In-process re-render jobs with SQLite state are
-  implemented; a scheduler that coordinates across instances is not.
+  distributed job queues. In-process re-render jobs and async upload
+  conversions with SQLite state are implemented; a scheduler that coordinates
+  across instances is not.
 - An `animations` kind. Multi-frame input is refused today, and the refusal is
   now deliberate: animated WebP, APNG, animated AVIF and HEIC sequences are
   turned away with `422 multi_frame_unsupported` by a container scan that reads
