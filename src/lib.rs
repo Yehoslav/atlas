@@ -1,4 +1,5 @@
 mod api;
+mod backup;
 pub mod config;
 mod disk;
 mod error;
@@ -16,7 +17,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use axum::Router;
+use axum::{
+    Router,
+    extract::{Request, State},
+    http::Method,
+    middleware::Next,
+    response::Response,
+};
 use ident::AssetId;
 use media::ImageProcessor;
 use model::AssetState;
@@ -43,6 +50,21 @@ pub struct AppState {
     pub(crate) conversion_slots: Arc<Semaphore>,
     asset_conversion_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     pub(crate) last_purge: Arc<Mutex<Option<Instant>>>,
+    /// Serializes backup creation against trash purging and against another
+    /// backup. A purge must not remove bytes between the database snapshot and
+    /// the file copy, and two concurrent backups would double the disk cost
+    /// this operation already checks for.
+    pub(crate) backup_lock: Arc<Mutex<()>>,
+    /// Normal requests take a read guard; applying a restore takes the write
+    /// guard, so the file swap happens with no request reading or writing the
+    /// store it is replacing.
+    pub(crate) restore_gate: Arc<tokio::sync::RwLock<()>>,
+    /// A backup holds the write side while it snapshots and copies; delete and
+    /// restore-from-trash hold the read side across their rename and row
+    /// update. Without this, an asset could move between `assets/` and
+    /// `trash/` after the snapshot and land only on the wrong side of the
+    /// bundle.
+    pub(crate) lifecycle_lock: Arc<tokio::sync::RwLock<()>>,
     /// The OpenAPI document, built once in `app()` from the same handlers the
     /// router serves. Empty until then, which is why the handler expects it.
     pub(crate) openapi: Arc<OnceLock<utoipa::openapi::OpenApi>>,
@@ -55,6 +77,13 @@ impl AppState {
         create_private_dir(&config.data_dir.join("staging"), true).await?;
         create_private_dir(&config.data_dir.join("assets"), true).await?;
         create_private_dir(&config.data_dir.join("trash"), true).await?;
+        create_private_dir(&config.data_dir.join("backups"), true).await?;
+
+        // A restore that crashed mid-swap leaves a journal. Finish or undo the
+        // swap before opening a database, so a missing file cannot become a
+        // freshly created empty one and a later recovery cannot delete the
+        // asset directories that belong to it.
+        backup::recover_interrupted_restore(&config.data_dir).await?;
 
         let store = Store::connect(&config.data_dir.join("atlas.sqlite3")).await?;
         recover_incomplete_storage(&config.data_dir, &store).await?;
@@ -80,6 +109,9 @@ impl AppState {
             conversion_slots: Arc::new(Semaphore::new(conversion_concurrency)),
             asset_conversion_locks: Arc::new(Mutex::new(HashMap::new())),
             last_purge: Arc::new(Mutex::new(None)),
+            backup_lock: Arc::new(Mutex::new(())),
+            restore_gate: Arc::new(tokio::sync::RwLock::new(())),
+            lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
             openapi: Arc::new(OnceLock::new()),
         };
 
@@ -127,6 +159,30 @@ impl AppState {
         self.config.data_dir.join("trash").join(id.as_str())
     }
 
+    pub(crate) fn backups_dir(&self) -> PathBuf {
+        self.config.data_dir.join("backups")
+    }
+
+    /// Where an unfinished bundle is written before it is renamed into
+    /// `backups/`: an incomplete backup is just another staging artifact.
+    pub(crate) fn backup_staging_dir(&self) -> PathBuf {
+        self.config.data_dir.join("staging").join("backups")
+    }
+
+    pub(crate) fn backup_path(&self, id: &str) -> PathBuf {
+        self.backups_dir().join(format!("{id}.tar"))
+    }
+
+    /// A restore upload and its extracted tree, under staging so startup
+    /// discards an upload that was never applied.
+    pub(crate) fn restore_staging_dir(&self, upload_id: &str) -> PathBuf {
+        self.config
+            .data_dir
+            .join("staging")
+            .join("restores")
+            .join(upload_id)
+    }
+
     /// Serialize conversions of the same asset while allowing distinct assets
     /// to use the configured global conversion capacity concurrently.
     pub(crate) async fn lock_asset_conversion(&self, id: &AssetId) -> OwnedMutexGuard<()> {
@@ -151,6 +207,13 @@ impl AppState {
         if !self.claim_purge_slot().await {
             return Ok(0);
         }
+
+        // A backup copies `trash/` after snapshotting the database, so a purge
+        // running in between could remove a directory the snapshot names. The
+        // same lock makes backup creation and purging take turns. The restore
+        // gate keeps a scheduled purge out of a restore's file swap.
+        let _restore_guard = self.restore_gate.read().await;
+        let _backup_guard = self.backup_lock.lock().await;
 
         let now = unix_now()?;
         let retention = i64::from(self.config.trash_retention_days).saturating_mul(24 * 60 * 60);
@@ -256,7 +319,7 @@ async fn remove_path(path: &Path) -> std::io::Result<()> {
 /// interrupted delete or restore converges. The trash itself is left alone: a
 /// trashed asset is a deliberate state, not a crash artifact, and only the
 /// retention sweep discards it.
-async fn recover_incomplete_storage(
+pub(crate) async fn recover_incomplete_storage(
     data_dir: &Path,
     store: &Store,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -383,12 +446,44 @@ pub fn app(state: AppState) -> Router {
         .routes(routes!(api::list_trash))
         .routes(routes!(api::get_original))
         .routes(routes!(api::get_rendition))
+        .routes(routes!(backup::create_backup, backup::list_backups))
+        .routes(routes!(backup::download_backup, backup::delete_backup))
+        .routes(routes!(backup::upload_restore))
+        .routes(routes!(backup::apply_restore))
         .split_for_parts();
     add_live_examples(&mut document, &state);
     // The handlers read it back from the state, so a second `app()` on a clone
     // of the same state keeps the first document.
     state.openapi.set(document).ok();
-    router.with_state(state)
+    let router = router.with_state(state.clone());
+    // Everything holds a read guard; the apply route itself bypasses this and
+    // takes the write guard, so no request reads or writes the store while a
+    // restore swaps its database and directories.
+    router.layer(axum::middleware::from_fn_with_state(
+        state,
+        hold_restore_gate,
+    ))
+}
+
+/// Block normal requests while a restore applies.
+///
+/// The apply route manages the write side itself, and backup creation takes
+/// the read side inside its detached task. Both are exempt here so a
+/// disconnect cannot drop a gate that the detached work still needs, and so a
+/// fair writer cannot deadlock between the middleware and the task.
+async fn hold_restore_gate(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let is_apply = path.starts_with("/api/v1/backups/restore/") && path.ends_with("/apply");
+    let is_backup_create = request.method() == Method::POST && path == "/api/v1/backups";
+    if is_apply || is_backup_create {
+        return next.run(request).await;
+    }
+    let _guard = state.restore_gate.read().await;
+    next.run(request).await
 }
 
 /// Put the instance's own widths and formats into the document as examples.

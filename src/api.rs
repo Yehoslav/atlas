@@ -873,7 +873,7 @@ fn schedule_purge(state: &AppState) {
     });
 }
 
-async fn stream_upload(
+pub(crate) async fn stream_upload(
     body: Body,
     path: &std::path::Path,
     limit: u64,
@@ -966,6 +966,10 @@ pub(super) async fn delete_asset(
 /// same order of operations, not just the same outcome.
 async fn delete_inner(state: &AppState, id: &AssetId) -> Result<(), ApiError> {
     let _asset_guard = state.lock_asset_conversion(id).await;
+    // A backup holds this write side while it copies. Keeping the move out of
+    // that window is what makes the snapshot's live/trashed state match the
+    // directory side of the bundle.
+    let _lifecycle = state.lifecycle_lock.read().await;
     let asset = load_asset(state, id, None).await?;
     if asset.asset.state() != AssetState::Active {
         return Ok(());
@@ -1019,6 +1023,7 @@ pub(super) async fn restore_asset(
 /// recovery resolves back into the trash.
 async fn restore_inner(state: &AppState, id: &AssetId) -> Result<(), ApiError> {
     let _asset_guard = state.lock_asset_conversion(id).await;
+    let _lifecycle = state.lifecycle_lock.read().await;
     let asset = load_asset(state, id, None).await?;
     match asset.asset.state() {
         AssetState::Active => return Ok(()),
@@ -3185,6 +3190,10 @@ async fn run_re_render_job(state: AppState, job_id: String) {
         .map(|(position, id, expect_generation)| {
             let state = state.clone();
             async move {
+                // A restore applying takes the write side of this gate, so a
+                // background conversion cannot be writing generation files
+                // while the asset directories are swapped.
+                let _gate = state.restore_gate.read().await;
                 let outcome = re_encode_conditionally(&state, &id, expect_generation).await;
                 (position, id, outcome)
             }
@@ -3795,7 +3804,7 @@ fn serve_placeholder(request_headers: &HeaderMap) -> Response {
         .expect("static placeholder response is well formed")
 }
 
-fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(value) = headers.get(AUTHORIZATION) else {
         return Err(ApiError::unauthorized());
     };
@@ -4000,7 +4009,7 @@ fn parse_range(value: &str, size: u64) -> Result<Option<ByteRange>, ()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn serve_file(
+pub(crate) async fn serve_file(
     request_headers: &HeaderMap,
     path: &std::path::Path,
     expected_size: u64,
@@ -4252,6 +4261,7 @@ mod tests {
             max_image_bytes: 1024 * 1024,
             max_document_bytes: 1024,
             max_consumer_data_bytes: 1024,
+            backup_upload_max_bytes: 16 * 1024 * 1024,
             min_free_bytes: 0,
             max_image_pixels: 40_000_000,
             max_image_dimension: 12_000,
@@ -6873,6 +6883,11 @@ mod tests {
         let mut expected = vec![
             "/api/v1/assets/by-hash",
             "/api/v1/assets/state",
+            "/api/v1/backups",
+            "/api/v1/backups/restore",
+            "/api/v1/backups/restore/{upload_id}/apply",
+            "/api/v1/backups/{id}",
+            "/api/v1/backups/{id}/archive",
             "/api/v1/documents",
             "/api/v1/formats",
             "/api/v1/images",

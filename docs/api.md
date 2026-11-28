@@ -152,6 +152,38 @@ as an attachment instead of being re-encoded into a picture.
   assets cannot grow into a page of blobs.
 - `GET /api/v1/trash` — authenticated listing of trashed and purged assets from
   both collections, paged with `limit` (default 200, max 500) and `offset`.
+- `POST /api/v1/backups` — authenticated creation of a consistent backup
+  bundle and the only route that writes one. The response is `201` with the
+  backup `id`, its `bytes`, `created_at`, and the `manifest` written inside the
+  archive. A second concurrent backup is `409 backup_in_progress`, and a
+  volume that cannot hold another copy is `507 insufficient_storage`. The
+  bundle is an uncompressed `application/x-tar` pairing a `VACUUM INTO`
+  database snapshot with `assets/` and `trash/`. See [Backup and
+  restore](#backup-and-restore).
+- `GET /api/v1/backups` — authenticated listing of stored bundles with `id`,
+  `bytes`, and `created_at`, newest first. There is no automatic retention: a
+  bundle costs roughly the data directory, and deleting one is the operator's
+  decision.
+- `GET /api/v1/backups/{id}/archive` — authenticated streamed download,
+  `Content-Disposition: attachment; filename="atlas-backup-<utc>.tar"`, with
+  the same `ETag` and byte-range handling as media. Token-gated because the
+  bundle contains the whole database and the trash.
+- `DELETE /api/v1/backups/{id}` — authenticated removal of one stored bundle.
+  Returns `204`, or `404 backup_not_found`.
+- `POST /api/v1/backups/restore` — authenticated raw-body upload of a bundle,
+  `Content-Type: application/x-tar`, streamed to staging under
+  `ATLAS_BACKUP_UPLOAD_MAX_BYTES`. It validates and extracts only; nothing live
+  is touched. A valid bundle answers `200` with an `upload_id`, counts,
+  configuration differences, and the warning that everything after the
+  snapshot will be lost. Traversal, symlinks, devices, unexpected members,
+  truncation, a wrong SHA-256, a database failing `integrity_check` or
+  `foreign_key_check`, a newer schema, and a database naming missing live or
+  trashed asset directories are refused before an upload id exists.
+- `POST /api/v1/backups/restore/{upload_id}/apply` — authenticated swap of the
+  validated upload. Requests are held while the database and directories are
+  replaced by rename; the new database is opened, migrations and the startup
+  recovery path run, and serving resumes. A failure restores the previous
+  files. A missing or already-applied upload is `404 restore_not_found`.
 - `GET /media/{id}/original` — public original delivery.
 - `GET /media/{id}/w{width}` — public width rendition. Atlas selects a
   pre-generated JXL, AVIF, WebP, or JPEG/PNG fallback using `Accept` and returns
@@ -646,6 +678,48 @@ a published post still uses and Atlas will never purge it.
 
 Nothing here is a replacement for a consuming site's own referential checks —
 Atlas cannot know which of its assets your posts mention.
+
+## Backup and restore
+
+Metadata and files are useless separately: a database restored beside a
+different set of `assets/` directories makes every asset undeliverable. A
+backup bundle therefore pairs both halves in one `application/x-tar`:
+
+- `manifest.json` — `format_version`, `created_at`, row counts, the snapshot's
+  `schema_version`, the SHA-256 of `atlas.sqlite3`, and informational instance
+  facts (ID length, rendition widths, accepted formats).
+- `atlas.sqlite3` — a `VACUUM INTO` snapshot taken first. WAL mode means
+  copying the live database file alone can miss committed rows; `VACUUM INTO`
+  is the consistent cut, and it compacts.
+- `assets/…` and `trash/…` — copied after the snapshot at their on-disk
+  layout. `staging/` and the generated sRGB profile are excluded.
+
+Creation refuses when another backup is running or when the volume cannot hold
+a second copy. Purges, deletes and restores from the trash are held for the
+duration, because a sweep or a directory move between the snapshot and the copy
+would ship a bundle whose database and files disagree. After the copy, every
+directory the snapshot names is checked once — live rows in `assets/`, trashed
+rows in `trash/`; a missing one fails the backup loudly instead of producing a
+broken bundle. Extra directories uploaded after the snapshot
+are harmless: startup recovery sweeps them after a restore.
+
+Restore is a replacement at a point in time, never a merge. Upload the archive
+to validate it; the response report says what would change and warns that
+assets and edits created after the snapshot will be lost. Applying takes the
+requests out of service while the staged directories and database are renamed
+into place. The restored database is opened, migrations for an older snapshot
+apply, and the startup recovery path runs before serving resumes. Asset IDs
+are restored as-is, so public URLs do not change. A database from a newer
+Atlas is refused rather than opened: downgrading a schema is not a restore.
+The refusals are `422 invalid_backup`, except a newer schema, which is `409
+backup_schema_too_new` with the version in the message. An interrupted swap is
+undone by a journal at startup before the database is opened. The apply gate
+holds other requests, including `/readyz`, while the swap runs.
+
+Scheduling is deliberately outside Atlas. A systemd timer or cron job can call
+`POST /api/v1/backups`, download the archive, and prune old bundles; Atlas
+adds no scheduler and no job queue for this. Encryption at rest, remote object
+storage, and incremental bundles are out of scope.
 
 ### If a consumer and Atlas have drifted
 

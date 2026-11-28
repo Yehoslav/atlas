@@ -283,6 +283,71 @@ Metadata and files are useless separately: a restore that pairs a database with
 a different set of `assets/` directories makes every asset undeliverable. Back
 both up, and drill the restore.
 
+### Through the API
+
+The API is the primary path. It writes the same two halves into one bundle and
+verifies the pair before answering, so an operator interface does not need host
+shell access:
+
+```sh
+TOKEN=...                       # ATLAS_API_TOKEN
+ATLAS=http://127.0.0.1:3000
+
+# Create a bundle; the response carries its id, size and manifest.
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+  "$ATLAS/api/v1/backups" | tee /tmp/backup.json
+
+ID=$(python3 -c 'import json,sys; print(json.load(open("/tmp/backup.json"))["id"])')
+
+# Download it off the host. The archive is token-gated.
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "$ATLAS/api/v1/backups/$ID/archive" \
+  -o "atlas-backup-$(date -u +%Y%m%dT%H%M%SZ).tar"
+
+# List and, eventually, delete old bundles; there is no automatic retention.
+curl -sS -H "Authorization: Bearer $TOKEN" "$ATLAS/api/v1/backups"
+curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" "$ATLAS/api/v1/backups/$ID"
+```
+
+To restore, upload the archive, read the validation report, and apply it:
+
+```sh
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/x-tar' \
+  --data-binary @atlas-backup-20260101T000000Z.tar \
+  "$ATLAS/api/v1/backups/restore" | tee /tmp/restore.json
+
+UPLOAD=$(python3 -c 'import json; print(json.load(open("/tmp/restore.json"))["upload_id"])')
+
+# This replaces the database and both media directories. Read the report first.
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+  "$ATLAS/api/v1/backups/restore/$UPLOAD/apply"
+```
+
+`ATLAS_BACKUP_UPLOAD_MAX_BYTES` must exceed the source instance's data
+directory; raise it before uploading a large bundle. Validation refuses an
+archive with an unexpected member, a link or device, a path traversal, a
+truncated body, a database that fails its integrity checks, a newer schema, or
+a database naming asset directories the archive lacks.
+
+**API restore drill.** The drill is the same idea as the manual one, without
+stopping the service:
+
+1. Create a bundle and download it.
+2. Upload it to `POST /api/v1/backups/restore`; confirm the report counts and
+   read the warning about newer data.
+3. Apply it and confirm `GET /healthz` stays `ok`.
+4. `GET /api/v1/images/{id}` for a known asset returns its metadata.
+5. `GET /media/{id}/original` returns `200` with the expected length, not a
+   placeholder.
+
+### The manual runbook
+
+This is the last resort, for the case where the API will not start — which is
+exactly when a restore is needed. It assumes host shell access and the same
+discipline as the API path: snapshot the database first, verify it, then copy
+the files.
+
 **Snapshot the database with `VACUUM INTO`, never `cp`.** Atlas runs SQLite in
 WAL mode, where committed transactions may still live in `atlas.sqlite3-wal`.
 Copying `atlas.sqlite3` on its own captures neither the WAL nor a consistent

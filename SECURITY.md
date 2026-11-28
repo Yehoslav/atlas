@@ -25,6 +25,11 @@ vulnerability shortly after.
   an administrator's. The byte limits, the dimension and pixel caps, the
   signature checks and the ImageMagick argument handling are the boundary.
   Anything that gets past them is worth knowing about.
+- **Restore archives.** A restore bundle is untrusted input too. The member
+  allowlist, rejection of absolute paths, `..`, links and devices, the member
+  and unpacked-size caps, and the database integrity and cross-reference
+  checks are the boundary. Anything that gets past them is worth knowing
+  about.
 - **Credential handling.** The API token authorises every write. Anything that
   reveals it, accepts it from somewhere it should not, or lets it reach a
   browser is a vulnerability.
@@ -64,5 +69,6 @@ upgrading is a matter of replacing a binary and letting the migrations run.
 - Keep the API token out of browser code and out of version control. It is a
   bearer token: whoever holds it can upload, delete and change every asset.
 - Back up the database and the media directory together, and drill the
-  restore. The README's backup section has the details; a backup that has
-  never been restored is not a backup.
+  restore. The API's backup routes and the manual runbook in
+  [`docs/deployment.md`](docs/deployment.md) have the details; a backup that
+  has never been restored is not a backup.

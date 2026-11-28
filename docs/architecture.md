@@ -27,12 +27,17 @@ design record — the decisions and the reasoning behind them — is
   content.
 - **The token is the only coupling.** Public media reads need no token; every
   write needs one.
+- **Backup is one consistent pair.** `POST /api/v1/backups` writes a tar that
+  pairs a `VACUUM INTO` database snapshot with the `assets/` and `trash/`
+  bytes, then verifies that every live asset the snapshot names is present.
+  Restore uploads are streamed, allowlisted and validated before an
+  all-or-nothing swap; scheduling and off-host storage stay outside Atlas.
 
 ## Project layout
 
 | Path | What is in it |
 | --- | --- |
-| `src/` | The service: `api.rs` (routes and responses), `store.rs` (SQLite), `media.rs` (ImageMagick), `disk.rs` (free space), `model.rs`, `config.rs`, `ident.rs` (asset ids), `filename.rs` (upload names), `lib.rs` (wiring). |
+| `src/` | The service: `api.rs` (routes and responses), `backup.rs` (bundles and restore), `store.rs` (SQLite), `media.rs` (ImageMagick), `disk.rs` (free space), `model.rs`, `config.rs`, `ident.rs` (asset ids), `filename.rs` (upload names), `lib.rs` (wiring). |
 | `migrations/` | Additive SQL migrations, applied at startup. `migrations/README.md` explains the SQLite constraints that shape them. |
 | `examples/family-album/` | A Flask consumer with its own database: the integration contract from the site side. |
 | `examples/cms-admin/` | A Rust consumer with no database at all: the same API seen from an operator's side. |

@@ -37,6 +37,7 @@ variant_widths = [320, 640, 960, 1280]
 max_image_bytes = 20971520
 max_document_bytes = 52428800
 max_consumer_data_bytes = 65536
+backup_upload_max_bytes = 4294967296
 min_free_bytes = 1073741824
 max_image_pixels = 40000000
 max_image_dimension = 12000
@@ -64,6 +65,7 @@ Environment variables override the file, which is useful for per-host values:
 | `ATLAS_MAX_IMAGE_BYTES` | 20 MiB | Streaming image-upload limit |
 | `ATLAS_MAX_DOCUMENT_BYTES` | 50 MiB | Streaming document-upload limit |
 | `ATLAS_MAX_CONSUMER_DATA_BYTES` | 64 KiB | Cap on a consumer's opaque `data` |
+| `ATLAS_BACKUP_UPLOAD_MAX_BYTES` | 4 GiB | Streaming limit for a restore bundle; must exceed the source instance's data size |
 | `ATLAS_MIN_FREE_BYTES` | 1 GiB | Free space the data volume must keep before uploads are refused; `0` disables the check |
 | `ATLAS_MAX_IMAGE_PIXELS` | 40,000,000 | Decoded image pixel limit |
 | `ATLAS_MAX_IMAGE_DIMENSION` | 12,000 | Maximum image width or height |
